@@ -11,10 +11,40 @@ type ReplayInspection = {
   patch: string | null;
   region: string | null;
   suggestedLocale: string | null;
+  dataDragonVersion: string | null;
   matchId: string | null;
   gameDurationMs: number | null;
+  winningTeam: string | null;
+  blueKills: number;
+  redKills: number;
+  players: PlayerStats[];
   metadata: unknown;
   notes: string[];
+};
+
+type PlayerStats = {
+  name: string;
+  champion: string;
+  championImageUrl: string | null;
+  team: "Blue" | "Red" | string;
+  position: string;
+  win: boolean;
+  kills: number;
+  deaths: number;
+  assists: number;
+  creepScore: number;
+  goldEarned: number;
+  damageToChampions: number;
+  visionScore: number;
+  items: PlayerItem[];
+  summonerSpells: string[];
+  perks: string[];
+};
+
+type PlayerItem = {
+  slot: number;
+  id: string;
+  imageUrl: string | null;
 };
 
 type LaunchReplayRequest = {
@@ -46,8 +76,13 @@ const patch = must("#patch", HTMLElement);
 const version = must("#version", HTMLElement);
 const matchId = must("#match-id", HTMLElement);
 const duration = must("#duration", HTMLElement);
+const score = must("#score", HTMLElement);
 const region = must("#region", HTMLElement);
 const suggestedLocale = must("#suggested-locale", HTMLElement);
+const blueScore = must("#blue-score", HTMLElement);
+const redScore = must("#red-score", HTMLElement);
+const blueTeam = must("#blue-team", HTMLElement);
+const redTeam = must("#red-team", HTMLElement);
 const clientState = must("#client-state", HTMLElement);
 const progressBar = must("#progress-bar", HTMLElement);
 const progressText = must("#progress-text", HTMLElement);
@@ -141,10 +176,14 @@ function renderReplay(replay: ReplayInspection) {
   version.textContent = replay.gameVersion ?? "-";
   matchId.textContent = replay.matchId ?? "-";
   duration.textContent = formatDuration(replay.gameDurationMs);
+  score.textContent = `${replay.blueKills} - ${replay.redKills}`;
   region.textContent = replay.region ?? "-";
   suggestedLocale.textContent = replay.suggestedLocale ?? "-";
+  blueScore.textContent = `${replay.blueKills}${replay.winningTeam === "Blue" ? " W" : ""}`;
+  redScore.textContent = `${replay.redKills}${replay.winningTeam === "Red" ? " W" : ""}`;
   metadata.textContent = JSON.stringify(replay.metadata, null, 2);
   note.textContent = replay.notes.join(" ");
+  renderScoreboard(replay.players);
 
   if (replay.suggestedLocale) {
     localeInput.value = replay.suggestedLocale;
@@ -177,6 +216,69 @@ function updateActions() {
   downloadClientButton.disabled = true;
 }
 
+function renderScoreboard(players: PlayerStats[]) {
+  replaceChildren(blueTeam, players.filter((player) => player.team === "Blue"));
+  replaceChildren(redTeam, players.filter((player) => player.team === "Red"));
+}
+
+function replaceChildren(container: HTMLElement, players: PlayerStats[]) {
+  container.textContent = "";
+  for (const player of players) {
+    container.appendChild(renderPlayer(player));
+  }
+}
+
+function renderPlayer(player: PlayerStats) {
+  const row = document.createElement("article");
+  row.className = "player-row";
+
+  const champ = document.createElement("div");
+  champ.className = "champion-cell";
+  if (player.championImageUrl) {
+    const image = document.createElement("img");
+    image.src = player.championImageUrl;
+    image.alt = player.champion;
+    image.loading = "lazy";
+    champ.appendChild(image);
+  }
+
+  const identity = document.createElement("div");
+  identity.className = "player-identity";
+  const name = document.createElement("strong");
+  name.textContent = player.name || "Unknown";
+  const subtitle = document.createElement("span");
+  subtitle.textContent = `${player.position} / ${player.champion}`;
+  identity.append(name, subtitle);
+
+  const stats = document.createElement("div");
+  stats.className = "player-stats";
+  stats.textContent = `${player.kills}/${player.deaths}/${player.assists}`;
+
+  const detail = document.createElement("div");
+  detail.className = "player-detail";
+  detail.textContent = `${player.creepScore} CS · ${formatCompact(player.goldEarned)} gold · ${formatCompact(player.damageToChampions)} dmg · ${player.visionScore} vision`;
+
+  const items = document.createElement("div");
+  items.className = "item-row";
+  for (const item of player.items) {
+    const itemBox = document.createElement("span");
+    itemBox.className = "item-box";
+    if (item.imageUrl) {
+      const image = document.createElement("img");
+      image.src = item.imageUrl;
+      image.alt = `Item ${item.id}`;
+      image.loading = "lazy";
+      itemBox.appendChild(image);
+    } else {
+      itemBox.textContent = item.id;
+    }
+    items.appendChild(itemBox);
+  }
+
+  row.append(champ, identity, stats, detail, items);
+  return row;
+}
+
 function renderProgress(progress: DownloadProgress) {
   const percent = progress.percent ?? 0;
   progressBar.style.width = `${Math.max(0, Math.min(percent, 100))}%`;
@@ -185,6 +287,10 @@ function renderProgress(progress: DownloadProgress) {
     : `${formatBytes(progress.downloadedBytes)} / ${
         progress.totalBytes ? formatBytes(progress.totalBytes) : "unknown"
       }`;
+}
+
+function formatCompact(value: number) {
+  return value >= 1000 ? `${(value / 1000).toFixed(1)}k` : `${value}`;
 }
 
 function formatDuration(ms: number | null) {

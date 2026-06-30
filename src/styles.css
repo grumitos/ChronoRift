@@ -177,7 +177,7 @@ h3 {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 1px;
   margin: 0;
   overflow: hidden;
@@ -216,6 +216,106 @@ dd {
   overflow: hidden;
   height: 10px;
   border-radius: 999px;
+  background: #0d0f10;
+}
+
+.scoreboard {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.team-column {
+  overflow: hidden;
+  border: 1px solid #2d3336;
+  border-radius: 8px;
+  background: #1d2124;
+}
+
+.team-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  border-bottom: 1px solid #2d3336;
+}
+
+.team-heading span {
+  font-weight: 700;
+}
+
+.player-list {
+  display: grid;
+}
+
+.player-row {
+  display: grid;
+  grid-template-columns: 42px minmax(120px, 1fr) auto;
+  gap: 10px 12px;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid #2d3336;
+}
+
+.player-row:last-child {
+  border-bottom: 0;
+}
+
+.champion-cell img,
+.item-box img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.champion-cell {
+  overflow: hidden;
+  width: 42px;
+  height: 42px;
+  border-radius: 6px;
+  background: #0d0f10;
+}
+
+.player-identity {
+  display: grid;
+  min-width: 0;
+}
+
+.player-identity strong,
+.player-identity span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.player-identity span,
+.player-detail {
+  color: #b9c0bf;
+  font-size: 0.8rem;
+}
+
+.player-stats {
+  font-weight: 700;
+  text-align: right;
+}
+
+.player-detail {
+  grid-column: 2 / 4;
+}
+
+.item-row {
+  display: flex;
+  grid-column: 2 / 4;
+  gap: 4px;
+  min-height: 24px;
+}
+
+.item-box {
+  overflow: hidden;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
   background: #0d0f10;
 }
 
@@ -271,7 +371,11 @@ pre {
   }
 
   .metrics {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .scoreboard {
+    grid-template-columns: 1fr;
   }
 }
 

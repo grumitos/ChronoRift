@@ -14,9 +14,9 @@ The installed user app must not require Bun, Node, Rust, or .NET.
 
 ### `rofl`
 
-Reads classic ROFL headers and extracts metadata JSON. It returns a small `ReplayInspection` object for the UI.
+Reads classic ROFL headers and extracts metadata JSON. It also reads modern ROFL2 trailer metadata and parses `statsJson` into player summaries. It returns a small `ReplayInspection` object for the UI.
 
-Known ceiling: ROFL2 is detected but not parsed yet. That is intentional until we have sample files and a verified format.
+Known ceiling: ROFL2 payload packet decoding is not implemented yet. Metadata and end-of-game stats are available.
 
 ### `launcher`
 

@@ -10,6 +10,8 @@ Implemented:
 
 - Tauri 2 desktop scaffold with Bun-managed vanilla TypeScript UI.
 - Classic ROFL metadata inspection in Rust.
+- ROFL2 trailer metadata/stat parsing for current replay files.
+- Replay scoreboard with DataDragon champion/item image URLs.
 - Manual League executable launch path with editable Riot locale.
 - Download job plumbing with progress events.
 - Product and architecture docs.
