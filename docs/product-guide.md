@@ -8,11 +8,12 @@ The core flow:
 
 1. User opens a `.rofl` file.
 2. ChronoRift reads metadata and shows patch, server, suggested locale, match id, and duration.
-3. ChronoRift checks whether a matching client is already known.
-4. If missing, ChronoRift shows a download/install action with destination folder and locale visible.
-5. User explicitly starts download/install.
-6. Progress stays visible until the client is ready.
-7. User explicitly launches the replay.
+3. ChronoRift loads DataDragon champion/item assets for the selected locale.
+4. ChronoRift checks whether a matching client is already known.
+5. If missing, ChronoRift shows a download/install action with destination folder and locale visible.
+6. User explicitly starts download/install.
+7. Progress stays visible until the client is ready.
+8. User explicitly launches the replay.
 
 ## Product Rules
 
@@ -21,6 +22,7 @@ The core flow:
 - The install folder is always visible and editable.
 - The locale is always visible and editable.
 - Locale can be suggested from replay server, but never silently forced.
+- Static-data loading may happen during inspection, but game-client work never does.
 - Failed or unsupported replay formats must say what is unsupported.
 - Downloader progress must come from real bytes/files, not fake timers.
 

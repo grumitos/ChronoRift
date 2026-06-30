@@ -33,6 +33,10 @@ Launch is Windows-only because the League client replay flow is Windows-only in 
 
 Owns visible download progress. It already emits byte progress for HTTP(S) artifacts. The next step is wiring Riot manifest resolution into this module.
 
+### DataDragon assets
+
+The UI resolves the replay patch to Riot's latest matching DataDragon version, then loads champion and item JSON for the visible locale with an `en_US` fallback. These fetches only enrich the scoreboard; they do not install or launch anything.
+
 ## Data Storage
 
 Start with simple files:
