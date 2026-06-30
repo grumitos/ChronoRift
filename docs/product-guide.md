@@ -50,7 +50,7 @@ This is only a default. The launch UI keeps the locale editable because backups 
 
 ## Downloader/Installer Contract
 
-The downloader must resolve a required patch into a concrete client manifest, then install files into the user-selected destination.
+The downloader resolves a required patch into a concrete `lol-game-client` RMAN manifest, then installs files into the user-selected destination.
 
 Inputs:
 
@@ -70,11 +70,13 @@ Stages:
 
 1. Resolve manifest.
 2. Plan files.
-3. Download files.
-4. Verify hashes.
+3. Download manifest.
+4. Download file chunks.
 5. Extract/decompress.
 6. Write install metadata.
 7. Mark executable ready.
+
+The first installer includes neutral files, Windows files, and files matching the visible locale. It refuses to overwrite existing files; resume/repair is a later feature.
 
 ## Deliberate Non-Goals For First Cut
 

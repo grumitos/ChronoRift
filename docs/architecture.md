@@ -31,7 +31,11 @@ Launch is Windows-only because the League client replay flow is Windows-only in 
 
 ### `installer`
 
-Owns visible download progress. It already emits byte progress for HTTP(S) artifacts. The next step is wiring Riot manifest resolution into this module.
+Owns generic visible download progress for direct HTTP(S) artifacts.
+
+### `client`
+
+Resolves `lol-game-client` releases from Riot Sieve for the replay region and Windows platform. It prefers the exact replay build when available, downloads the RMAN manifest only after user action, filters files to neutral + `windows` + selected locale, downloads bundle byte ranges, decompresses Zstandard chunks, and writes `League of Legends.exe` plus install metadata into the chosen destination.
 
 ### DataDragon assets
 

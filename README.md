@@ -13,13 +13,12 @@ Implemented:
 - ROFL2 trailer metadata/stat parsing for current replay files.
 - Replay scoreboard with DataDragon champion/item names and images resolved by patch and locale.
 - Manual League executable launch path with editable Riot locale.
-- Download job plumbing with progress events.
+- Explicit League client install from Riot RMAN manifests with visible destination, locale, and progress.
 - Product and architecture docs.
 
 Not implemented yet:
 
-- Riot manifest resolution for a specific patch.
-- RMAN install/extract pipeline.
+- Resume/repair for interrupted client installs.
 - CommunityDragon-enriched match view beyond the scoreboard.
 
 ## Commands
@@ -37,8 +36,9 @@ Not implemented yet:
 ## Architecture
 
 - `src-tauri/src/rofl.rs` parses replay metadata.
+- `src-tauri/src/client.rs` resolves and installs the matching League game client.
 - `src-tauri/src/launcher.rs` launches a replay with a chosen League executable and locale.
-- `src-tauri/src/installer.rs` owns visible download progress events.
+- `src-tauri/src/installer.rs` owns generic visible download progress events.
 - `src/main.ts` is the thin UI controller and resolves DataDragon static assets.
 - `docs/` holds project guide and ADRs.
 

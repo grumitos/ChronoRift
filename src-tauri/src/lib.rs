@@ -1,3 +1,4 @@
+mod client;
 mod installer;
 mod launcher;
 mod rofl;
@@ -24,6 +25,16 @@ async fn download_artifact(
         .map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+async fn install_client(
+    app: tauri::AppHandle,
+    request: client::ClientInstallRequest,
+) -> Result<client::ClientInstallResult, String> {
+    client::install_client(app, request)
+        .await
+        .map_err(|err| err.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -32,7 +43,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             inspect_replay,
             launch_replay,
-            download_artifact
+            download_artifact,
+            install_client
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

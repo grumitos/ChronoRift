@@ -16,6 +16,8 @@ The app exists to remove friction from old replay playback. The risky part is do
 
 ChronoRift may detect the required patch and suggest locale automatically, but it must not download, install, overwrite, delete, or launch without a visible user action.
 
+The first installer resolves Riot's Windows `lol-game-client` artifact. That RMAN manifest already contains `League of Legends.exe` and locale-tagged game files, so ChronoRift filters neutral files, `windows` files, and files tagged with the selected locale instead of downloading every language or duplicating `lol-standalone-client-content`.
+
 The UI must show:
 
 - required patch
@@ -45,3 +47,4 @@ Rejected. Users need control over disk layout and storage devices.
 - More visible UI state is needed.
 - Downloader state must be durable enough to recover from interruption.
 - Locale suggestion must be editable and treated as a default, not truth.
+- Existing files are not overwritten; resume/repair needs a separate explicit flow.

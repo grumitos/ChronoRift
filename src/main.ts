@@ -78,15 +78,37 @@ type LaunchReplayRequest = {
   locale: string;
 };
 
+type ClientInstallRequest = {
+  patch: string;
+  gameVersion: string | null;
+  region: string | null;
+  locale: string;
+  destinationPath: string;
+};
+
+type ClientInstallResult = {
+  resolvedVersion: string;
+  locale: string;
+  executablePath: string;
+  fileCount: number;
+  downloadBytes: number;
+  installBytes: number;
+};
+
 type DownloadProgress = {
   destinationPath: string;
   downloadedBytes: number;
   totalBytes: number | null;
   percent: number | null;
   done: boolean;
+  stage?: string;
+  detail?: string;
 };
 
-const state: { replay: ReplayInspection | null } = { replay: null };
+const state: { replay: ReplayInspection | null; installing: boolean } = {
+  replay: null,
+  installing: false,
+};
 
 const openReplayButton = must("#open-replay", HTMLButtonElement);
 const chooseInstallFolderButton = must("#choose-install-folder", HTMLButtonElement);
@@ -122,6 +144,7 @@ downloadClientButton.addEventListener("click", downloadClient);
 playReplayButton.addEventListener("click", playReplay);
 exePathInput.addEventListener("input", updateActions);
 installFolderInput.addEventListener("input", updateActions);
+localeInput.addEventListener("input", updateActions);
 localeInput.addEventListener("change", () => {
   if (state.replay) void enrichScoreboard(state.replay);
 });
@@ -171,15 +194,38 @@ async function inspectReplay(path: string) {
 async function downloadClient() {
   const replay = state.replay;
   const installFolder = installFolderInput.value.trim();
-  if (!replay?.patch || !installFolder) return;
+  const locale = localeInput.value.trim() || "en_US";
+  if (!replay?.patch || !installFolder || state.installing) return;
 
-  clientState.textContent = `Installer ready for ${replay.patch}`;
-  progressText.textContent =
-    "Manifest resolver is the next slice; download job plumbing is wired.";
+  state.installing = true;
+  updateActions();
+  clientState.textContent = `Installing League client ${replay.patch}`;
+  progressText.textContent = `Destination: ${installFolder} · Locale: ${locale}`;
   progressBar.style.width = "0%";
 
-  // ponytail: real progress command exists; Riot manifest resolution lands before this button is enabled.
-  downloadClientButton.disabled = true;
+  const request: ClientInstallRequest = {
+    patch: replay.patch,
+    gameVersion: replay.gameVersion,
+    region: replay.region,
+    locale,
+    destinationPath: installFolder,
+  };
+
+  try {
+    const result = await invoke<ClientInstallResult>("install_client", { request });
+    exePathInput.value = result.executablePath;
+    clientState.textContent = `Client ${result.resolvedVersion} ready`;
+    progressText.textContent = `${result.fileCount} files · ${formatBytes(
+      result.downloadBytes,
+    )} downloaded · ${formatBytes(result.installBytes)} installed · ${result.locale}`;
+    setStatus("Client ready", "ok");
+  } catch (error) {
+    clientState.textContent = "Install failed";
+    showError(error);
+  } finally {
+    state.installing = false;
+    updateActions();
+  }
 }
 
 async function playReplay() {
@@ -242,9 +288,13 @@ function renderReplay(replay: ReplayInspection) {
 
 function updateActions() {
   const replayReady = state.replay?.status === "parsed";
-  playReplayButton.disabled = !replayReady || !exePathInput.value.trim();
-  // Disabled until the Riot manifest resolver is implemented. Keeping it visible avoids hidden automation.
-  downloadClientButton.disabled = true;
+  playReplayButton.disabled = state.installing || !replayReady || !exePathInput.value.trim();
+  downloadClientButton.disabled =
+    state.installing ||
+    !replayReady ||
+    !state.replay?.patch ||
+    !installFolderInput.value.trim() ||
+    !localeInput.value.trim();
 }
 
 function renderScoreboard(players: PlayerStats[]) {
@@ -438,11 +488,18 @@ function normalizeKey(value: string) {
 function renderProgress(progress: DownloadProgress) {
   const percent = progress.percent ?? 0;
   progressBar.style.width = `${Math.max(0, Math.min(percent, 100))}%`;
-  progressText.textContent = progress.done
-    ? `Downloaded ${progress.destinationPath}`
-    : `${formatBytes(progress.downloadedBytes)} / ${
-        progress.totalBytes ? formatBytes(progress.totalBytes) : "unknown"
-      }`;
+  if (progress.stage) {
+    clientState.textContent = stageLabel(progress.stage);
+  }
+  if (progress.done) {
+    progressText.textContent =
+      progress.stage === "complete" ? "Client ready" : `Downloaded ${progress.destinationPath}`;
+    return;
+  }
+
+  progressText.textContent = `${progress.detail ? `${progress.detail} · ` : ""}${formatBytes(
+    progress.downloadedBytes,
+  )} / ${progress.totalBytes ? formatBytes(progress.totalBytes) : "unknown"}`;
 }
 
 function formatCompact(value: number) {
@@ -459,7 +516,25 @@ function formatDuration(ms: number | null) {
 function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
+  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+}
+
+function stageLabel(stage: string) {
+  switch (stage) {
+    case "resolve":
+      return "Resolving Riot manifest";
+    case "manifest":
+      return "Downloading manifest";
+    case "plan":
+      return "Planning locale files";
+    case "download":
+      return "Installing client files";
+    case "complete":
+      return "Client ready";
+    default:
+      return stage;
+  }
 }
 
 function setBusy(label: string) {
