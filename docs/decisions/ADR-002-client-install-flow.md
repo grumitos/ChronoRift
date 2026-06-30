@@ -1,0 +1,47 @@
+# ADR-002: Client Download And Install Must Be Explicit
+
+## Status
+
+Accepted
+
+## Date
+
+2026-06-30
+
+## Context
+
+The app exists to remove friction from old replay playback. The risky part is downloading and installing old game clients. Doing that silently would be surprising, expensive in disk space, and potentially wrong if the user wants a custom destination or language.
+
+## Decision
+
+ChronoRift may detect the required patch and suggest locale automatically, but it must not download, install, overwrite, delete, or launch without a visible user action.
+
+The UI must show:
+
+- required patch
+- server/region when available
+- suggested locale
+- editable locale
+- install destination
+- progress and current stage
+- final executable path
+
+## Alternatives Considered
+
+### Auto-install on replay open
+
+Rejected. It hides disk/network side effects behind a read action.
+
+### Require users to install clients manually
+
+Rejected. It preserves ReplayBook's main friction point.
+
+### Install only into ChronoRift's version folder
+
+Rejected. Users need control over disk layout and storage devices.
+
+## Consequences
+
+- More visible UI state is needed.
+- Downloader state must be durable enough to recover from interruption.
+- Locale suggestion must be editable and treated as a default, not truth.
