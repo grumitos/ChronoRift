@@ -2,6 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>ChronoRift</title>
@@ -28,7 +29,10 @@
 
         <label class="field">
           <span>League executable</span>
-          <input id="exe-path" type="text" spellcheck="false" placeholder="...\Game\League of Legends.exe" />
+          <div class="inline">
+            <input id="exe-path" type="text" spellcheck="false" placeholder="...\Game\League of Legends.exe" />
+            <button id="choose-executable" type="button" aria-label="Choose League executable">...</button>
+          </div>
         </label>
 
         <label class="field compact">

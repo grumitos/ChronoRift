@@ -112,6 +112,7 @@ const state: { replay: ReplayInspection | null; installing: boolean } = {
 
 const openReplayButton = must("#open-replay", HTMLButtonElement);
 const chooseInstallFolderButton = must("#choose-install-folder", HTMLButtonElement);
+const chooseExecutableButton = must("#choose-executable", HTMLButtonElement);
 const downloadClientButton = must("#download-client", HTMLButtonElement);
 const playReplayButton = must("#play-replay", HTMLButtonElement);
 const installFolderInput = must("#install-folder", HTMLInputElement);
@@ -140,6 +141,7 @@ let dataDragonVersions: Promise<string[]> | null = null;
 
 openReplayButton.addEventListener("click", chooseReplay);
 chooseInstallFolderButton.addEventListener("click", chooseInstallFolder);
+chooseExecutableButton.addEventListener("click", chooseExecutable);
 downloadClientButton.addEventListener("click", downloadClient);
 playReplayButton.addEventListener("click", playReplay);
 exePathInput.addEventListener("input", updateActions);
@@ -176,6 +178,17 @@ async function chooseInstallFolder() {
   const selected = await open({ directory: true, multiple: false });
   if (typeof selected === "string") {
     installFolderInput.value = selected;
+    updateActions();
+  }
+}
+
+async function chooseExecutable() {
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "League executable", extensions: ["exe"] }],
+  });
+  if (typeof selected === "string") {
+    exePathInput.value = selected;
     updateActions();
   }
 }
