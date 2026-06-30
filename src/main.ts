@@ -95,6 +95,16 @@ type ClientInstallResult = {
   installBytes: number;
 };
 
+type ClientInstallPlan = {
+  resolvedVersion: string;
+  region: string;
+  locale: string;
+  destinationPath: string;
+  fileCount: number;
+  downloadBytes: number;
+  installBytes: number;
+};
+
 type DownloadProgress = {
   destinationPath: string;
   downloadedBytes: number;
@@ -212,7 +222,7 @@ async function downloadClient() {
 
   state.installing = true;
   updateActions();
-  clientState.textContent = `Installing League client ${replay.patch}`;
+  clientState.textContent = `Checking League client ${replay.patch}`;
   progressText.textContent = `Destination: ${installFolder} · Locale: ${locale}`;
   progressBar.style.width = "0%";
 
@@ -225,6 +235,21 @@ async function downloadClient() {
   };
 
   try {
+    const plan = await invoke<ClientInstallPlan>("plan_client_install", { request });
+    const planText = installPlanText(plan);
+    clientState.textContent = `Client ${plan.resolvedVersion} planned`;
+    progressText.textContent = planText;
+    const confirmed = window.confirm(
+      `Install League client ${plan.resolvedVersion}?\n\n${planText}\nDestination: ${plan.destinationPath}`,
+    );
+    if (!confirmed) {
+      clientState.textContent = "Install cancelled";
+      setStatus("Parsed", "ok");
+      return;
+    }
+
+    clientState.textContent = `Installing League client ${plan.resolvedVersion}`;
+    progressBar.style.width = "0%";
     const result = await invoke<ClientInstallResult>("install_client", { request });
     exePathInput.value = result.executablePath;
     clientState.textContent = `Client ${result.resolvedVersion} ready`;
@@ -531,6 +556,12 @@ function formatBytes(bytes: number) {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MiB`;
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GiB`;
+}
+
+function installPlanText(plan: ClientInstallPlan) {
+  return `${plan.fileCount} files · ${formatBytes(plan.downloadBytes)} download · ${formatBytes(
+    plan.installBytes,
+  )} installed · ${plan.region} · ${plan.locale}`;
 }
 
 function stageLabel(stage: string) {

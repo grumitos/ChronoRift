@@ -11,9 +11,10 @@ The core flow:
 3. ChronoRift loads DataDragon champion/item assets for the selected locale.
 4. ChronoRift checks whether a matching client is already known.
 5. If missing, ChronoRift shows a download/install action with destination folder and locale visible.
-6. User explicitly starts download/install.
-7. Progress stays visible until the client is ready.
-8. User explicitly launches the replay.
+6. User checks the install plan and sees file count, download size, install size, destination, and locale.
+7. User explicitly confirms download/install.
+8. Progress stays visible until the client is ready.
+9. User explicitly launches the replay.
 
 ## Product Rules
 
@@ -25,6 +26,7 @@ The core flow:
 - Static-data loading may happen during inspection, but game-client work never does.
 - Failed or unsupported replay formats must say what is unsupported.
 - Downloader progress must come from real bytes/files, not fake timers.
+- Heavy bundle downloads require an explicit confirmation after the manifest plan is visible.
 
 ## Language And Server Handling
 
@@ -69,12 +71,13 @@ Outputs:
 Stages:
 
 1. Resolve manifest.
-2. Plan files.
-3. Download manifest.
-4. Download file chunks.
-5. Extract/decompress.
-6. Write install metadata.
-7. Mark executable ready.
+2. Download manifest.
+3. Plan files and show file count/bytes.
+4. Ask for explicit confirmation.
+5. Download file chunks.
+6. Extract/decompress.
+7. Write install metadata.
+8. Mark executable ready.
 
 The first installer includes neutral files, Windows files, and files matching the visible locale. It refuses to overwrite existing files; resume/repair is a later feature.
 

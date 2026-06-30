@@ -45,6 +45,20 @@ pub struct ClientInstallResult {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ClientInstallPlan {
+    pub patch: String,
+    pub resolved_version: String,
+    pub region: String,
+    pub locale: String,
+    pub destination_path: String,
+    pub manifest_url: String,
+    pub file_count: usize,
+    pub download_bytes: u64,
+    pub install_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ClientInstallProgress {
     destination_path: String,
     downloaded_bytes: u64,
@@ -157,70 +171,17 @@ pub async fn install_client(
     app: AppHandle,
     request: ClientInstallRequest,
 ) -> Result<ClientInstallResult, ClientInstallError> {
-    let patch = normalize_patch(&request.patch).ok_or(ClientInstallError::InvalidPatch)?;
-    let locale = normalize_locale(&request.locale)
-        .ok_or_else(|| ClientInstallError::InvalidLocale(request.locale.clone()))?;
-    let region = request
-        .region
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("NA1")
-        .trim()
-        .to_ascii_uppercase();
-    let destination = PathBuf::from(request.destination_path.trim());
-    if destination.as_os_str().is_empty() {
-        return Err(ClientInstallError::InvalidDestination);
-    }
-
-    emit_progress(
-        &app,
-        &destination,
-        "resolve",
-        "Resolving Riot manifest",
-        0,
-        None,
-        false,
-    )?;
-
-    let target_version = request
-        .game_version
-        .as_deref()
-        .and_then(normalize_game_version);
-    let release = resolve_game_release(&region, &patch, target_version.as_deref()).await?;
-    let bundle_base = bundle_base_from_manifest_url(&release.manifest_url)?;
-
-    let manifest = download_manifest(&app, &destination, &release.manifest_url).await?;
-    emit_progress(
-        &app,
-        &destination,
-        "plan",
-        "Planning locale files",
-        0,
-        None,
-        false,
-    )?;
-
-    let rman = read_rman_manifest(manifest)?;
-    let files = select_install_files(&rman, &locale)?;
-    preflight_targets(&destination, &files)?;
+    let planned = build_install_plan(&app, &request).await?;
+    let destination = PathBuf::from(&planned.plan.destination_path);
+    let bundle_base = bundle_base_from_manifest_url(&planned.plan.manifest_url)?;
     fs::create_dir_all(&destination)?;
-
-    let total_download_bytes = files
-        .iter()
-        .flat_map(|file| file.chunks.iter())
-        .map(|chunk| u64::from(chunk.bundle_size))
-        .sum::<u64>();
-    let total_install_bytes = files
-        .iter()
-        .map(|file| u64::from(file.filesize))
-        .sum::<u64>();
 
     download_files(
         &app,
         &destination,
         &bundle_base,
-        &files,
-        total_download_bytes,
+        &planned.files,
+        planned.plan.download_bytes,
     )
     .await?;
 
@@ -230,16 +191,16 @@ pub async fn install_client(
     }
 
     let result = ClientInstallResult {
-        patch,
-        resolved_version: release.version,
-        region,
-        locale,
-        destination_path: destination.display().to_string(),
+        patch: planned.plan.patch,
+        resolved_version: planned.plan.resolved_version,
+        region: planned.plan.region,
+        locale: planned.plan.locale,
+        destination_path: planned.plan.destination_path,
         executable_path: executable.display().to_string(),
-        manifest_url: release.manifest_url,
-        file_count: files.len(),
-        download_bytes: total_download_bytes,
-        install_bytes: total_install_bytes,
+        manifest_url: planned.plan.manifest_url,
+        file_count: planned.plan.file_count,
+        download_bytes: planned.plan.download_bytes,
+        install_bytes: planned.plan.install_bytes,
     };
     write_install_metadata(&destination, &result)?;
     emit_progress(
@@ -247,11 +208,20 @@ pub async fn install_client(
         &destination,
         "complete",
         "Client ready",
-        total_download_bytes,
-        Some(total_download_bytes),
+        result.download_bytes,
+        Some(result.download_bytes),
         true,
     )?;
     Ok(result)
+}
+
+pub async fn plan_client_install(
+    app: AppHandle,
+    request: ClientInstallRequest,
+) -> Result<ClientInstallPlan, ClientInstallError> {
+    build_install_plan(&app, &request)
+        .await
+        .map(|planned| planned.plan)
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +235,12 @@ struct InstallFile {
     path: String,
     filesize: u32,
     chunks: Vec<BundleChunk>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedInstall {
+    plan: ClientInstallPlan,
+    files: Vec<InstallFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -291,6 +267,85 @@ struct LabelValues {
 #[derive(Debug, Deserialize)]
 struct Download {
     url: String,
+}
+
+async fn build_install_plan(
+    app: &AppHandle,
+    request: &ClientInstallRequest,
+) -> Result<PlannedInstall, ClientInstallError> {
+    let patch = normalize_patch(&request.patch).ok_or(ClientInstallError::InvalidPatch)?;
+    let locale = normalize_locale(&request.locale)
+        .ok_or_else(|| ClientInstallError::InvalidLocale(request.locale.clone()))?;
+    let region = request
+        .region
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("NA1")
+        .trim()
+        .to_ascii_uppercase();
+    let destination = PathBuf::from(request.destination_path.trim());
+    if destination.as_os_str().is_empty() {
+        return Err(ClientInstallError::InvalidDestination);
+    }
+
+    emit_progress(
+        app,
+        &destination,
+        "resolve",
+        "Resolving Riot manifest",
+        0,
+        None,
+        false,
+    )?;
+
+    let target_version = request
+        .game_version
+        .as_deref()
+        .and_then(normalize_game_version);
+    let release = resolve_game_release(&region, &patch, target_version.as_deref()).await?;
+    let manifest = download_manifest(app, &destination, &release.manifest_url).await?;
+    emit_progress(
+        app,
+        &destination,
+        "plan",
+        "Planning locale files",
+        0,
+        None,
+        false,
+    )?;
+
+    let rman = read_rman_manifest(manifest)?;
+    let files = select_install_files(&rman, &locale)?;
+    preflight_targets(&destination, &files)?;
+    let (download_bytes, install_bytes) = install_totals(&files);
+
+    Ok(PlannedInstall {
+        plan: ClientInstallPlan {
+            patch,
+            resolved_version: release.version,
+            region,
+            locale,
+            destination_path: destination.display().to_string(),
+            manifest_url: release.manifest_url,
+            file_count: files.len(),
+            download_bytes,
+            install_bytes,
+        },
+        files,
+    })
+}
+
+fn install_totals(files: &[InstallFile]) -> (u64, u64) {
+    let download_bytes = files
+        .iter()
+        .flat_map(|file| file.chunks.iter())
+        .map(|chunk| u64::from(chunk.bundle_size))
+        .sum::<u64>();
+    let install_bytes = files
+        .iter()
+        .map(|file| u64::from(file.filesize))
+        .sum::<u64>();
+    (download_bytes, install_bytes)
 }
 
 async fn resolve_game_release(
@@ -828,6 +883,13 @@ mod tests {
     }
 
     #[test]
+    fn sums_install_plan_totals() {
+        let files = vec![install_file(100, &[10, 15]), install_file(250, &[20])];
+
+        assert_eq!(install_totals(&files), (45, 350));
+    }
+
+    #[test]
     fn parses_optional_real_manifest_sample() {
         let Ok(path) = std::env::var("CHRONORIFT_MANIFEST_SAMPLE") else {
             return;
@@ -864,6 +926,22 @@ mod tests {
             download: Download {
                 url: url.to_string(),
             },
+        }
+    }
+
+    fn install_file(filesize: u32, chunk_sizes: &[u32]) -> InstallFile {
+        InstallFile {
+            path: format!("file-{filesize}"),
+            filesize,
+            chunks: chunk_sizes
+                .iter()
+                .map(|size| BundleChunk {
+                    bundle_id: 1,
+                    bundle_offset: 0,
+                    bundle_size: *size,
+                    target_size: *size,
+                })
+                .collect(),
         }
     }
 }

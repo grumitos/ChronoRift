@@ -35,6 +35,16 @@ async fn install_client(
         .map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+async fn plan_client_install(
+    app: tauri::AppHandle,
+    request: client::ClientInstallRequest,
+) -> Result<client::ClientInstallPlan, String> {
+    client::plan_client_install(app, request)
+        .await
+        .map_err(|err| err.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -44,7 +54,8 @@ pub fn run() {
             inspect_replay,
             launch_replay,
             download_artifact,
-            install_client
+            install_client,
+            plan_client_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
