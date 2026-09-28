@@ -15,6 +15,8 @@ Goal: the app opens to something useful and the whole core flow is visible.
 - Remove the unused `download_artifact` command (arbitrary URL to arbitrary path).
 - New UI: minimal, monochrome, utility-first.
 
+Pulled forward from Milestone 3 at the owner's request: the detail pane is a full post-game view (per-team objectives, KDA/KP, CS/min, damage share, runes, spells, vision) in the style of Porofessor/op.gg. See "Match stats" below.
+
 ## Milestone 2 — Resume and repair installs
 
 Goal: an interrupted or damaged install can be finished without starting over or overwriting blindly.
@@ -105,5 +107,70 @@ type InstalledClient = {
   executableExists: boolean;
 };
 ```
+
+### Match stats (post-game view like Porofessor/op.gg)
+
+`ReplayInspection` gains `teams` and `PlayerStats` gains more end-of-game stats read from the ROFL2 `statsJson` (classic ROFL uses the same keys). Missing keys default to `0` / `null` / empty so older replays still render.
+
+```ts
+type ReplayInspection = /* existing fields */ & {
+  teams: TeamSummary[];              // Blue then Red; empty when no stats
+  endedInSurrender: boolean;         // GAME_ENDED_IN_SURRENDER or GAME_ENDED_IN_EARLY_SURRENDER
+  endedInEarlySurrender: boolean;
+};
+
+type TeamSummary = {
+  team: "Blue" | "Red";
+  win: boolean;
+  kills: number; deaths: number; assists: number;
+  goldEarned: number;
+  damageToChampions: number;
+  towers: number;                    // sum TURRETS_KILLED
+  inhibitors: number;                // sum BARRACKS_KILLED
+  dragons: number;                   // sum DRAGON_KILLS
+  elderDragons: number;              // sum ELDER_DRAGON_KILLS
+  barons: number;                    // sum BARON_KILLS
+  heralds: number;                   // sum RIFT_HERALD_KILLS
+  voidgrubs: number;                 // sum HORDE_KILLS
+  atakhan: number;                   // sum ATAKHAN_KILLS
+};
+
+type PlayerStats = /* existing fields */ & {
+  riotTagLine: string | null;        // RIOT_ID_TAG_LINE
+  puuid: string | null;              // PUUID
+  level: number;                     // LEVEL
+  minionsKilled: number;             // MINIONS_KILLED
+  neutralMinionsKilled: number;      // NEUTRAL_MINIONS_KILLED
+  goldSpent: number;
+  physicalDamageToChampions: number;
+  magicDamageToChampions: number;
+  trueDamageToChampions: number;
+  damageTaken: number;               // TOTAL_DAMAGE_TAKEN
+  damageSelfMitigated: number;
+  damageToBuildings: number;         // TOTAL_DAMAGE_DEALT_TO_BUILDINGS
+  damageToObjectives: number;        // TOTAL_DAMAGE_DEALT_TO_OBJECTIVES
+  healing: number;                   // TOTAL_HEAL
+  healingOnTeammates: number;
+  shieldingOnTeammates: number;      // TOTAL_DAMAGE_SHIELDED_ON_TEAMMATES
+  crowdControlScore: number;         // TIME_CCING_OTHERS
+  wardsPlaced: number;
+  wardsKilled: number;
+  controlWardsBought: number;        // VISION_WARDS_BOUGHT_IN_GAME
+  turretTakedowns: number;
+  largestKillingSpree: number;
+  largestMultiKill: number;
+  doubleKills: number; tripleKills: number; quadraKills: number; pentaKills: number;
+  timeSpentDeadSeconds: number;      // TOTAL_TIME_SPENT_DEAD
+  keystone: string | null;           // KEYSTONE_ID, else PERK0
+  primaryStyle: string | null;       // PERK_PRIMARY_STYLE
+  subStyle: string | null;           // PERK_SUB_STYLE
+  statPerks: string[];               // STAT_PERK_0..2
+  trinket: string | null;            // ITEM6 (also still in items)
+};
+```
+
+Player profiles: public sites address players by Riot ID + region, not PUUID, so the UI builds links from `name#riotTagLine` and the replay region (e.g. `https://www.op.gg/summoners/las/Name-TAG`, `https://www.leagueofgraphs.com/summoner/las/Name-TAG`) and opens them in the system browser only on click (opener plugin). PUUID is kept in the data for future lookups. No link is shown when the tag line or region is unknown.
+
+The frontend derives kill participation, KDA ratio, CS/min, gold/min, and damage share from these.
 
 The `download-progress` event keeps its current shape.
