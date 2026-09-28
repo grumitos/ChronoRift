@@ -768,10 +768,9 @@ fn num(player: &Value, key: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// Riot ID game name only; the tag line is sent separately as `riot_tag_line`.
 fn riot_name(player: &Value) -> Option<String> {
-    let name = stat_string(player, "RIOT_ID_GAME_NAME")?;
-    let tag = stat_string(player, "RIOT_ID_TAG_LINE")?;
-    Some(format!("{name}#{tag}"))
+    stat_string(player, "RIOT_ID_GAME_NAME")
 }
 
 fn team_name(value: Option<&str>) -> String {
@@ -1204,7 +1203,8 @@ mod tests {
         assert_eq!(replay.game_duration_ms, Some(123000));
         assert_eq!(replay.metadata["statsJson"], STATS_PLACEHOLDER);
         assert_eq!(players.len(), 3);
-        assert_eq!(players[0].name, "Tester#LA2");
+        assert_eq!(players[0].name, "Tester");
+        assert_eq!(players[0].riot_tag_line.as_deref(), Some("LA2"));
         assert_eq!(players[0].champion, "Nasus");
         assert_eq!(players[0].creep_score, 203);
         assert_eq!(players[0].items.len(), 3);
@@ -1318,6 +1318,10 @@ mod tests {
         assert!(replay.teams.iter().any(|team| team.win));
         assert!(replay.players.iter().all(|player| player.puuid.is_some()));
         assert!(replay.players.iter().all(|player| player.level > 0));
+        assert!(replay
+            .players
+            .iter()
+            .all(|player| !player.name.contains('#') && player.riot_tag_line.is_some()));
         assert_eq!(replay.metadata["statsJson"], STATS_PLACEHOLDER);
         assert!(serde_json::to_string(&replay).unwrap().len() < 64 * 1024);
     }
