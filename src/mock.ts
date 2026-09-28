@@ -323,7 +323,7 @@ const SUGGESTED_LOCALES: Record<string, string> = {
   JP1: "ja_JP",
   KR: "ko_KR",
   LA1: "es_MX",
-  LA2: "es_AR",
+  LA2: "es_MX",
   NA1: "en_US",
 };
 

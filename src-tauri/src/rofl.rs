@@ -847,8 +847,7 @@ fn suggest_locale_for_region(region: &str) -> Option<String> {
         "EUN1" | "EUW1" => "en_GB",
         "JP1" => "ja_JP",
         "KR" => "ko_KR",
-        "LA1" => "es_MX",
-        "LA2" => "es_AR",
+        "LA1" | "LA2" => "es_MX",
         "ME1" => "ar_AE",
         "NA1" => "en_US",
         "OC1" => "en_AU",
@@ -1116,7 +1115,7 @@ mod tests {
     #[test]
     fn suggests_locale_from_region_without_forcing_it() {
         assert_eq!(suggest_locale_for_region("LA1"), Some("es_MX".to_string()));
-        assert_eq!(suggest_locale_for_region("LA2"), Some("es_AR".to_string()));
+        assert_eq!(suggest_locale_for_region("LA2"), Some("es_MX".to_string()));
         assert_eq!(suggest_locale_for_region("OC1"), Some("en_AU".to_string()));
         assert_eq!(suggest_locale_for_region("PH2"), Some("en_PH".to_string()));
         assert_eq!(suggest_locale_for_region("SG2"), Some("en_SG".to_string()));
@@ -1309,7 +1308,7 @@ mod tests {
         assert_eq!(replay.data_dragon_version.as_deref(), Some("16.17"));
         assert_eq!(replay.region.as_deref(), Some("LA2"));
         assert_eq!(replay.match_id.as_deref(), Some("1621247134"));
-        assert_eq!(replay.suggested_locale.as_deref(), Some("es_AR"));
+        assert_eq!(replay.suggested_locale.as_deref(), Some("es_MX"));
         assert_eq!(replay.players.len(), 10);
         assert!(replay.game_duration_ms.unwrap_or_default() > 0);
         assert_eq!(replay.teams.len(), 2);
