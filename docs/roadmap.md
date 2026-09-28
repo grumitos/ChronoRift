@@ -83,6 +83,8 @@ type ReplaySummary = {
   winningTeam: string | null;
   blueKills: number;
   redKills: number;
+  blueChampions: string[];           // champion ids in player order, e.g. ["Urgot", "LeeSin"]
+  redChampions: string[];
 };
 
 type Settings = {
