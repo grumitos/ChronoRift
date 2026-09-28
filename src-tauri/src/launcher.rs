@@ -1,4 +1,4 @@
-use crate::locale::normalize_locale;
+use crate::{install::CommandError, locale::normalize_locale};
 use serde::Deserialize;
 use std::{
     error::Error,
@@ -66,6 +66,45 @@ impl Display for LaunchError {
 }
 
 impl Error for LaunchError {}
+
+impl LaunchError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::UnsupportedPlatform => "unsupportedPlatform",
+            Self::ReplayNotAbsolute(_) | Self::NotARofl(_) | Self::MissingReplay(_) => {
+                "invalidReplay"
+            }
+            Self::MissingExecutable(_) | Self::WrongExecutable(_) | Self::NotInGameFolder(_) => {
+                "invalidExecutable"
+            }
+            Self::InvalidLocale(_) => "invalidLocale",
+            Self::Spawn(_) => "spawn",
+        }
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::ReplayNotAbsolute(path)
+            | Self::NotARofl(path)
+            | Self::MissingReplay(path)
+            | Self::MissingExecutable(path)
+            | Self::WrongExecutable(path)
+            | Self::NotInGameFolder(path) => Some(path),
+            _ => None,
+        }
+    }
+}
+
+impl From<LaunchError> for CommandError {
+    fn from(err: LaunchError) -> Self {
+        Self {
+            code: err.code().to_string(),
+            message: err.to_string(),
+            path: err.path().map(|path| path.display().to_string()),
+            available_locales: None,
+        }
+    }
+}
 
 /// A request whose paths and locale passed every check in [`validate_request`].
 #[derive(Debug, PartialEq, Eq)]
@@ -274,6 +313,32 @@ mod tests {
         let err = check_executable_layout(Path::new("/lol/League of Legends.exe")).unwrap_err();
         assert!(matches!(err, LaunchError::NotInGameFolder(_)));
         assert!(err.to_string().contains("inside a Game folder"));
+    }
+
+    #[test]
+    fn launch_errors_serialize_as_command_errors() {
+        let err = CommandError::from(LaunchError::NotInGameFolder(PathBuf::from("/x/a.exe")));
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], "invalidExecutable");
+        assert_eq!(json["path"], "/x/a.exe");
+        assert!(json["message"].as_str().unwrap().contains("Game folder"));
+
+        let json = serde_json::to_value(CommandError::from(LaunchError::InvalidLocale(
+            "en_US -x".into(),
+        )))
+        .unwrap();
+        assert_eq!(json["code"], "invalidLocale");
+        assert!(json.get("path").is_none());
+        for (err, code) in [
+            (
+                LaunchError::MissingReplay(PathBuf::from("/r.rofl")),
+                "invalidReplay",
+            ),
+            (LaunchError::UnsupportedPlatform, "unsupportedPlatform"),
+            (LaunchError::Spawn(std::io::Error::other("no")), "spawn"),
+        ] {
+            assert_eq!(CommandError::from(err).code, code);
+        }
     }
 
     #[test]

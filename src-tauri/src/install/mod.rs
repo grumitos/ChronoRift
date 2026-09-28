@@ -126,6 +126,9 @@ pub struct ClientRepairPlan {
     pub plan_id: String,
     pub expires_at_ms: u64,
     pub patch: String,
+    /// Replay build the install was planned for (archive form); `None` when the saved
+    /// state does not know it (v1 installs).
+    pub requested_version: Option<String>,
     pub resolved_version: String,
     pub exact_build: bool,
     pub source: Source,
@@ -547,6 +550,7 @@ pub async fn plan_client_repair(
             plan_id: pinned.id.clone(),
             expires_at_ms: pinned.expires_at_ms,
             patch: release.patch,
+            requested_version: release.requested_version,
             resolved_version: release.resolved_version,
             exact_build: release.exact_build,
             source: release.source,

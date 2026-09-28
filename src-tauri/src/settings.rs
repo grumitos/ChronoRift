@@ -8,6 +8,11 @@ use std::{
 };
 
 pub const SETTINGS_FILE: &str = "settings.json";
+/// Smallest remembered window size (logical pixels); matches the layout's minimum.
+pub const MIN_WINDOW_WIDTH: u32 = 900;
+pub const MIN_WINDOW_HEIGHT: u32 = 600;
+/// Upper bound so a corrupt file cannot ask for an absurd window.
+const MAX_WINDOW_SIDE: u32 = 16_384;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
@@ -16,6 +21,11 @@ pub struct Settings {
     pub clients_root: Option<String>,
     pub executable_path: Option<String>,
     pub locale: Option<String>,
+    /// Replay selected when the app last closed; restored only if still in the library.
+    pub last_replay: Option<String>,
+    /// Inner window size in logical pixels, clamped to at least 900x600.
+    pub window_width: Option<u32>,
+    pub window_height: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -51,6 +61,13 @@ impl Settings {
             clients_root: clean(self.clients_root),
             executable_path: clean(self.executable_path),
             locale: clean(self.locale).and_then(|locale| normalize_locale(&locale)),
+            last_replay: clean(self.last_replay),
+            window_width: self
+                .window_width
+                .map(|width| width.clamp(MIN_WINDOW_WIDTH, MAX_WINDOW_SIDE)),
+            window_height: self
+                .window_height
+                .map(|height| height.clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_SIDE)),
         }
     }
 }
@@ -115,6 +132,9 @@ mod tests {
             clients_root: Some("/clients".to_string()),
             executable_path: None,
             locale: Some("es_MX".to_string()),
+            last_replay: Some("/replays/LA2-1.rofl".to_string()),
+            window_width: Some(1280),
+            window_height: Some(800),
         };
 
         let saved = save_to(&path, &settings).expect("save should succeed");
@@ -154,6 +174,9 @@ mod tests {
             clients_root: Some("".to_string()),
             executable_path: Some("  /game/League of Legends.exe ".to_string()),
             locale: Some("english".to_string()),
+            last_replay: Some("  ".to_string()),
+            window_width: Some(320),
+            window_height: Some(u32::MAX),
         };
 
         let saved = save_to(&path, &settings).expect("save should succeed");
@@ -162,6 +185,8 @@ mod tests {
 
         let expected = Settings {
             executable_path: Some("/game/League of Legends.exe".to_string()),
+            window_width: Some(MIN_WINDOW_WIDTH),
+            window_height: Some(MAX_WINDOW_SIDE),
             ..Settings::default()
         };
         assert_eq!(saved, expected);
@@ -189,5 +214,21 @@ mod tests {
 
         assert_eq!(loaded.replay_folder.as_deref(), Some("/r"));
         assert_eq!(loaded.locale, None);
+        assert_eq!(loaded.last_replay, None);
+        assert_eq!(loaded.window_width, None);
+    }
+
+    #[test]
+    fn clamps_small_window_sizes_on_load() {
+        let dir = temp_dir("window");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(SETTINGS_FILE);
+        fs::write(&path, br#"{"windowWidth":100,"windowHeight":599}"#).unwrap();
+
+        let loaded = load_from(&path);
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.window_width, Some(900));
+        assert_eq!(loaded.window_height, Some(600));
     }
 }

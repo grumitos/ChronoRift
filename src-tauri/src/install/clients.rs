@@ -14,6 +14,9 @@ pub struct InstalledClient {
     pub destination_path: String,
     pub executable_path: String,
     pub executable_exists: bool,
+    /// True when the executable is not `<destinationPath>/Game/League of Legends.exe`
+    /// (v1 installs put the files directly in the destination).
+    pub legacy_layout: bool,
 }
 
 /// Reads `<root>/.chronorift/install.json` and `<root>/*/.chronorift/install.json` (v1 or
@@ -40,6 +43,7 @@ pub fn find_installed_clients(root: impl AsRef<Path>) -> Vec<InstalledClient> {
         .filter_map(|dir| store::read_record(dir).ok().flatten())
         .map(|stored| InstalledClient {
             executable_exists: stored.executable_path.is_file(),
+            legacy_layout: !in_game_folder(&stored.root, &stored.executable_path),
             patch: stored.record.release.patch,
             resolved_version: stored.record.release.resolved_version,
             region: stored.record.release.region,
@@ -54,6 +58,18 @@ pub fn find_installed_clients(root: impl AsRef<Path>) -> Vec<InstalledClient> {
             .then_with(|| a.destination_path.cmp(&b.destination_path))
     });
     clients
+}
+
+/// `executable` sits directly in a `Game` folder (any case) that is directly in `root`.
+fn in_game_folder(root: &Path, executable: &Path) -> bool {
+    let Some(folder) = executable.parent() else {
+        return false;
+    };
+    let named_game = folder
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(store::GAME_DIR));
+    named_game && folder.parent() == Some(root)
 }
 
 /// Compares dotted versions numerically segment by segment (14.10 > 14.9).
@@ -155,6 +171,12 @@ mod tests {
             root.join("14.9").display().to_string()
         );
         assert_eq!(clients[2].resolved_version, "14.2.100.1000");
+        assert!(!clients[0].legacy_layout);
+        assert!(!clients[1].legacy_layout);
+        assert!(
+            clients[2].legacy_layout,
+            "v1 files sit directly in the root"
+        );
 
         let json = serde_json::to_value(&clients[1]).unwrap();
         let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
@@ -165,6 +187,7 @@ mod tests {
                 "destinationPath",
                 "executableExists",
                 "executablePath",
+                "legacyLayout",
                 "locale",
                 "patch",
                 "region",

@@ -36,6 +36,8 @@ pub struct ReplaySummary {
     pub red_kills: u32,
     pub blue_champions: Vec<String>,
     pub red_champions: Vec<String>,
+    /// Riot ID game names in player order (blue and red), empty names skipped.
+    pub players: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -142,6 +144,13 @@ pub fn summarize(
     };
     let blue_champions = team_champions("Blue");
     let red_champions = team_champions("Red");
+    let players = inspection
+        .players
+        .iter()
+        .map(|player| player.name.trim())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
 
     ReplaySummary {
         path: inspection.path,
@@ -160,6 +169,7 @@ pub fn summarize(
         red_kills: inspection.red_kills,
         blue_champions,
         red_champions,
+        players,
     }
 }
 
@@ -221,6 +231,7 @@ mod tests {
             red_kills: 0,
             blue_champions: Vec::new(),
             red_champions: Vec::new(),
+            players: Vec::new(),
         }
     }
 
@@ -291,6 +302,8 @@ mod tests {
         assert!(replay.modified_ms.is_some());
         assert_eq!(replay.blue_champions.len(), 5);
         assert_eq!(replay.red_champions.len(), 5);
+        assert_eq!(replay.players.len(), 10);
+        assert!(replay.players.iter().all(|name| !name.is_empty()));
     }
 
     #[test]
@@ -353,6 +366,7 @@ mod tests {
                 "modifiedMs",
                 "patch",
                 "path",
+                "players",
                 "redChampions",
                 "redKills",
                 "region",
@@ -370,10 +384,12 @@ mod tests {
     fn projects_inspection_into_summary_with_team_champions() {
         let dir = temp_dir("project");
         let stats = serde_json::json!([
-            { "SKIN": "Nasus", "TEAM": "100", "CHAMPIONS_KILLED": "3", "WIN": "Win" },
-            { "SKIN": "Ahri", "TEAM": "200", "CHAMPIONS_KILLED": "1" },
-            { "SKIN": "Lux", "TEAM": "100", "CHAMPIONS_KILLED": "2", "WIN": "Win" },
-            { "SKIN": "Zed", "TEAM": "200", "CHAMPIONS_KILLED": "4" }
+            { "SKIN": "Nasus", "TEAM": "100", "CHAMPIONS_KILLED": "3", "WIN": "Win",
+              "RIOT_ID_GAME_NAME": "Dog" },
+            { "SKIN": "Ahri", "TEAM": "200", "CHAMPIONS_KILLED": "1", "RIOT_ID_GAME_NAME": "Fox" },
+            { "SKIN": "Lux", "TEAM": "100", "CHAMPIONS_KILLED": "2", "WIN": "Win",
+              "RIOT_ID_GAME_NAME": " " },
+            { "SKIN": "Zed", "TEAM": "200", "CHAMPIONS_KILLED": "4", "RIOT_ID_GAME_NAME": "Ninja" }
         ]);
         let metadata = serde_json::json!({
             "gameLength": 1_800_000,
@@ -400,5 +416,6 @@ mod tests {
         assert_eq!((summary.blue_kills, summary.red_kills), (5, 5));
         assert_eq!(summary.blue_champions, vec!["Nasus", "Lux"]);
         assert_eq!(summary.red_champions, vec!["Ahri", "Zed"]);
+        assert_eq!(summary.players, vec!["Dog", "Fox", "Ninja"]);
     }
 }

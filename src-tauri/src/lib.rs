@@ -55,11 +55,16 @@ fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<Settings, 
 }
 
 #[tauri::command]
-async fn launch_replay(request: launcher::LaunchReplayRequest) -> Result<(), String> {
+async fn launch_replay(request: launcher::LaunchReplayRequest) -> Result<(), CommandError> {
     tauri::async_runtime::spawn_blocking(move || launcher::launch_replay(request))
         .await
-        .map_err(|err| err.to_string())?
-        .map_err(|err| err.to_string())
+        .map_err(|err| CommandError {
+            code: "spawn".into(),
+            message: format!("Could not launch League executable: {err}"),
+            path: None,
+            available_locales: None,
+        })?
+        .map_err(CommandError::from)
 }
 
 #[tauri::command]

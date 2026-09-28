@@ -371,8 +371,8 @@ fn inspect_rofl2<R: Read + Seek>(
 
     let match_id =
         get_string(&metadata, &["gameId", "GameId", "matchId", "MatchId"]).or(file_match_id);
-    let mut notes = vec!["ROFL2 metadata read from trailer".to_string()];
-    notes.extend(version_note);
+    // Notes are for things the user should know; a normal read adds none.
+    let notes: Vec<String> = version_note.into_iter().collect();
     Ok(parsed_inspection(
         source,
         ReplayFormat::Rofl2,
@@ -1200,6 +1200,7 @@ mod tests {
         assert_eq!(replay.status, ReplayStatus::Parsed);
         assert_eq!(replay.game_version.as_deref(), Some("16.13.790.6961"));
         assert_eq!(replay.data_dragon_version.as_deref(), Some("16.13"));
+        assert!(replay.notes.is_empty(), "{:?}", replay.notes);
         assert_eq!(replay.game_duration_ms, Some(123000));
         assert_eq!(replay.metadata["statsJson"], STATS_PLACEHOLDER);
         assert_eq!(players.len(), 3);
