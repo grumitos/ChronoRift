@@ -2,7 +2,7 @@
 
 This roadmap turns the promises in the README and [product-guide.md](product-guide.md) into shippable milestones. Each milestone must pass the Definition Of Done in `AGENTS.md`.
 
-## Milestone 1 — Usable library (current)
+## Milestone 1 — Usable library (done)
 
 Goal: the app opens to something useful and the whole core flow is visible.
 
@@ -17,7 +17,7 @@ Goal: the app opens to something useful and the whole core flow is visible.
 
 Pulled forward from Milestone 3 at the owner's request: the detail pane is a full post-game view (per-team objectives, KDA/KP, CS/min, damage share, runes, spells, vision) in the style of Porofessor/op.gg. See "Match stats" below.
 
-## Milestone 2 — Resume and repair installs
+## Milestone 2 — Resume and repair installs (backend done; UI in progress)
 
 Goal: an interrupted or damaged install can be finished without starting over or overwriting blindly.
 
@@ -27,6 +27,10 @@ Goal: an interrupted or damaged install can be finished without starting over or
 - Clean `.chronorift/tmp` only for files ChronoRift itself was writing.
 - Cancel button for a running install (cooperative cancel flag checked between chunks).
 - UI: detect partial installs in the destination and offer "Review repair" instead of failing with `WouldOverwrite`.
+
+## Milestone 2b — Install pipeline rebuild (done)
+
+Found in the project audit: Riot's live service only lists the current patch, and the downloader issued one request per chunk. Rebuilt as `src-tauri/src/install/`: archive-first resolution with exact-build reporting, plan pinning by `planId`, coalesced concurrent downloads (about 250× fewer requests), size-verified atomic writes, `Game/` layout, repair pinned to the saved manifest, structured errors. See "Install pipeline contract (v2)", which supersedes the Milestone 1 and 2 install commands below.
 
 ## Milestone 3 — Richer match view
 

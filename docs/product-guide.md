@@ -6,14 +6,14 @@ ChronoRift should make old `.rofl` files easy to inspect and replay without forc
 
 The core flow:
 
-1. User opens a `.rofl` file.
-2. ChronoRift reads metadata and shows patch, server, suggested locale, match id, and duration.
-3. ChronoRift loads DataDragon champion/item assets for the selected locale.
-4. ChronoRift checks whether a matching client is already known.
-5. If missing, ChronoRift shows a download/install action with destination folder and locale visible.
-6. User checks the install plan and sees file count, download size, install size, destination, and locale.
-7. User explicitly confirms download/install.
-8. Progress stays visible until the client is ready.
+1. User chooses a replays folder once; ChronoRift lists every `.rofl` in it (read-only).
+2. Selecting a replay shows the match view: result, team objectives, and per-player stats.
+3. ChronoRift loads DataDragon champion, item, spell, and rune assets for the selected locale.
+4. To watch it, ChronoRift checks whether a matching client is already installed.
+5. If missing, the user picks server, locale, and destination and asks for an install plan.
+6. The plan shows the resolved build (and whether it is the exact build of the replay), source, available locales, file count, download size, install size, and destination.
+7. User explicitly confirms the install; progress stays visible and can be cancelled.
+8. Interrupted or damaged installs are resumed through an explicit repair plan.
 9. User explicitly launches the replay.
 
 ## Product Rules
@@ -56,12 +56,14 @@ This is only a default. The launch UI keeps the locale editable because backups 
 
 ## Downloader/Installer Contract
 
-The downloader resolves a required patch into a concrete `lol-game-client` RMAN manifest, then installs files into the user-selected destination.
+The downloader resolves the replay's build into a concrete `lol-game-client` RMAN manifest, then installs files into `<destination>/Game/`.
+
+Riot's live release service only lists the current patch, so old builds are resolved from the public manifest archive (Morilli/riot-manifests) first: the exact build, then other builds of the same patch, then the live service. When the exact build is not available the plan says so; ChronoRift never swaps builds silently. The plan also lists the locales the manifest offers and fails with the available list if the chosen locale is missing.
 
 Inputs:
 
 - Replay patch, for example `14.8`.
-- Preferred region/server, when available.
+- Server. Required; suggested from the replay file name when known.
 - Locale, defaulted but editable.
 - Destination folder.
 
