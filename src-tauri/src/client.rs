@@ -28,7 +28,7 @@ pub struct ClientInstallRequest {
     pub destination_path: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientInstallResult {
     pub patch: String,
@@ -707,7 +707,7 @@ fn version_revision(version: &str) -> Option<u64> {
     version.split('.').nth(2)?.parse().ok()
 }
 
-fn normalize_locale(locale: &str) -> Option<String> {
+pub(crate) fn normalize_locale(locale: &str) -> Option<String> {
     let trimmed = locale.trim();
     let (language, territory) = trimmed.split_once('_')?;
     (language.len() == 2

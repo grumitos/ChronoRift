@@ -46,6 +46,9 @@ pub struct ReplayInspection {
     pub winning_team: Option<String>,
     pub blue_kills: u32,
     pub red_kills: u32,
+    pub teams: Vec<TeamSummary>,
+    pub ended_in_surrender: bool,
+    pub ended_in_early_surrender: bool,
     pub players: Vec<PlayerStats>,
     pub metadata: Value,
     pub notes: Vec<String>,
@@ -70,6 +73,59 @@ pub struct PlayerStats {
     pub items: Vec<PlayerItem>,
     pub summoner_spells: Vec<String>,
     pub perks: Vec<String>,
+    pub riot_tag_line: Option<String>,
+    pub puuid: Option<String>,
+    pub level: u32,
+    pub minions_killed: u32,
+    pub neutral_minions_killed: u32,
+    pub gold_spent: u32,
+    pub physical_damage_to_champions: u32,
+    pub magic_damage_to_champions: u32,
+    pub true_damage_to_champions: u32,
+    pub damage_taken: u32,
+    pub damage_self_mitigated: u32,
+    pub damage_to_buildings: u32,
+    pub damage_to_objectives: u32,
+    pub healing: u32,
+    pub healing_on_teammates: u32,
+    pub shielding_on_teammates: u32,
+    pub crowd_control_score: u32,
+    pub wards_placed: u32,
+    pub wards_killed: u32,
+    pub control_wards_bought: u32,
+    pub turret_takedowns: u32,
+    pub largest_killing_spree: u32,
+    pub largest_multi_kill: u32,
+    pub double_kills: u32,
+    pub triple_kills: u32,
+    pub quadra_kills: u32,
+    pub penta_kills: u32,
+    pub time_spent_dead_seconds: u32,
+    pub keystone: Option<String>,
+    pub primary_style: Option<String>,
+    pub sub_style: Option<String>,
+    pub stat_perks: Vec<String>,
+    pub trinket: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamSummary {
+    pub team: String,
+    pub win: bool,
+    pub kills: u32,
+    pub deaths: u32,
+    pub assists: u32,
+    pub gold_earned: u32,
+    pub damage_to_champions: u32,
+    pub towers: u32,
+    pub inhibitors: u32,
+    pub dragons: u32,
+    pub elder_dragons: u32,
+    pub barons: u32,
+    pub heralds: u32,
+    pub voidgrubs: u32,
+    pub atakhan: u32,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -171,7 +227,12 @@ pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, Inspec
         &metadata,
         &["gameLength", "GameLength", "game_length", "gameDuration"],
     );
-    let players = players_from_metadata(&metadata, data_dragon_version.as_deref());
+    let MatchStats {
+        players,
+        teams,
+        ended_in_surrender,
+        ended_in_early_surrender,
+    } = match_stats(&metadata, data_dragon_version.as_deref());
     let (blue_kills, red_kills, winning_team) = team_summary(&players);
     let match_id = payload_match_id
         .or_else(|| get_string(&metadata, &["gameId", "GameId", "matchId", "MatchId"]));
@@ -191,6 +252,9 @@ pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, Inspec
         winning_team,
         blue_kills,
         red_kills,
+        teams,
+        ended_in_surrender,
+        ended_in_early_surrender,
         players,
         metadata,
         notes: Vec::new(),
@@ -209,7 +273,12 @@ fn inspect_rofl2(path: PathBuf, file_name: String) -> Result<ReplayInspection, I
         &metadata,
         &["gameLength", "GameLength", "game_length", "gameDuration"],
     );
-    let players = players_from_metadata(&metadata, data_dragon_version.as_deref());
+    let MatchStats {
+        players,
+        teams,
+        ended_in_surrender,
+        ended_in_early_surrender,
+    } = match_stats(&metadata, data_dragon_version.as_deref());
     let (blue_kills, red_kills, winning_team) = team_summary(&players);
 
     Ok(ReplayInspection {
@@ -228,6 +297,9 @@ fn inspect_rofl2(path: PathBuf, file_name: String) -> Result<ReplayInspection, I
         winning_team,
         blue_kills,
         red_kills,
+        teams,
+        ended_in_surrender,
+        ended_in_early_surrender,
         players,
         metadata,
         notes: vec!["ROFL2 metadata read from trailer".to_string()],
@@ -256,6 +328,9 @@ fn base_inspection(
         winning_team: None,
         blue_kills: 0,
         red_kills: 0,
+        teams: Vec::new(),
+        ended_in_surrender: false,
+        ended_in_early_surrender: false,
         players: Vec::new(),
         metadata: Value::Null,
         notes: vec![note.into()],
@@ -352,16 +427,69 @@ fn get_u64(value: &Value, keys: &[&str]) -> Option<u64> {
         })
 }
 
-fn players_from_metadata(metadata: &Value, data_dragon_version: Option<&str>) -> Vec<PlayerStats> {
-    let stats = get_string(metadata, &["statsJson", "statsJSON"])
+struct MatchStats {
+    players: Vec<PlayerStats>,
+    teams: Vec<TeamSummary>,
+    ended_in_surrender: bool,
+    ended_in_early_surrender: bool,
+}
+
+fn match_stats(metadata: &Value, data_dragon_version: Option<&str>) -> MatchStats {
+    let rows = get_string(metadata, &["statsJson", "statsJSON"])
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
-
-    stats
+    let players: Vec<_> = rows
         .iter()
         .enumerate()
         .map(|(index, player)| player_from_stats(index, player, data_dragon_version))
+        .collect();
+    let flag = |key: &str| rows.iter().any(|row| num(row, key) > 0);
+    let ended_in_early_surrender = flag("GAME_ENDED_IN_EARLY_SURRENDER");
+
+    MatchStats {
+        teams: team_summaries(&rows, &players),
+        ended_in_surrender: ended_in_early_surrender || flag("GAME_ENDED_IN_SURRENDER"),
+        ended_in_early_surrender,
+        players,
+    }
+}
+
+/// Per-team totals, Blue then Red; teams with no players are omitted.
+fn team_summaries(rows: &[Value], players: &[PlayerStats]) -> Vec<TeamSummary> {
+    ["Blue", "Red"]
+        .iter()
+        .filter_map(|team| {
+            let members: Vec<_> = rows
+                .iter()
+                .zip(players)
+                .filter(|(_, player)| player.team == *team)
+                .collect();
+            if members.is_empty() {
+                return None;
+            }
+            let sum = |key: &str| members.iter().map(|(row, _)| num(row, key)).sum();
+            Some(TeamSummary {
+                team: team.to_string(),
+                win: members.iter().any(|(_, player)| player.win),
+                kills: members.iter().map(|(_, player)| player.kills).sum(),
+                deaths: members.iter().map(|(_, player)| player.deaths).sum(),
+                assists: members.iter().map(|(_, player)| player.assists).sum(),
+                gold_earned: members.iter().map(|(_, player)| player.gold_earned).sum(),
+                damage_to_champions: members
+                    .iter()
+                    .map(|(_, player)| player.damage_to_champions)
+                    .sum(),
+                towers: sum("TURRETS_KILLED"),
+                inhibitors: sum("BARRACKS_KILLED"),
+                dragons: sum("DRAGON_KILLS"),
+                elder_dragons: sum("ELDER_DRAGON_KILLS"),
+                barons: sum("BARON_KILLS"),
+                heralds: sum("RIFT_HERALD_KILLS"),
+                voidgrubs: sum("HORDE_KILLS"),
+                atakhan: sum("ATAKHAN_KILLS"),
+            })
+        })
         .collect()
 }
 
@@ -378,9 +506,12 @@ fn player_from_stats(
     let position = stat_string(player, "TEAM_POSITION")
         .or_else(|| stat_string(player, "INDIVIDUAL_POSITION"))
         .unwrap_or_else(|| fallback_position(index).to_string());
-    let kills = stat_u32(player, "CHAMPIONS_KILLED");
-    let deaths = stat_u32(player, "NUM_DEATHS");
-    let assists = stat_u32(player, "ASSISTS");
+    let kills = num(player, "CHAMPIONS_KILLED");
+    let deaths = num(player, "NUM_DEATHS");
+    let assists = num(player, "ASSISTS");
+    let minions_killed = num(player, "MINIONS_KILLED");
+    let neutral_minions_killed = num(player, "NEUTRAL_MINIONS_KILLED");
+    let id = |key: &str| stat_string(player, key).filter(|value| value != "0");
     let win = stat_string(player, "WIN")
         .map(|value| value.eq_ignore_ascii_case("Win"))
         .unwrap_or(false);
@@ -397,22 +528,55 @@ fn player_from_stats(
         kills,
         deaths,
         assists,
-        creep_score: stat_u32(player, "MINIONS_KILLED")
-            + stat_u32(player, "NEUTRAL_MINIONS_KILLED"),
-        gold_earned: stat_u32(player, "GOLD_EARNED"),
-        damage_to_champions: stat_u32(player, "TOTAL_DAMAGE_DEALT_TO_CHAMPIONS"),
-        vision_score: stat_u32(player, "VISION_SCORE"),
+        creep_score: minions_killed + neutral_minions_killed,
+        gold_earned: num(player, "GOLD_EARNED"),
+        damage_to_champions: num(player, "TOTAL_DAMAGE_DEALT_TO_CHAMPIONS"),
+        vision_score: num(player, "VISION_SCORE"),
         items: player_items(player, data_dragon_version),
         summoner_spells: ["SUMMONER_SPELL_1", "SUMMONER_SPELL_2"]
             .iter()
-            .filter_map(|key| stat_string(player, key))
-            .filter(|value| value != "0")
+            .filter_map(|key| id(key))
             .collect(),
         perks: ["PERK0", "PERK1", "PERK2", "PERK3", "PERK4", "PERK5"]
             .iter()
-            .filter_map(|key| stat_string(player, key))
-            .filter(|value| value != "0")
+            .filter_map(|key| id(key))
             .collect(),
+        riot_tag_line: stat_string(player, "RIOT_ID_TAG_LINE"),
+        puuid: stat_string(player, "PUUID"),
+        level: num(player, "LEVEL"),
+        minions_killed,
+        neutral_minions_killed,
+        gold_spent: num(player, "GOLD_SPENT"),
+        physical_damage_to_champions: num(player, "PHYSICAL_DAMAGE_DEALT_TO_CHAMPIONS"),
+        magic_damage_to_champions: num(player, "MAGIC_DAMAGE_DEALT_TO_CHAMPIONS"),
+        true_damage_to_champions: num(player, "TRUE_DAMAGE_DEALT_TO_CHAMPIONS"),
+        damage_taken: num(player, "TOTAL_DAMAGE_TAKEN"),
+        damage_self_mitigated: num(player, "TOTAL_DAMAGE_SELF_MITIGATED"),
+        damage_to_buildings: num(player, "TOTAL_DAMAGE_DEALT_TO_BUILDINGS"),
+        damage_to_objectives: num(player, "TOTAL_DAMAGE_DEALT_TO_OBJECTIVES"),
+        healing: num(player, "TOTAL_HEAL"),
+        healing_on_teammates: num(player, "TOTAL_HEAL_ON_TEAMMATES"),
+        shielding_on_teammates: num(player, "TOTAL_DAMAGE_SHIELDED_ON_TEAMMATES"),
+        crowd_control_score: num(player, "TIME_CCING_OTHERS"),
+        wards_placed: num(player, "WARD_PLACED"),
+        wards_killed: num(player, "WARD_KILLED"),
+        control_wards_bought: num(player, "VISION_WARDS_BOUGHT_IN_GAME"),
+        turret_takedowns: num(player, "TURRET_TAKEDOWNS"),
+        largest_killing_spree: num(player, "LARGEST_KILLING_SPREE"),
+        largest_multi_kill: num(player, "LARGEST_MULTI_KILL"),
+        double_kills: num(player, "DOUBLE_KILLS"),
+        triple_kills: num(player, "TRIPLE_KILLS"),
+        quadra_kills: num(player, "QUADRA_KILLS"),
+        penta_kills: num(player, "PENTA_KILLS"),
+        time_spent_dead_seconds: num(player, "TOTAL_TIME_SPENT_DEAD"),
+        keystone: id("KEYSTONE_ID").or_else(|| id("PERK0")),
+        primary_style: id("PERK_PRIMARY_STYLE"),
+        sub_style: id("PERK_SUB_STYLE"),
+        stat_perks: ["STAT_PERK_0", "STAT_PERK_1", "STAT_PERK_2"]
+            .iter()
+            .filter_map(|key| id(key))
+            .collect(),
+        trinket: id("ITEM6"),
     }
 }
 
@@ -456,9 +620,18 @@ fn stat_string(player: &Value, key: &str) -> Option<String> {
     })
 }
 
-fn stat_u32(player: &Value, key: &str) -> u32 {
+/// Numeric stat; ROFL2 stores numbers as strings. Missing or malformed values read as 0.
+fn num(player: &Value, key: &str) -> u32 {
     stat_string(player, key)
-        .and_then(|value| value.parse::<u32>().ok())
+        .and_then(|value| {
+            value.parse::<u32>().ok().or_else(|| {
+                value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|number| number.is_finite() && *number >= 0.0)
+                    .map(|number| number.min(f64::from(u32::MAX)) as u32)
+            })
+        })
         .unwrap_or(0)
 }
 
@@ -528,7 +701,15 @@ fn find_ascii_version(bytes: &[u8]) -> Option<String> {
 }
 
 fn region_and_match_from_file_name(file_name: &str) -> (Option<String>, Option<String>) {
-    let stem = file_name.strip_suffix(".rofl").unwrap_or(file_name);
+    let stem = match file_name.len().checked_sub(5) {
+        Some(split)
+            if file_name.is_char_boundary(split)
+                && file_name[split..].eq_ignore_ascii_case(".rofl") =>
+        {
+            &file_name[..split]
+        }
+        _ => file_name,
+    };
     let Some((region, match_id)) = stem.split_once('-') else {
         return (None, None);
     };
@@ -565,6 +746,18 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
             .try_into()
             .expect("fixed header offset"),
     )
+}
+
+/// Builds a minimal ROFL2 file (magic + version string + JSON trailer) for tests.
+#[cfg(test)]
+pub(crate) fn rofl2_fixture_bytes(metadata: &Value, version: &str) -> Vec<u8> {
+    let raw = metadata.to_string();
+    let mut bytes = ROFL2_MAGIC.to_vec();
+    bytes.extend_from_slice(b"deadbeef");
+    bytes.extend_from_slice(version.as_bytes());
+    bytes.extend_from_slice(raw.as_bytes());
+    bytes.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    bytes
 }
 
 #[cfg(test)]
@@ -652,7 +845,36 @@ mod tests {
                     "SUMMONER_SPELL_1": "6",
                     "SUMMONER_SPELL_2": "12",
                     "PERK0": "8021",
+                    "PERK_PRIMARY_STYLE": "8000",
+                    "STAT_PERK_0": "5008",
+                    "STAT_PERK_1": "0",
+                    "PUUID": "abc-123",
+                    "LEVEL": "18",
+                    "TURRETS_KILLED": "2",
+                    "DRAGON_KILLS": "1",
+                    "HORDE_KILLS": "3",
                     "WIN": "Win"
+                },
+                {
+                    "RIOT_ID_GAME_NAME": "Ally",
+                    "RIOT_ID_TAG_LINE": "",
+                    "PUUID": "",
+                    "SKIN": "Lux",
+                    "TEAM": "100",
+                    "CHAMPIONS_KILLED": "1",
+                    "GOLD_EARNED": "1000",
+                    "TURRETS_KILLED": "1",
+                    "BARON_KILLS": "1",
+                    "WIN": "Win"
+                },
+                {
+                    "SKIN": "Zed",
+                    "TEAM": "200",
+                    "CHAMPIONS_KILLED": "7",
+                    "NUM_DEATHS": "2",
+                    "BARRACKS_KILLED": "1",
+                    "GAME_ENDED_IN_SURRENDER": "1",
+                    "WIN": "Fail"
                 }
             ])).unwrap()
         });
@@ -663,16 +885,44 @@ mod tests {
 
         let parsed = read_rofl2_metadata(&bytes).expect("metadata should parse");
         let version = find_ascii_version(&bytes[..128.min(bytes.len())]);
-        let players = players_from_metadata(&parsed, Some("16.13.1"));
+        let stats = match_stats(&parsed, Some("16.13.1"));
+        let players = &stats.players;
 
         assert_eq!(version, Some("16.13.790.6961".to_string()));
         assert_eq!(get_u64(&parsed, &["gameLength"]), Some(123000));
-        assert_eq!(players.len(), 1);
+        assert_eq!(players.len(), 3);
         assert_eq!(players[0].name, "Tester#LA2");
         assert_eq!(players[0].champion, "Nasus");
         assert_eq!(players[0].creep_score, 203);
         assert_eq!(players[0].items.len(), 3);
-        assert_eq!(team_summary(&players), (4, 0, Some("Blue".to_string())));
+        assert_eq!(players[0].riot_tag_line.as_deref(), Some("LA2"));
+        assert_eq!(players[0].puuid.as_deref(), Some("abc-123"));
+        assert_eq!(players[0].level, 18);
+        assert_eq!(players[0].minions_killed, 200);
+        assert_eq!(players[0].keystone.as_deref(), Some("8021"));
+        assert_eq!(players[0].primary_style.as_deref(), Some("8000"));
+        assert_eq!(players[0].sub_style, None);
+        assert_eq!(players[0].stat_perks, vec!["5008"]);
+        assert_eq!(players[0].trinket.as_deref(), Some("3340"));
+        assert_eq!(players[1].riot_tag_line, None);
+        assert_eq!(players[1].puuid, None);
+        assert_eq!(players[1].gold_spent, 0);
+        assert_eq!(team_summary(players), (5, 7, Some("Blue".to_string())));
+
+        assert!(stats.ended_in_surrender);
+        assert!(!stats.ended_in_early_surrender);
+        assert_eq!(stats.teams.len(), 2);
+        let (blue, red) = (&stats.teams[0], &stats.teams[1]);
+        assert_eq!((blue.team.as_str(), blue.win), ("Blue", true));
+        assert_eq!((blue.kills, blue.deaths, blue.assists), (5, 5, 6));
+        assert_eq!(blue.gold_earned, 11428);
+        assert_eq!((blue.towers, blue.dragons, blue.barons), (3, 1, 1));
+        assert_eq!((blue.voidgrubs, blue.inhibitors), (3, 0));
+        assert_eq!((red.team.as_str(), red.win), ("Red", false));
+        assert_eq!((red.kills, red.deaths, red.inhibitors), (7, 2, 1));
+
+        let empty = match_stats(&serde_json::json!({}), None);
+        assert!(empty.players.is_empty() && empty.teams.is_empty());
     }
 
     #[test]
@@ -695,5 +945,12 @@ mod tests {
         assert!(replay.game_version.is_some());
         assert_eq!(replay.players.len(), 10);
         assert!(replay.game_duration_ms.unwrap_or_default() > 0);
+        assert_eq!(replay.teams.len(), 2);
+        assert_eq!(replay.teams[0].team, "Blue");
+        assert_eq!(replay.teams[0].kills, replay.blue_kills);
+        assert_eq!(replay.teams[1].kills, replay.red_kills);
+        assert!(replay.teams.iter().any(|team| team.win));
+        assert!(replay.players.iter().all(|player| player.puuid.is_some()));
+        assert!(replay.players.iter().all(|player| player.level > 0));
     }
 }
