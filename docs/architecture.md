@@ -19,7 +19,7 @@ Reads classic ROFL headers and extracts metadata JSON. It also reads modern ROFL
 - Every length read from a replay is bounded (offset + length within the file, metadata at most 16 MB) before anything is allocated. ROFL2 reads only the header, the 4-byte trailer length at the end of the file, and the metadata JSON.
 - ROFL2 game version comes from the length-prefixed header field (magic, 8 bytes, `u8` length, version string).
 - Region and match id come from metadata when present, otherwise from file names shaped `<anything>-<PLATFORM>-<digits>.rofl` or `<PLATFORM>-<digits>.rofl`; unknown platforms give no region.
-- Error model: I/O failures are errors. Files that were read but are not usable replays return status `invalid` (or `unsupported` for ROFL2 files whose trailer is unreadable) with a reason in `notes`.
+- Error model: I/O failures are errors. Files that were read but are not usable replays return status `invalid` (or `unsupported` for ROFL2 files whose trailer is unreadable) with a reason in `notes`. `notes` only carries what the user should know (these reasons, or a guessed version); a normal read has none.
 - `dataDragonVersion` is the replay's `major.minor` patch; the UI resolves the concrete DataDragon release and builds image URLs. The raw `statsJson` string in `metadata` is replaced by `"<parsed into players>"`.
 
 Known ceiling: ROFL2 payload packet decoding is not implemented yet. Metadata and end-of-game stats are available.
@@ -33,7 +33,7 @@ Validates the request (absolute, existing `.rofl` replay; canonical, existing `L
 - `-SkipBuild -EnableLNP -UseNewX3D=1 -UseNewX3DFramebuffers=1`
 - explicit `-Locale`
 
-Argument building (`build_launch_args`) is a pure function tested on every platform; only the spawn is Windows-only.
+Argument building (`build_launch_args`) is a pure function tested on every platform; only the spawn is Windows-only. Failures reach the UI as `CommandError` (`invalidReplay`, `invalidExecutable`, `invalidLocale`, `unsupportedPlatform`, `spawn`), the same shape the install commands use.
 
 Launch is Windows-only because the League client replay flow is Windows-only in practice.
 
@@ -48,13 +48,29 @@ Launch is Windows-only because the League client replay flow is Windows-only in 
 - `store`: layout and versioned files. Install to `<dest>/Game/` (official layout, launcher uses `-GameBaseDir=<dest>`); `<dest>/.chronorift/install.json` and `install-state.json` are version 2 with paths relative to `<dest>`. Version 1 files (absolute paths, game files directly in `<dest>`) are still read.
 - `repair`: disk classification (ok / missing / wrong size) for repair plans.
 - `progress`: the engine reports through a `Progress` trait; the Tauri implementation emits `download-progress` at most ~10 times per second, always on stage changes, and always a final `complete`/`cancelled`/`failed` event.
-- `clients`: discovers installed clients under the clients root from `install.json` (v1 or v2).
+- `clients`: discovers installed clients under the clients root from `install.json` (v1 or v2) and flags `legacyLayout` when the executable is not in `<dest>/Game`.
 
 Plans are pinned: `plan_client_install` / `plan_client_repair` keep the selected files in memory under a `planId` (30 min, at most 3 plans), and `install_client` / `repair_client` run exactly that plan. Only one plan/install/repair runs at a time.
 
+### `library`
+
+Scans one folder (non-recursive) for `.rofl` files and projects each `ReplayInspection` into a `ReplaySummary`: patch, server, duration, score, champions per team, and player Riot ID game names for search. Read-only.
+
+### `settings` and `locale`
+
+`settings.json` in the app config dir: replay folder, clients root, executable, locale, last selected replay, and window size. Loading normalizes values (trims, drops malformed locales, clamps the window to at least 900x600); a missing or corrupt file yields defaults. Writes are atomic (temp file + rename). `locale` validates `xx_YY`.
+
+### Frontend (`src/`)
+
+Vanilla TypeScript, no framework. `state.ts` holds one state object and topic-based `notify`/`subscribe`; `actions.ts` holds every user action (only explicit buttons plan, install, repair, or launch); `views/` render with the `h()` helper in `dom.ts` (text via `textContent`, never `innerHTML`); `api.ts` types the commands and routes them to `mock.ts` in browser preview.
+
+On startup the UI loads settings, restores the window size (`@tauri-apps/api/window`, saved again 600 ms after resizing), scans the replay folder, and reselects the last replay if it is still listed. The library filter runs client-side over champion ids and localized names, player names, patch, server, and match id.
+
 ### DataDragon assets
 
-The UI resolves the replay patch to Riot's latest matching DataDragon version, then loads champion and item JSON for the visible locale with an `en_US` fallback. These fetches only enrich the scoreboard; they do not install or launch anything.
+The UI resolves the replay patch to Riot's latest matching DataDragon version, then loads champion, item, summoner spell, and rune JSON for the visible locale with an `en_US` fallback. Icons carry the localized name as `title` and `alt`. The library uses one champion table from the newest release in the selected locale. These fetches only enrich the view; they do not install or launch anything.
+
+Offline, the view falls back to text: champion monograms, item ids, no spell or rune icons, and a single "Static data unavailable (offline?)" note. Failed image loads fall back the same way.
 
 ## Data Storage
 

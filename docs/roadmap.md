@@ -17,7 +17,7 @@ Goal: the app opens to something useful and the whole core flow is visible.
 
 Pulled forward from Milestone 3 at the owner's request: the detail pane is a full post-game view (per-team objectives, KDA/KP, CS/min, damage share, runes, spells, vision) in the style of Porofessor/op.gg. See "Match stats" below.
 
-## Milestone 2 — Resume and repair installs (backend done; UI in progress)
+## Milestone 2 — Resume and repair installs (done)
 
 Goal: an interrupted or damaged install can be finished without starting over or overwriting blindly.
 
@@ -28,24 +28,27 @@ Goal: an interrupted or damaged install can be finished without starting over or
 - Cancel button for a running install (cooperative cancel flag checked between chunks).
 - UI: detect partial installs in the destination and offer "Review repair" instead of failing with `WouldOverwrite`.
 
+The UI shows the repair plan (ok / missing / wrong size, stale temp files, opt-in replacement), a cancel button with progress, and "Review repair" for `wouldOverwrite`, `cancelled`, and interrupted installs.
+
 ## Milestone 2b — Install pipeline rebuild (done)
 
 Found in the project audit: Riot's live service only lists the current patch, and the downloader issued one request per chunk. Rebuilt as `src-tauri/src/install/`: archive-first resolution with exact-build reporting, plan pinning by `planId`, coalesced concurrent downloads (about 250× fewer requests), size-verified atomic writes, `Game/` layout, repair pinned to the saved manifest, structured errors. See "Install pipeline contract (v2)", which supersedes the Milestone 1 and 2 install commands below.
 
-## Milestone 3 — Richer match view
+## Milestone 3 — Richer match view (done, one item open)
 
 Goal: the "CommunityDragon-enriched match view beyond the scoreboard" from the README.
 
-- Summoner spells and keystone/secondary rune icons (DataDragon `summoner.json`, `runesReforged.json`, CommunityDragon fallback for old patches).
-- Per-team totals (gold, damage, vision) and simple bars for damage share.
-- Item tooltips with names in the selected locale.
-- Graceful offline mode: text fallbacks when static data is unavailable.
+- Done: summoner spells and keystone/secondary rune icons (DataDragon `summoner.json`, `runesReforged.json`).
+- Done: per-team totals (kills, gold, damage, objectives) and bars for damage share; a Stats tab compares all ten players.
+- Done: champion, item, spell, and rune icons carry `title` and `alt` text with names in the selected locale (`en_US` fallback).
+- Done: offline mode. When DataDragon cannot be reached, champions show a two-letter monogram, items show their id in a small box, spells and runes are left out, and the detail pane shows one quiet note, "Static data unavailable (offline?)". Images that fail to load fall back the same way.
+- Open: CommunityDragon fallback for patches DataDragon does not cover (runes from before Runes Reforged, patch 7.22). Those replays show empty rune slots with the rune id in the title.
 
-## Milestone 4 — Polish and release
+## Milestone 4 — Polish and release (in progress)
 
-- Library search/filter by champion, player, patch.
-- Remember window size and last selected replay.
-- Windows bundle smoke test (`bun run tauri build`) and release notes.
+- Done: library filter matches champion ids and names (selected locale), player Riot ID game names, patch, server, and match id.
+- Done: remember the last selected replay (restored on startup when it is still in the library) and the window size (restored on startup, saved 600 ms after the last resize, not while maximized).
+- Open: Windows bundle smoke test (`bun run tauri build`) and release notes.
 
 ## Out Of Scope For Now
 
@@ -65,7 +68,7 @@ All payloads are camelCase JSON.
 | `find_installed_clients` | `{ root }` | `InstalledClient[]` |
 | `plan_client_install` | `{ request }` | `ClientInstallPlan` (unchanged) |
 | `install_client` | `{ request }` | `ClientInstallResult` (unchanged) |
-| `launch_replay` | `{ request }` | `null` (unchanged) |
+| `launch_replay` | `{ request }` | `null`; rejects with `CommandError` (see "Contract updates (Milestones 3–4)") |
 
 ```ts
 type ReplayLibrary = {
@@ -91,6 +94,7 @@ type ReplaySummary = {
   redKills: number;
   blueChampions: string[];           // champion ids in player order, e.g. ["Urgot", "LeeSin"]
   redChampions: string[];
+  players: string[];                 // Riot ID game names in player order (both teams), empty names skipped
 };
 
 type Settings = {
@@ -98,6 +102,9 @@ type Settings = {
   clientsRoot: string | null;
   executablePath: string | null;
   locale: string | null;
+  lastReplay: string | null;         // last selected replay path
+  windowWidth: number | null;        // inner size in logical px; clamped to >= 900
+  windowHeight: number | null;       // clamped to >= 600
 };
 
 // Parsed from <root>/.chronorift/install.json and <root>/*/.chronorift/install.json
@@ -109,6 +116,7 @@ type InstalledClient = {
   destinationPath: string;
   executablePath: string;
   executableExists: boolean;
+  legacyLayout: boolean;             // executable is not <destinationPath>/Game/League of Legends.exe (v1); cannot be launched
 };
 ```
 
@@ -254,13 +262,15 @@ Supersedes the install/repair parts of the Milestone 1 and 2 contracts (`plan_cl
 | `cancel_client_install` | none | `boolean` (true when a plan/install/repair was running) | — |
 
 ```ts
-// Failures of the four commands above reject with this object (not a string).
+// Failures of the four commands above, and of launch_replay, reject with this object (not a string).
 type CommandError = {
   code:
     | "invalidRegion" | "invalidPatch" | "invalidLocale" | "localeUnavailable"
     | "invalidDestination" | "releaseNotFound" | "network" | "manifest" | "io"
     | "unsafePath" | "wouldOverwrite" | "notChronoRiftInstall" | "localeMismatch"
-    | "missingExecutable" | "unknownPlan" | "cancelled" | "busy";
+    | "missingExecutable" | "unknownPlan" | "cancelled" | "busy"
+    // launch_replay only:
+    | "invalidReplay" | "invalidExecutable" | "unsupportedPlatform" | "spawn";
   message: string;                   // human readable, safe to show as is
   path?: string;                     // io, wouldOverwrite, notChronoRiftInstall, missingExecutable
   availableLocales?: string[];       // localeUnavailable: what the manifest offers (sorted)
@@ -326,6 +336,7 @@ type ClientRepairPlan = {
   planId: string;
   expiresAtMs: number;
   patch: string;
+  requestedVersion: string | null;   // replay build from install-state.json; null when the state does not know it (v1)
   resolvedVersion: string;
   exactBuild: boolean;
   source: "archive" | "sieve";
@@ -403,3 +414,19 @@ type InstallRecord = Release & {     // install.json, written on completion
 ```
 
 Version 1 files (no `version` in `install.json`, `version: 1` in the state; absolute `destinationPath`/`executablePath`) are still read by `find_installed_clients` and repair.
+
+## Contract updates (Milestones 3–4)
+
+- `ReplaySummary.players`, `Settings.lastReplay` / `windowWidth` / `windowHeight`, `InstalledClient.legacyLayout`, and `ClientRepairPlan.requestedVersion` are shown inline above.
+- `ReplayInspection.notes` only holds things the user should know: why a file is invalid or unsupported, or that the version was guessed. A normal read has no notes.
+- `launch_replay` rejects with the same `CommandError` shape as the install commands:
+
+| Code | When | `path` |
+| --- | --- | --- |
+| `invalidReplay` | replay path not absolute, not `.rofl`, or missing | replay |
+| `invalidExecutable` | executable missing, not `League of Legends.exe`, or not in a `Game` folder | executable |
+| `invalidLocale` | locale not shaped `xx_YY` | — |
+| `unsupportedPlatform` | not Windows | — |
+| `spawn` | the process could not be started | — |
+
+- Capabilities: `core:window:allow-set-size`, `allow-inner-size`, and `allow-scale-factor` for the window size restore.
