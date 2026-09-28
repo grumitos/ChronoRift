@@ -1,12 +1,15 @@
-mod client;
-mod clients;
+mod install;
 mod launcher;
 mod library;
 mod locale;
-mod repair;
 mod rofl;
 mod settings;
 
+use install::{
+    clients::InstalledClient, ClientInstallPlan, ClientInstallRequest, ClientInstallResult,
+    ClientRepairPlan, ClientRepairPlanRequest, ClientRepairRequest, CommandError,
+    InstallClientRequest, InstallRuntime,
+};
 use rofl::ReplayInspection;
 use settings::Settings;
 use std::path::PathBuf;
@@ -30,8 +33,8 @@ async fn scan_replay_folder(path: String) -> Result<library::ReplayLibrary, Stri
 }
 
 #[tauri::command]
-fn find_installed_clients(root: String) -> Result<Vec<clients::InstalledClient>, String> {
-    Ok(clients::find_installed_clients(root))
+fn find_installed_clients(root: String) -> Result<Vec<InstalledClient>, String> {
+    Ok(install::clients::find_installed_clients(root))
 }
 
 fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -60,48 +63,44 @@ async fn launch_replay(request: launcher::LaunchReplayRequest) -> Result<(), Str
 }
 
 #[tauri::command]
-async fn install_client(
+async fn plan_client_install(
     app: tauri::AppHandle,
-    request: client::ClientInstallRequest,
-) -> Result<client::ClientInstallResult, String> {
-    client::install_client(app, request)
-        .await
-        .map_err(|err| err.to_string())
+    runtime: tauri::State<'_, InstallRuntime>,
+    request: ClientInstallRequest,
+) -> Result<ClientInstallPlan, CommandError> {
+    Ok(install::plan_client_install(&runtime, &app, request).await?)
 }
 
 #[tauri::command]
-async fn plan_client_install(
+async fn install_client(
     app: tauri::AppHandle,
-    request: client::ClientInstallRequest,
-) -> Result<client::ClientInstallPlan, String> {
-    client::plan_client_install(app, request)
-        .await
-        .map_err(|err| err.to_string())
+    runtime: tauri::State<'_, InstallRuntime>,
+    request: InstallClientRequest,
+) -> Result<ClientInstallResult, CommandError> {
+    Ok(install::install_client(&runtime, &app, request).await?)
 }
 
 #[tauri::command]
 async fn plan_client_repair(
     app: tauri::AppHandle,
-    request: client::ClientInstallRequest,
-) -> Result<repair::ClientRepairPlan, String> {
-    repair::plan_client_repair(app, request)
-        .await
-        .map_err(|err| err.to_string())
+    runtime: tauri::State<'_, InstallRuntime>,
+    request: ClientRepairPlanRequest,
+) -> Result<ClientRepairPlan, CommandError> {
+    Ok(install::plan_client_repair(&runtime, &app, request).await?)
 }
 
 #[tauri::command]
 async fn repair_client(
     app: tauri::AppHandle,
-    request: repair::ClientRepairRequest,
-) -> Result<client::ClientInstallResult, String> {
-    repair::repair_client(app, request)
-        .await
-        .map_err(|err| err.to_string())
+    runtime: tauri::State<'_, InstallRuntime>,
+    request: ClientRepairRequest,
+) -> Result<ClientInstallResult, CommandError> {
+    Ok(install::repair_client(&runtime, &app, request).await?)
 }
 
 #[tauri::command]
-fn cancel_client_install(app: tauri::AppHandle) -> bool {
-    client::cancel_client_install(&app)
+fn cancel_client_install(runtime: tauri::State<'_, InstallRuntime>) -> bool {
+    runtime.cancel()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -109,8 +108,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .manage(client::InstallCancel::default())
-        .manage(client::InstallBusy::default())
+        .manage(InstallRuntime::default())
         .invoke_handler(tauri::generate_handler![
             inspect_replay,
             scan_replay_folder,

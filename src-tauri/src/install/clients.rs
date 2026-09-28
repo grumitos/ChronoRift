@@ -1,13 +1,8 @@
-use crate::client::ClientInstallResult;
-use serde::Serialize;
-use std::{
-    cmp::Ordering,
-    fs,
-    path::{Path, PathBuf},
-};
+//! Finds ChronoRift-installed clients under a clients root. Read-only.
 
-const METADATA_DIR: &str = ".chronorift";
-const METADATA_FILE: &str = "install.json";
+use super::store::{self, METADATA_DIR};
+use serde::Serialize;
+use std::{cmp::Ordering, fs, path::Path};
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -21,8 +16,8 @@ pub struct InstalledClient {
     pub executable_exists: bool,
 }
 
-/// Reads `<root>/.chronorift/install.json` and `<root>/*/.chronorift/install.json`.
-/// Read-only; unreadable or corrupt entries are skipped, and a missing root yields no clients.
+/// Reads `<root>/.chronorift/install.json` and `<root>/*/.chronorift/install.json` (v1 or
+/// v2). Unreadable or corrupt entries are skipped, and a missing root yields no clients.
 pub fn find_installed_clients(root: impl AsRef<Path>) -> Vec<InstalledClient> {
     let root = root.as_ref();
     if !root.is_dir() {
@@ -42,7 +37,16 @@ pub fn find_installed_clients(root: impl AsRef<Path>) -> Vec<InstalledClient> {
 
     let mut clients: Vec<_> = candidates
         .iter()
-        .filter_map(|dir| read_install_metadata(dir))
+        .filter_map(|dir| store::read_record(dir).ok().flatten())
+        .map(|stored| InstalledClient {
+            executable_exists: stored.executable_path.is_file(),
+            patch: stored.record.release.patch,
+            resolved_version: stored.record.release.resolved_version,
+            region: stored.record.release.region,
+            locale: stored.record.release.locale,
+            destination_path: stored.root.display().to_string(),
+            executable_path: stored.executable_path.display().to_string(),
+        })
         .collect();
     clients.sort_by(|a, b| {
         compare_versions(&b.patch, &a.patch)
@@ -50,23 +54,6 @@ pub fn find_installed_clients(root: impl AsRef<Path>) -> Vec<InstalledClient> {
             .then_with(|| a.destination_path.cmp(&b.destination_path))
     });
     clients
-}
-
-fn read_install_metadata(dir: &Path) -> Option<InstalledClient> {
-    let path: PathBuf = dir.join(METADATA_DIR).join(METADATA_FILE);
-    let bytes = fs::read(path).ok()?;
-    let result: ClientInstallResult = serde_json::from_slice(&bytes).ok()?;
-    let executable_exists = Path::new(&result.executable_path).is_file();
-
-    Some(InstalledClient {
-        patch: result.patch,
-        resolved_version: result.resolved_version,
-        region: result.region,
-        locale: result.locale,
-        destination_path: result.destination_path,
-        executable_path: result.executable_path,
-        executable_exists,
-    })
 }
 
 /// Compares dotted versions numerically segment by segment (14.10 > 14.9).
@@ -94,58 +81,65 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::install::store::{
+        tests::{release, temp_root},
+        write_record, InstallRecord, GAME_DIR, GAME_EXE, RECORD_FILE, STORE_VERSION,
+    };
+    use std::path::PathBuf;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "chronorift-clients-{name}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn write_metadata(dir: &Path, patch: &str, with_exe: bool) {
-        let exe = dir.join("Game").join("League of Legends.exe");
+    fn write_v2(dir: &Path, patch: &str, with_exe: bool) -> PathBuf {
+        let exe = dir.join(GAME_DIR).join(GAME_EXE);
         if with_exe {
             fs::create_dir_all(exe.parent().unwrap()).unwrap();
             fs::write(&exe, b"").unwrap();
         }
-        let result = ClientInstallResult {
-            patch: patch.to_string(),
-            resolved_version: format!("{patch}.100.1000"),
-            region: "LA2".to_string(),
-            locale: "es_MX".to_string(),
-            destination_path: dir.display().to_string(),
-            executable_path: exe.display().to_string(),
-            manifest_url: "https://example.invalid/manifest".to_string(),
-            file_count: 1,
-            download_bytes: 2,
-            install_bytes: 3,
-        };
+        let mut release = release();
+        release.patch = patch.into();
+        release.resolved_version = format!("{patch}.1000");
+        write_record(
+            dir,
+            &InstallRecord {
+                version: STORE_VERSION,
+                release,
+                game_dir: GAME_DIR.into(),
+                file_count: 1,
+                download_bytes: 2,
+                install_bytes: 3,
+                installed_at_ms: 4,
+            },
+        )
+        .unwrap();
+        exe
+    }
+
+    fn write_v1(dir: &Path, patch: &str) {
         let meta = dir.join(METADATA_DIR);
         fs::create_dir_all(&meta).unwrap();
         fs::write(
-            meta.join(METADATA_FILE),
-            serde_json::to_vec_pretty(&result).unwrap(),
+            meta.join(RECORD_FILE),
+            serde_json::json!({
+                "patch": patch, "resolvedVersion": format!("{patch}.100.1000"),
+                "region": "LA2", "locale": "es_MX",
+                "destinationPath": dir.display().to_string(),
+                "executablePath": dir.join(GAME_EXE).display().to_string(),
+                "manifestUrl": "https://example.invalid/releases/A.manifest",
+                "fileCount": 1, "downloadBytes": 2, "installBytes": 3
+            })
+            .to_string(),
         )
         .unwrap();
     }
 
     #[test]
-    fn discovers_clients_at_root_and_one_level_down() {
-        let root = temp_dir("discover");
-        write_metadata(&root, "14.2", false);
-        write_metadata(&root.join("14.9"), "14.9", true);
-        write_metadata(&root.join("14.10"), "14.10", false);
-        write_metadata(&root.join("a").join("deep"), "15.1", true);
+    fn discovers_v1_and_v2_clients_at_root_and_one_level_down() {
+        let root = temp_root("clients");
+        write_v1(&root, "14.2");
+        let exe = write_v2(&root.join("14.9"), "14.9", true);
+        write_v2(&root.join("14.10"), "14.10", false);
+        write_v2(&root.join("a").join("deep"), "15.1", true);
         let corrupt = root.join("corrupt").join(METADATA_DIR);
         fs::create_dir_all(&corrupt).unwrap();
-        fs::write(corrupt.join(METADATA_FILE), b"{ nope").unwrap();
+        fs::write(corrupt.join(RECORD_FILE), b"{ nope").unwrap();
         fs::create_dir_all(root.join("empty")).unwrap();
 
         let clients = find_installed_clients(&root);
@@ -155,8 +149,12 @@ mod tests {
         assert_eq!(patches, vec!["14.10", "14.9", "14.2"]);
         assert!(!clients[0].executable_exists);
         assert!(clients[1].executable_exists);
-        assert_eq!(clients[1].locale, "es_MX");
-        assert_eq!(clients[1].resolved_version, "14.9.100.1000");
+        assert_eq!(clients[1].executable_path, exe.display().to_string());
+        assert_eq!(
+            clients[1].destination_path,
+            root.join("14.9").display().to_string()
+        );
+        assert_eq!(clients[2].resolved_version, "14.2.100.1000");
 
         let json = serde_json::to_value(&clients[1]).unwrap();
         let mut keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
@@ -177,9 +175,8 @@ mod tests {
 
     #[test]
     fn missing_root_yields_no_clients() {
-        let root = temp_dir("missing");
+        let root = temp_root("clients-missing");
         fs::remove_dir_all(&root).unwrap();
-
         assert!(find_installed_clients(&root).is_empty());
     }
 
