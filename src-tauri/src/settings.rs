@@ -1,4 +1,4 @@
-use crate::client::normalize_locale;
+use crate::locale::normalize_locale;
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,

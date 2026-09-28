@@ -34,13 +34,11 @@ export type ReplayLibrary = {
 export type PlayerItem = {
   slot: number;
   id: string;
-  imageUrl: string | null;
 };
 
 export type PlayerStats = {
   name: string;
   champion: string;
-  championImageUrl: string | null;
   team: string;
   position: string;
   win: boolean;
@@ -116,6 +114,7 @@ export type ReplayInspection = {
   patch: string | null;
   region: string | null;
   suggestedLocale: string | null;
+  /** Replay "major.minor" patch; resolve the concrete release with datadragon.resolveVersion. */
   dataDragonVersion: string | null;
   matchId: string | null;
   gameDurationMs: number | null;
@@ -123,6 +122,7 @@ export type ReplayInspection = {
   blueKills: number;
   redKills: number;
   players: PlayerStats[];
+  /** Replay metadata JSON; its raw `statsJson` string is replaced by "<parsed into players>". */
   metadata: unknown;
   notes: string[];
   /** Blue then Red; empty when the replay carries no stats. */

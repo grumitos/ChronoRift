@@ -40,9 +40,14 @@ ChronoRift maps known replay platform ids to a default locale:
 | EUN1, EUW1 | `en_GB` |
 | JP1 | `ja_JP` |
 | KR | `ko_KR` |
-| LA1, LA2 | `es_MX` |
-| NA1, OC1, PH2, SG2 | `en_US` |
+| LA1 | `es_MX` |
+| LA2 | `es_AR` |
+| ME1 | `ar_AE` |
+| NA1 | `en_US` |
+| OC1 | `en_AU` |
+| PH2 | `en_PH` |
 | RU | `ru_RU` |
+| SG2 | `en_SG` |
 | TH2 | `th_TH` |
 | TR1 | `tr_TR` |
 | TW2 | `zh_TW` |

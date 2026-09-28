@@ -8,9 +8,27 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const CLASSIC_MAGIC: &[u8; 6] = b"RIOT\0\0";
-const ROFL2_MAGIC: &[u8; 6] = b"RIOT\x02\0";
+const MAGIC_LEN: usize = 6;
+const CLASSIC_MAGIC: &[u8; MAGIC_LEN] = b"RIOT\0\0";
+const ROFL2_MAGIC: &[u8; MAGIC_LEN] = b"RIOT\x02\0";
 const CLASSIC_HEADER_LEN: usize = 288;
+/// ROFL2 header: magic(6) + 8 unknown bytes, then a u8 length and the game version.
+const ROFL2_VERSION_LEN_OFFSET: usize = MAGIC_LEN + 8;
+/// ROFL2 ends with the metadata JSON followed by its u32 little-endian length.
+const ROFL2_TRAILER_LEN: u64 = 4;
+/// Upper bound for any metadata block read from an untrusted replay.
+const MAX_METADATA_LEN: u64 = 16 * 1024 * 1024;
+/// Only the leading u64 match id is read from the classic payload header.
+const PAYLOAD_MATCH_ID_LEN: u64 = 8;
+const STATS_JSON_KEYS: [&str; 2] = ["statsJson", "statsJSON"];
+/// Replaces the raw `statsJson` string in `metadata` sent to the UI.
+pub const STATS_PLACEHOLDER: &str = "<parsed into players>";
+
+/// Riot platform ids ChronoRift recognizes in metadata and file names.
+const KNOWN_PLATFORMS: [&str; 17] = [
+    "BR1", "EUN1", "EUW1", "JP1", "KR", "LA1", "LA2", "ME1", "NA1", "OC1", "PH2", "RU", "SG2",
+    "TH2", "TR1", "TW2", "VN2",
+];
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -20,11 +38,12 @@ pub enum ReplayFormat {
     Unknown,
 }
 
+/// `Invalid`: not a readable replay (too small, no RIOT magic, broken header).
+/// `Unsupported`: recognized ROFL2 file whose trailer metadata could not be read.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum ReplayStatus {
     Parsed,
-    #[allow(dead_code)]
     Unsupported,
     Invalid,
 }
@@ -40,6 +59,8 @@ pub struct ReplayInspection {
     pub patch: Option<String>,
     pub region: Option<String>,
     pub suggested_locale: Option<String>,
+    /// The replay's "major.minor" patch. The frontend resolves the concrete
+    /// DataDragon release (e.g. "14.8" -> "14.8.1") from Riot's versions list.
     pub data_dragon_version: Option<String>,
     pub match_id: Option<String>,
     pub game_duration_ms: Option<u64>,
@@ -50,6 +71,7 @@ pub struct ReplayInspection {
     pub ended_in_surrender: bool,
     pub ended_in_early_surrender: bool,
     pub players: Vec<PlayerStats>,
+    /// Replay metadata JSON; `statsJson` is replaced by [`STATS_PLACEHOLDER`].
     pub metadata: Value,
     pub notes: Vec<String>,
 }
@@ -59,7 +81,6 @@ pub struct ReplayInspection {
 pub struct PlayerStats {
     pub name: String,
     pub champion: String,
-    pub champion_image_url: Option<String>,
     pub team: String,
     pub position: String,
     pub win: bool,
@@ -133,16 +154,14 @@ pub struct TeamSummary {
 pub struct PlayerItem {
     pub slot: u8,
     pub id: String,
-    pub image_url: Option<String>,
 }
 
+/// Only I/O failures and unusable paths are errors. A file that was read but is
+/// not a usable replay comes back as `Ok` with `Invalid`/`Unsupported` and a note.
 #[derive(Debug)]
 pub enum InspectError {
     Io(io::Error),
     InvalidPath,
-    InvalidHeader(&'static str),
-    InvalidMetadata(serde_json::Error),
-    InvalidRofl2MetadataLength,
 }
 
 impl Display for InspectError {
@@ -150,9 +169,6 @@ impl Display for InspectError {
         match self {
             Self::Io(err) => write!(f, "{err}"),
             Self::InvalidPath => write!(f, "Invalid replay path"),
-            Self::InvalidHeader(reason) => write!(f, "Invalid ROFL header: {reason}"),
-            Self::InvalidMetadata(err) => write!(f, "Invalid ROFL metadata JSON: {err}"),
-            Self::InvalidRofl2MetadataLength => write!(f, "Invalid ROFL2 metadata length"),
         }
     }
 }
@@ -173,6 +189,39 @@ struct ClassicHeader {
     payload_header_length: u32,
 }
 
+/// Identity of the file being inspected, shared by every result.
+struct Source<'a> {
+    path: &'a Path,
+    file_name: &'a str,
+}
+
+impl Source<'_> {
+    fn empty(&self, format: ReplayFormat, status: ReplayStatus, note: String) -> ReplayInspection {
+        ReplayInspection {
+            path: self.path.display().to_string(),
+            file_name: self.file_name.to_string(),
+            format,
+            status,
+            game_version: None,
+            patch: None,
+            region: None,
+            suggested_locale: None,
+            data_dragon_version: None,
+            match_id: None,
+            game_duration_ms: None,
+            winning_team: None,
+            blue_kills: 0,
+            red_kills: 0,
+            teams: Vec::new(),
+            ended_in_surrender: false,
+            ended_in_early_surrender: false,
+            players: Vec::new(),
+            metadata: Value::Null,
+            notes: vec![note],
+        }
+    }
+}
+
 pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, InspectError> {
     let path = path.into();
     let file_name = path
@@ -180,36 +229,85 @@ pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, Inspec
         .and_then(|value| value.to_str())
         .ok_or(InspectError::InvalidPath)?
         .to_owned();
-
     let mut file = File::open(&path)?;
-    let mut header_bytes = [0; CLASSIC_HEADER_LEN];
-    let read = file.read(&mut header_bytes)?;
-    if read < CLASSIC_MAGIC.len() {
-        return Ok(base_inspection(
-            &path,
-            file_name,
+    let file_len = file.metadata()?.len();
+    let source = Source {
+        path: &path,
+        file_name: &file_name,
+    };
+    inspect_reader(&source, &mut file, file_len)
+}
+
+fn inspect_reader<R: Read + Seek>(
+    source: &Source,
+    reader: &mut R,
+    file_len: u64,
+) -> Result<ReplayInspection, InspectError> {
+    let mut head = Vec::with_capacity(CLASSIC_HEADER_LEN);
+    reader
+        .by_ref()
+        .take(CLASSIC_HEADER_LEN as u64)
+        .read_to_end(&mut head)?;
+
+    if head.len() < MAGIC_LEN {
+        return Ok(source.empty(
             ReplayFormat::Unknown,
             ReplayStatus::Invalid,
-            "File is too small to be a ROFL replay",
+            "File is too small to be a ROFL replay".to_string(),
         ));
     }
-
-    if header_bytes[..CLASSIC_MAGIC.len()] == *ROFL2_MAGIC {
-        return inspect_rofl2(path, file_name);
+    if head[..MAGIC_LEN] == *ROFL2_MAGIC {
+        return inspect_rofl2(source, reader, file_len, &head);
     }
+    if head[..MAGIC_LEN] == *CLASSIC_MAGIC {
+        return inspect_classic(source, reader, file_len, &head);
+    }
+    Ok(source.empty(
+        ReplayFormat::Unknown,
+        ReplayStatus::Invalid,
+        "File does not start with the RIOT replay signature".to_string(),
+    ))
+}
 
-    let header = parse_classic_header(&header_bytes)?;
-    let metadata = read_json_at(&mut file, header.metadata_offset, header.metadata_length)?;
-    let payload_header = read_slice_at(
-        &mut file,
-        header.payload_header_offset,
-        header.payload_header_length,
-    )?;
-    let payload_match_id = parse_payload_match_id(&payload_header);
+fn inspect_classic<R: Read + Seek>(
+    source: &Source,
+    reader: &mut R,
+    file_len: u64,
+    head: &[u8],
+) -> Result<ReplayInspection, InspectError> {
+    let invalid =
+        |note: String| Ok(source.empty(ReplayFormat::ClassicRofl, ReplayStatus::Invalid, note));
+    let header = match parse_classic_header(head) {
+        Ok(header) => header,
+        Err(reason) => return invalid(format!("Invalid ROFL header: {reason}")),
+    };
+    let (offset, length) = (
+        u64::from(header.metadata_offset),
+        u64::from(header.metadata_length),
+    );
+    if let Err(reason) = check_range(offset, length, file_len, MAX_METADATA_LEN) {
+        return invalid(format!("Metadata block {reason}"));
+    }
+    let metadata = match serde_json::from_slice::<Value>(&read_range(reader, offset, length)?) {
+        Ok(value) if value.is_object() => value,
+        _ => return invalid("Metadata block is not a JSON object".to_string()),
+    };
 
+    let (payload_offset, payload_length) = (
+        u64::from(header.payload_header_offset),
+        u64::from(header.payload_header_length),
+    );
+    let payload_match_id = match check_range(payload_offset, payload_length, file_len, u64::MAX) {
+        Ok(()) => parse_payload_match_id(&read_range(
+            reader,
+            payload_offset,
+            payload_length.min(PAYLOAD_MATCH_ID_LEN),
+        )?),
+        Err(_) => None,
+    };
+
+    let (file_region, file_match_id) = region_and_match_from_file_name(source.file_name);
     let game_version = get_string(&metadata, &["gameVersion", "GameVersion", "game_version"]);
-    let patch = game_version.as_deref().and_then(patch_from_version);
-    let data_dragon_version = patch.as_deref().map(data_dragon_version_from_patch);
     let region = get_string(
         &metadata,
         &[
@@ -221,8 +319,81 @@ pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, Inspec
             "gameServerRegion",
         ],
     )
-    .map(|value| value.to_ascii_uppercase());
-    let suggested_locale = region.as_deref().and_then(suggest_locale_for_region);
+    .and_then(|value| known_platform(&value))
+    .or(file_region);
+    let match_id = payload_match_id
+        .or_else(|| get_string(&metadata, &["gameId", "GameId", "matchId", "MatchId"]))
+        .or(file_match_id);
+
+    Ok(parsed_inspection(
+        source,
+        ReplayFormat::ClassicRofl,
+        metadata,
+        game_version,
+        region,
+        match_id,
+        Vec::new(),
+    ))
+}
+
+fn inspect_rofl2<R: Read + Seek>(
+    source: &Source,
+    reader: &mut R,
+    file_len: u64,
+    head: &[u8],
+) -> Result<ReplayInspection, InspectError> {
+    let (header_version, version_note) = match rofl2_header_version(head) {
+        Some(version) => (Some(version), None),
+        None => (
+            find_ascii_version(&head[..head.len().min(128)]),
+            Some("ROFL2 version field missing; version guessed from header bytes".to_string()),
+        ),
+    };
+    let (region, file_match_id) = region_and_match_from_file_name(source.file_name);
+
+    let metadata = match read_rofl2_trailer(reader, file_len)? {
+        Ok(metadata) => metadata,
+        Err(reason) => {
+            let mut inspection = source.empty(
+                ReplayFormat::Rofl2,
+                ReplayStatus::Unsupported,
+                format!("ROFL2 trailer metadata unreadable: {reason}"),
+            );
+            inspection.patch = header_version.as_deref().and_then(patch_from_version);
+            inspection.data_dragon_version = inspection.patch.clone();
+            inspection.game_version = header_version;
+            inspection.suggested_locale = region.as_deref().and_then(suggest_locale_for_region);
+            inspection.region = region;
+            inspection.match_id = file_match_id;
+            return Ok(inspection);
+        }
+    };
+
+    let match_id =
+        get_string(&metadata, &["gameId", "GameId", "matchId", "MatchId"]).or(file_match_id);
+    let mut notes = vec!["ROFL2 metadata read from trailer".to_string()];
+    notes.extend(version_note);
+    Ok(parsed_inspection(
+        source,
+        ReplayFormat::Rofl2,
+        metadata,
+        header_version,
+        region,
+        match_id,
+        notes,
+    ))
+}
+
+fn parsed_inspection(
+    source: &Source,
+    format: ReplayFormat,
+    mut metadata: Value,
+    game_version: Option<String>,
+    region: Option<String>,
+    match_id: Option<String>,
+    notes: Vec<String>,
+) -> ReplayInspection {
+    let patch = game_version.as_deref().and_then(patch_from_version);
     let game_duration_ms = get_u64(
         &metadata,
         &["gameLength", "GameLength", "game_length", "gameDuration"],
@@ -232,21 +403,20 @@ pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, Inspec
         teams,
         ended_in_surrender,
         ended_in_early_surrender,
-    } = match_stats(&metadata, data_dragon_version.as_deref());
+    } = match_stats(&metadata);
+    strip_stats_json(&mut metadata);
     let (blue_kills, red_kills, winning_team) = team_summary(&players);
-    let match_id = payload_match_id
-        .or_else(|| get_string(&metadata, &["gameId", "GameId", "matchId", "MatchId"]));
 
-    Ok(ReplayInspection {
-        path: path.display().to_string(),
-        file_name,
-        format: ReplayFormat::ClassicRofl,
+    ReplayInspection {
+        path: source.path.display().to_string(),
+        file_name: source.file_name.to_string(),
+        format,
         status: ReplayStatus::Parsed,
         game_version,
+        data_dragon_version: patch.clone(),
         patch,
+        suggested_locale: region.as_deref().and_then(suggest_locale_for_region),
         region,
-        suggested_locale,
-        data_dragon_version,
         match_id,
         game_duration_ms,
         winning_team,
@@ -257,151 +427,106 @@ pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, Inspec
         ended_in_early_surrender,
         players,
         metadata,
-        notes: Vec::new(),
-    })
-}
-
-fn inspect_rofl2(path: PathBuf, file_name: String) -> Result<ReplayInspection, InspectError> {
-    let bytes = std::fs::read(&path)?;
-    let metadata = read_rofl2_metadata(&bytes)?;
-    let game_version = find_ascii_version(&bytes[..bytes.len().min(128)]);
-    let patch = game_version.as_deref().and_then(patch_from_version);
-    let data_dragon_version = patch.as_deref().map(data_dragon_version_from_patch);
-    let (region, file_match_id) = region_and_match_from_file_name(&file_name);
-    let suggested_locale = region.as_deref().and_then(suggest_locale_for_region);
-    let game_duration_ms = get_u64(
-        &metadata,
-        &["gameLength", "GameLength", "game_length", "gameDuration"],
-    );
-    let MatchStats {
-        players,
-        teams,
-        ended_in_surrender,
-        ended_in_early_surrender,
-    } = match_stats(&metadata, data_dragon_version.as_deref());
-    let (blue_kills, red_kills, winning_team) = team_summary(&players);
-
-    Ok(ReplayInspection {
-        path: path.display().to_string(),
-        file_name,
-        format: ReplayFormat::Rofl2,
-        status: ReplayStatus::Parsed,
-        game_version,
-        patch,
-        region,
-        suggested_locale,
-        data_dragon_version,
-        match_id: get_string(&metadata, &["gameId", "GameId", "matchId", "MatchId"])
-            .or(file_match_id),
-        game_duration_ms,
-        winning_team,
-        blue_kills,
-        red_kills,
-        teams,
-        ended_in_surrender,
-        ended_in_early_surrender,
-        players,
-        metadata,
-        notes: vec!["ROFL2 metadata read from trailer".to_string()],
-    })
-}
-
-fn base_inspection(
-    path: &Path,
-    file_name: String,
-    format: ReplayFormat,
-    status: ReplayStatus,
-    note: impl Into<String>,
-) -> ReplayInspection {
-    ReplayInspection {
-        path: path.display().to_string(),
-        file_name,
-        format,
-        status,
-        game_version: None,
-        patch: None,
-        region: None,
-        suggested_locale: None,
-        data_dragon_version: None,
-        match_id: None,
-        game_duration_ms: None,
-        winning_team: None,
-        blue_kills: 0,
-        red_kills: 0,
-        teams: Vec::new(),
-        ended_in_surrender: false,
-        ended_in_early_surrender: false,
-        players: Vec::new(),
-        metadata: Value::Null,
-        notes: vec![note.into()],
+        notes,
     }
 }
 
-fn read_rofl2_metadata(bytes: &[u8]) -> Result<Value, InspectError> {
-    if bytes.len() < 4 {
-        return Err(InspectError::InvalidRofl2MetadataLength);
+/// Reads the ROFL2 trailer (JSON followed by its u32 LE length) without
+/// touching the rest of the file. The inner `Err` explains a malformed trailer.
+fn read_rofl2_trailer<R: Read + Seek>(
+    reader: &mut R,
+    file_len: u64,
+) -> io::Result<Result<Value, String>> {
+    let body_len = file_len.saturating_sub(MAGIC_LEN as u64);
+    if body_len < ROFL2_TRAILER_LEN {
+        return Ok(Err("file ends before the trailer length".to_string()));
     }
-
-    let metadata_length = u32::from_le_bytes(
-        bytes[bytes.len() - 4..]
-            .try_into()
-            .expect("metadata length suffix"),
-    ) as usize;
-    let metadata_start = bytes
-        .len()
-        .checked_sub(4 + metadata_length)
-        .ok_or(InspectError::InvalidRofl2MetadataLength)?;
-
-    serde_json::from_slice(&bytes[metadata_start..bytes.len() - 4])
-        .map_err(InspectError::InvalidMetadata)
+    let length_at = file_len - ROFL2_TRAILER_LEN;
+    let mut length_bytes = [0; ROFL2_TRAILER_LEN as usize];
+    reader.seek(SeekFrom::Start(length_at))?;
+    reader.read_exact(&mut length_bytes)?;
+    let length = u64::from(u32::from_le_bytes(length_bytes));
+    if length > body_len - ROFL2_TRAILER_LEN {
+        return Ok(Err(format!(
+            "trailer claims {length} bytes, more than the file holds"
+        )));
+    }
+    let start = length_at - length;
+    if let Err(reason) = check_range(start, length, file_len, MAX_METADATA_LEN) {
+        return Ok(Err(format!("metadata {reason}")));
+    }
+    Ok(
+        match serde_json::from_slice::<Value>(&read_range(reader, start, length)?) {
+            Ok(value) if value.is_object() => Ok(value),
+            Ok(_) => Err("metadata is not a JSON object".to_string()),
+            Err(err) => Err(format!("metadata is not JSON ({err})")),
+        },
+    )
 }
 
-fn parse_classic_header(bytes: &[u8]) -> Result<ClassicHeader, InspectError> {
+/// The length-prefixed version string after the ROFL2 magic, e.g. "16.17.810.4348".
+fn rofl2_header_version(head: &[u8]) -> Option<String> {
+    let length = usize::from(*head.get(ROFL2_VERSION_LEN_OFFSET)?);
+    let start = ROFL2_VERSION_LEN_OFFSET + 1;
+    let bytes = head.get(start..start + length)?;
+    let text = std::str::from_utf8(bytes).ok()?;
+    is_version_string(text).then(|| text.to_string())
+}
+
+fn is_version_string(text: &str) -> bool {
+    text.starts_with(|ch: char| ch.is_ascii_digit())
+        && text.contains('.')
+        && text.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+}
+
+fn parse_classic_header(bytes: &[u8]) -> Result<ClassicHeader, &'static str> {
     if bytes.len() < CLASSIC_HEADER_LEN {
-        return Err(InspectError::InvalidHeader(
-            "file is shorter than the classic header",
-        ));
+        return Err("file is shorter than the classic header");
+    }
+    if bytes[..MAGIC_LEN] != *CLASSIC_MAGIC {
+        return Err("missing RIOT classic magic");
     }
 
-    if bytes[..CLASSIC_MAGIC.len()] != *CLASSIC_MAGIC {
-        return Err(InspectError::InvalidHeader("missing RIOT classic magic"));
+    let header = ClassicHeader {
+        metadata_offset: u32_at(bytes, 268),
+        metadata_length: u32_at(bytes, 272),
+        payload_header_offset: u32_at(bytes, 276),
+        payload_header_length: u32_at(bytes, 280),
+    };
+    if header.metadata_length == 0 {
+        return Err("metadata length is zero");
     }
-
-    let metadata_offset = u32_at(bytes, 268);
-    let metadata_length = u32_at(bytes, 272);
-    let payload_header_offset = u32_at(bytes, 276);
-    let payload_header_length = u32_at(bytes, 280);
-
-    if metadata_length == 0 {
-        return Err(InspectError::InvalidHeader("metadata length is zero"));
-    }
-
-    Ok(ClassicHeader {
-        metadata_offset,
-        metadata_length,
-        payload_header_offset,
-        payload_header_length,
-    })
+    Ok(header)
 }
 
-fn read_json_at(file: &mut File, offset: u32, length: u32) -> Result<Value, InspectError> {
-    let bytes = read_slice_at(file, offset, length)?;
-    serde_json::from_slice(&bytes).map_err(InspectError::InvalidMetadata)
+/// Validates an untrusted `(offset, length)` pair before anything is allocated.
+fn check_range(offset: u64, length: u64, file_len: u64, cap: u64) -> Result<(), String> {
+    if length == 0 {
+        return Err("is empty".to_string());
+    }
+    if length > cap {
+        return Err(format!("claims {length} bytes, over the {cap} byte limit"));
+    }
+    match offset.checked_add(length) {
+        Some(end) if end <= file_len => Ok(()),
+        _ => Err(format!(
+            "at {offset}+{length} extends past the end of the file ({file_len} bytes)"
+        )),
+    }
 }
 
-fn read_slice_at(file: &mut File, offset: u32, length: u32) -> Result<Vec<u8>, InspectError> {
-    file.seek(SeekFrom::Start(u64::from(offset)))?;
-    let mut bytes = vec![0; length as usize];
-    file.read_exact(&mut bytes)?;
+/// Reads a range that already passed [`check_range`] (so `length` is bounded).
+fn read_range<R: Read + Seek>(reader: &mut R, offset: u64, length: u64) -> io::Result<Vec<u8>> {
+    let length = usize::try_from(length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "range too large"))?;
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut bytes = vec![0; length];
+    reader.read_exact(&mut bytes)?;
     Ok(bytes)
 }
 
 fn parse_payload_match_id(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 8 {
-        return None;
-    }
-
-    let id = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+    let id = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
     (id != 0).then(|| id.to_string())
 }
 
@@ -427,6 +552,17 @@ fn get_u64(value: &Value, keys: &[&str]) -> Option<u64> {
         })
 }
 
+fn strip_stats_json(metadata: &mut Value) {
+    let Some(object) = metadata.as_object_mut() else {
+        return;
+    };
+    for key in STATS_JSON_KEYS {
+        if let Some(value @ Value::String(_)) = object.get_mut(key) {
+            *value = Value::String(STATS_PLACEHOLDER.to_string());
+        }
+    }
+}
+
 struct MatchStats {
     players: Vec<PlayerStats>,
     teams: Vec<TeamSummary>,
@@ -434,15 +570,20 @@ struct MatchStats {
     ended_in_early_surrender: bool,
 }
 
-fn match_stats(metadata: &Value, data_dragon_version: Option<&str>) -> MatchStats {
-    let rows = get_string(metadata, &["statsJson", "statsJSON"])
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|value| value.as_array().cloned())
+fn match_stats(metadata: &Value) -> MatchStats {
+    let rows = STATS_JSON_KEYS
+        .iter()
+        .find_map(|key| metadata.get(*key).and_then(Value::as_str))
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| match value {
+            Value::Array(rows) => Some(rows),
+            _ => None,
+        })
         .unwrap_or_default();
     let players: Vec<_> = rows
         .iter()
         .enumerate()
-        .map(|(index, player)| player_from_stats(index, player, data_dragon_version))
+        .map(|(index, player)| player_from_stats(index, player))
         .collect();
     let flag = |key: &str| rows.iter().any(|row| num(row, key) > 0);
     let ended_in_early_surrender = flag("GAME_ENDED_IN_EARLY_SURRENDER");
@@ -453,6 +594,10 @@ fn match_stats(metadata: &Value, data_dragon_version: Option<&str>) -> MatchStat
         ended_in_early_surrender,
         players,
     }
+}
+
+fn saturating_sum(values: impl Iterator<Item = u32>) -> u32 {
+    values.fold(0, u32::saturating_add)
 }
 
 /// Per-team totals, Blue then Red; teams with no players are omitted.
@@ -468,18 +613,18 @@ fn team_summaries(rows: &[Value], players: &[PlayerStats]) -> Vec<TeamSummary> {
             if members.is_empty() {
                 return None;
             }
-            let sum = |key: &str| members.iter().map(|(row, _)| num(row, key)).sum();
+            let sum = |key: &str| saturating_sum(members.iter().map(|(row, _)| num(row, key)));
+            let total = |field: fn(&PlayerStats) -> u32| {
+                saturating_sum(members.iter().map(|(_, player)| field(player)))
+            };
             Some(TeamSummary {
                 team: team.to_string(),
                 win: members.iter().any(|(_, player)| player.win),
-                kills: members.iter().map(|(_, player)| player.kills).sum(),
-                deaths: members.iter().map(|(_, player)| player.deaths).sum(),
-                assists: members.iter().map(|(_, player)| player.assists).sum(),
-                gold_earned: members.iter().map(|(_, player)| player.gold_earned).sum(),
-                damage_to_champions: members
-                    .iter()
-                    .map(|(_, player)| player.damage_to_champions)
-                    .sum(),
+                kills: total(|player| player.kills),
+                deaths: total(|player| player.deaths),
+                assists: total(|player| player.assists),
+                gold_earned: total(|player| player.gold_earned),
+                damage_to_champions: total(|player| player.damage_to_champions),
                 towers: sum("TURRETS_KILLED"),
                 inhibitors: sum("BARRACKS_KILLED"),
                 dragons: sum("DRAGON_KILLS"),
@@ -493,11 +638,7 @@ fn team_summaries(rows: &[Value], players: &[PlayerStats]) -> Vec<TeamSummary> {
         .collect()
 }
 
-fn player_from_stats(
-    index: usize,
-    player: &Value,
-    data_dragon_version: Option<&str>,
-) -> PlayerStats {
+fn player_from_stats(index: usize, player: &Value) -> PlayerStats {
     let team = team_name(stat_string(player, "TEAM").as_deref());
     let champion = stat_string(player, "SKIN").unwrap_or_default();
     let name = riot_name(player)
@@ -518,21 +659,18 @@ fn player_from_stats(
 
     PlayerStats {
         name,
-        champion: champion.clone(),
-        champion_image_url: data_dragon_version
-            .filter(|_| !champion.is_empty())
-            .map(|version| champion_image_url(version, &champion)),
+        champion,
         team,
         position,
         win,
         kills,
         deaths,
         assists,
-        creep_score: minions_killed + neutral_minions_killed,
+        creep_score: minions_killed.saturating_add(neutral_minions_killed),
         gold_earned: num(player, "GOLD_EARNED"),
         damage_to_champions: num(player, "TOTAL_DAMAGE_DEALT_TO_CHAMPIONS"),
         vision_score: num(player, "VISION_SCORE"),
-        items: player_items(player, data_dragon_version),
+        items: player_items(player),
         summoner_spells: ["SUMMONER_SPELL_1", "SUMMONER_SPELL_2"]
             .iter()
             .filter_map(|key| id(key))
@@ -580,36 +718,30 @@ fn player_from_stats(
     }
 }
 
-fn player_items(player: &Value, data_dragon_version: Option<&str>) -> Vec<PlayerItem> {
+fn player_items(player: &Value) -> Vec<PlayerItem> {
     (0..=6)
         .filter_map(|slot| {
             let id = stat_string(player, &format!("ITEM{slot}"))?;
-            (id != "0").then(|| PlayerItem {
-                slot,
-                image_url: data_dragon_version.map(|version| item_image_url(version, &id)),
-                id,
-            })
+            (id != "0").then_some(PlayerItem { slot, id })
         })
         .collect()
 }
 
 fn team_summary(players: &[PlayerStats]) -> (u32, u32, Option<String>) {
-    let blue_kills = players
-        .iter()
-        .filter(|player| player.team == "Blue")
-        .map(|player| player.kills)
-        .sum();
-    let red_kills = players
-        .iter()
-        .filter(|player| player.team == "Red")
-        .map(|player| player.kills)
-        .sum();
+    let kills = |team: &str| {
+        saturating_sum(
+            players
+                .iter()
+                .filter(|player| player.team == team)
+                .map(|player| player.kills),
+        )
+    };
     let winning_team = players
         .iter()
         .find(|player| player.win)
         .map(|player| player.team.clone());
 
-    (blue_kills, red_kills, winning_team)
+    (kills("Blue"), kills("Red"), winning_team)
 }
 
 fn stat_string(player: &Value, key: &str) -> Option<String> {
@@ -620,7 +752,8 @@ fn stat_string(player: &Value, key: &str) -> Option<String> {
     })
 }
 
-/// Numeric stat; ROFL2 stores numbers as strings. Missing or malformed values read as 0.
+/// Numeric stat; ROFL2 stores numbers as strings. Missing, negative or
+/// malformed values read as 0; values above `u32::MAX` clamp.
 fn num(player: &Value, key: &str) -> u32 {
     stat_string(player, key)
         .and_then(|value| {
@@ -667,39 +800,24 @@ fn patch_from_version(version: &str) -> Option<String> {
     (!major.is_empty() && !minor.is_empty()).then(|| format!("{major}.{minor}"))
 }
 
-fn data_dragon_version_from_patch(patch: &str) -> String {
-    format!("{patch}.1")
-}
-
-fn champion_image_url(version: &str, champion: &str) -> String {
-    format!("https://ddragon.leagueoflegends.com/cdn/{version}/img/champion/{champion}.png")
-}
-
-fn item_image_url(version: &str, item: &str) -> String {
-    format!("https://ddragon.leagueoflegends.com/cdn/{version}/img/item/{item}.png")
-}
-
+/// Fallback for ROFL2 headers without a valid length-prefixed version field:
+/// the first run of digits and dots with at least two dots.
 fn find_ascii_version(bytes: &[u8]) -> Option<String> {
-    for start in 0..bytes.len() {
-        if !bytes[start].is_ascii_digit() {
-            continue;
-        }
-
-        let end = (start..bytes.len())
-            .find(|index| {
-                let byte = bytes[*index];
-                !(byte.is_ascii_digit() || byte == b'.')
-            })
-            .unwrap_or(bytes.len());
-        let candidate = std::str::from_utf8(&bytes[start..end]).ok()?;
-        if candidate.matches('.').count() >= 2 {
-            return Some(candidate.to_string());
-        }
-    }
-
-    None
+    bytes
+        .split(|byte| !(byte.is_ascii_digit() || *byte == b'.'))
+        .filter_map(|run| std::str::from_utf8(run).ok())
+        .find(|run| is_version_string(run) && run.matches('.').count() >= 2)
+        .map(str::to_string)
 }
 
+/// Uppercases `value` and returns it only if it is a known Riot platform id.
+fn known_platform(value: &str) -> Option<String> {
+    let upper = value.trim().to_ascii_uppercase();
+    KNOWN_PLATFORMS.contains(&upper.as_str()).then_some(upper)
+}
+
+/// Parses `<anything>-<PLATFORM>-<digits>.rofl` or `<PLATFORM>-<digits>.rofl`
+/// (case-insensitive). Returns `(None, None)` unless the platform is known.
 fn region_and_match_from_file_name(file_name: &str) -> (Option<String>, Option<String>) {
     let stem = match file_name.len().checked_sub(5) {
         Some(split)
@@ -710,15 +828,17 @@ fn region_and_match_from_file_name(file_name: &str) -> (Option<String>, Option<S
         }
         _ => file_name,
     };
-    let Some((region, match_id)) = stem.split_once('-') else {
+    let Some((rest, digits)) = stem.rsplit_once('-') else {
         return (None, None);
     };
-
-    (
-        (!region.is_empty()).then(|| region.to_ascii_uppercase()),
-        (!match_id.is_empty() && match_id.chars().all(|ch| ch.is_ascii_digit()))
-            .then(|| match_id.to_string()),
-    )
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return (None, None);
+    }
+    let platform = rest.rsplit_once('-').map_or(rest, |(_, platform)| platform);
+    match known_platform(platform) {
+        Some(region) => (Some(region), Some(digits.to_string())),
+        None => (None, None),
+    }
 }
 
 fn suggest_locale_for_region(region: &str) -> Option<String> {
@@ -727,9 +847,14 @@ fn suggest_locale_for_region(region: &str) -> Option<String> {
         "EUN1" | "EUW1" => "en_GB",
         "JP1" => "ja_JP",
         "KR" => "ko_KR",
-        "LA1" | "LA2" => "es_MX",
-        "NA1" | "OC1" | "PH2" | "SG2" => "en_US",
+        "LA1" => "es_MX",
+        "LA2" => "es_AR",
+        "ME1" => "ar_AE",
+        "NA1" => "en_US",
+        "OC1" => "en_AU",
+        "PH2" => "en_PH",
         "RU" => "ru_RU",
+        "SG2" => "en_SG",
         "TH2" => "th_TH",
         "TR1" => "tr_TR",
         "TW2" => "zh_TW",
@@ -748,30 +873,58 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     )
 }
 
-/// Builds a minimal ROFL2 file (magic + version string + JSON trailer) for tests.
+/// Builds a minimal ROFL2 file (magic + 8 bytes + length-prefixed version +
+/// JSON trailer) for tests.
 #[cfg(test)]
 pub(crate) fn rofl2_fixture_bytes(metadata: &Value, version: &str) -> Vec<u8> {
     let raw = metadata.to_string();
     let mut bytes = ROFL2_MAGIC.to_vec();
     bytes.extend_from_slice(b"deadbeef");
+    bytes.push(u8::try_from(version.len()).expect("short version"));
     bytes.extend_from_slice(version.as_bytes());
+    bytes.extend_from_slice(b"payload");
     bytes.extend_from_slice(raw.as_bytes());
     bytes.extend_from_slice(&(raw.len() as u32).to_le_bytes());
     bytes
 }
 
+/// Path of the real replay used by `#[ignore]` tests.
+#[cfg(test)]
+pub(crate) fn replay_sample_path() -> PathBuf {
+    PathBuf::from(
+        std::env::var("CHRONORIFT_REPLAY_SAMPLE")
+            .expect("set CHRONORIFT_REPLAY_SAMPLE to a real .rofl file to run this ignored test"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    fn inspect_bytes(file_name: &str, bytes: &[u8]) -> ReplayInspection {
+        let path = PathBuf::from(file_name);
+        let source = Source {
+            path: &path,
+            file_name,
+        };
+        inspect_reader(&source, &mut Cursor::new(bytes), bytes.len() as u64)
+            .expect("in-memory inspection never fails on I/O")
+    }
+
+    fn classic_header(metadata: (u32, u32), payload: (u32, u32)) -> Vec<u8> {
+        let mut bytes = vec![0; CLASSIC_HEADER_LEN];
+        bytes[..6].copy_from_slice(CLASSIC_MAGIC);
+        bytes[268..272].copy_from_slice(&metadata.0.to_le_bytes());
+        bytes[272..276].copy_from_slice(&metadata.1.to_le_bytes());
+        bytes[276..280].copy_from_slice(&payload.0.to_le_bytes());
+        bytes[280..284].copy_from_slice(&payload.1.to_le_bytes());
+        bytes
+    }
 
     #[test]
     fn parses_classic_header_offsets() {
-        let mut bytes = [0; CLASSIC_HEADER_LEN];
-        bytes[..6].copy_from_slice(CLASSIC_MAGIC);
-        bytes[268..272].copy_from_slice(&300u32.to_le_bytes());
-        bytes[272..276].copy_from_slice(&48u32.to_le_bytes());
-        bytes[276..280].copy_from_slice(&400u32.to_le_bytes());
-        bytes[280..284].copy_from_slice(&8u32.to_le_bytes());
+        let bytes = classic_header((300, 48), (400, 8));
 
         let header = parse_classic_header(&bytes).expect("header should parse");
 
@@ -787,7 +940,158 @@ mod tests {
 
         let err = parse_classic_header(&bytes).expect_err("header should fail");
 
-        assert!(err.to_string().contains("missing RIOT classic magic"));
+        assert!(err.contains("missing RIOT classic magic"));
+    }
+
+    #[test]
+    fn parses_classic_replay_with_metadata_and_payload_id() {
+        let metadata = serde_json::json!({
+            "gameVersion": "9.3.263.4538",
+            "gameLength": 1_500_000,
+            "statsJson": serde_json::json!([
+                { "SKIN": "Ahri", "TEAM": "100", "CHAMPIONS_KILLED": 3, "WIN": "Win" }
+            ]).to_string(),
+        })
+        .to_string();
+        let meta_offset = CLASSIC_HEADER_LEN as u32;
+        let payload_offset = meta_offset + metadata.len() as u32;
+        let mut bytes = classic_header((meta_offset, metadata.len() as u32), (payload_offset, 34));
+        bytes.extend_from_slice(metadata.as_bytes());
+        bytes.extend_from_slice(&987_654u64.to_le_bytes());
+        bytes.extend_from_slice(&[0; 26]);
+
+        let replay = inspect_bytes("replay-EUW1-1.rofl", &bytes);
+
+        assert_eq!(replay.status, ReplayStatus::Parsed);
+        assert_eq!(replay.format, ReplayFormat::ClassicRofl);
+        assert_eq!(replay.game_version.as_deref(), Some("9.3.263.4538"));
+        assert_eq!(replay.patch.as_deref(), Some("9.3"));
+        assert_eq!(replay.data_dragon_version.as_deref(), Some("9.3"));
+        assert_eq!(replay.region.as_deref(), Some("EUW1"));
+        assert_eq!(replay.suggested_locale.as_deref(), Some("en_GB"));
+        assert_eq!(replay.match_id.as_deref(), Some("987654"));
+        assert_eq!(replay.players.len(), 1);
+        assert_eq!(replay.metadata["statsJson"], STATS_PLACEHOLDER);
+        assert_eq!(replay.metadata["gameLength"], 1_500_000);
+    }
+
+    #[test]
+    fn classic_lengths_are_bounded_before_allocating() {
+        // Metadata claims 4 GB: must be rejected from the header alone.
+        let huge = classic_header((CLASSIC_HEADER_LEN as u32, u32::MAX), (0, 0));
+        let replay = inspect_bytes("huge.rofl", &huge);
+        assert_eq!(replay.status, ReplayStatus::Invalid);
+        assert_eq!(replay.format, ReplayFormat::ClassicRofl);
+        assert!(replay.notes[0].contains("limit"), "{:?}", replay.notes);
+
+        // Under the cap but past the end of the file.
+        let past_end = classic_header((u32::MAX - 10, 1024), (0, 0));
+        let replay = inspect_bytes("past.rofl", &past_end);
+        assert_eq!(replay.status, ReplayStatus::Invalid);
+        assert!(
+            replay.notes[0].contains("past the end"),
+            "{:?}",
+            replay.notes
+        );
+
+        // Payload header pointing outside the file is ignored, not fatal.
+        let metadata = br#"{"gameVersion":"9.1.1.1"}"#;
+        let mut bytes = classic_header(
+            (CLASSIC_HEADER_LEN as u32, metadata.len() as u32),
+            (u32::MAX, u32::MAX),
+        );
+        bytes.extend_from_slice(metadata);
+        let replay = inspect_bytes("ok.rofl", &bytes);
+        assert_eq!(replay.status, ReplayStatus::Parsed);
+        assert_eq!(replay.match_id, None);
+    }
+
+    #[test]
+    fn garbage_and_tiny_files_are_invalid_with_a_reason() {
+        let tiny = inspect_bytes("tiny.rofl", b"RIO");
+        let garbage = inspect_bytes("garbage.rofl", &[0u8; 400]);
+        let short_classic = inspect_bytes("short.rofl", b"RIOT\0\0abc");
+        let bad_json = {
+            let mut bytes = classic_header((CLASSIC_HEADER_LEN as u32, 4), (0, 0));
+            bytes.extend_from_slice(b"nope");
+            inspect_bytes("bad.rofl", &bytes)
+        };
+
+        for replay in [&tiny, &garbage, &short_classic, &bad_json] {
+            assert_eq!(replay.status, ReplayStatus::Invalid);
+            assert_eq!(replay.notes.len(), 1);
+            assert!(!replay.notes[0].is_empty());
+        }
+        assert_eq!(tiny.format, ReplayFormat::Unknown);
+        assert_eq!(garbage.format, ReplayFormat::Unknown);
+        assert!(garbage.notes[0].contains("RIOT"));
+        assert_eq!(short_classic.format, ReplayFormat::ClassicRofl);
+        assert!(bad_json.notes[0].contains("JSON"));
+    }
+
+    #[test]
+    fn missing_file_is_an_io_error() {
+        let err = inspect_file(std::env::temp_dir().join("chronorift-missing-replay.rofl"))
+            .expect_err("missing file should fail");
+        assert!(matches!(err, InspectError::Io(_)));
+    }
+
+    #[test]
+    fn reads_rofl2_trailer_without_reading_the_body() {
+        let metadata = serde_json::json!({ "gameLength": 5, "lastGameChunkId": 3 });
+        let bytes = rofl2_fixture_bytes(&metadata, "16.17.810.4348");
+
+        let value = read_rofl2_trailer(&mut Cursor::new(&bytes), bytes.len() as u64)
+            .unwrap()
+            .expect("trailer should parse");
+        assert_eq!(value, metadata);
+
+        // Trailer length larger than the file: unsupported, not a panic.
+        let mut broken = bytes.clone();
+        let at = broken.len() - 4;
+        broken[at..].copy_from_slice(&u32::MAX.to_le_bytes());
+        let reason = read_rofl2_trailer(&mut Cursor::new(&broken), broken.len() as u64)
+            .unwrap()
+            .expect_err("oversized trailer");
+        assert!(reason.contains("more than the file holds"));
+
+        let replay = inspect_bytes("x-LA2-77.rofl", &broken);
+        assert_eq!(replay.status, ReplayStatus::Unsupported);
+        assert_eq!(replay.format, ReplayFormat::Rofl2);
+        assert_eq!(replay.game_version.as_deref(), Some("16.17.810.4348"));
+        assert_eq!(replay.region.as_deref(), Some("LA2"));
+        assert_eq!(replay.match_id.as_deref(), Some("77"));
+        assert!(replay.notes[0].contains("trailer"));
+
+        // Magic only, no room for a trailer.
+        let magic_only = inspect_bytes("m.rofl", ROFL2_MAGIC);
+        assert_eq!(magic_only.status, ReplayStatus::Unsupported);
+    }
+
+    #[test]
+    fn reads_rofl2_version_from_length_prefixed_field() {
+        let mut head = ROFL2_MAGIC.to_vec();
+        head.extend_from_slice(&[0x37, 0x14, 0xcb, 0x24, 0x56, 0x62, 0x63, 0xe2]);
+        head.push(14);
+        head.extend_from_slice(b"16.17.810.4348");
+        head.extend_from_slice(&[1, 0, 0, 0, 2]);
+        assert_eq!(
+            rofl2_header_version(&head),
+            Some("16.17.810.4348".to_string())
+        );
+
+        // Length points past the buffer or at non-version bytes: no field.
+        let mut truncated = head[..ROFL2_VERSION_LEN_OFFSET].to_vec();
+        truncated.push(200);
+        assert_eq!(rofl2_header_version(&truncated), None);
+        assert_eq!(rofl2_header_version(ROFL2_MAGIC), None);
+
+        // Fallback digit-run scan still finds a version in older layouts.
+        assert_eq!(
+            find_ascii_version(b"RIOT\x02\x00deadbeef16.13.790.6961{"),
+            Some("16.13.790.6961".to_string())
+        );
+        assert_eq!(find_ascii_version(b"1.2 and 3"), None);
     }
 
     #[test]
@@ -806,14 +1110,26 @@ mod tests {
             Some("123456789".to_string())
         );
         assert_eq!(parse_payload_match_id(&0u64.to_le_bytes()), None);
+        assert_eq!(parse_payload_match_id(&[1, 2, 3]), None);
     }
 
     #[test]
     fn suggests_locale_from_region_without_forcing_it() {
         assert_eq!(suggest_locale_for_region("LA1"), Some("es_MX".to_string()));
+        assert_eq!(suggest_locale_for_region("LA2"), Some("es_AR".to_string()));
+        assert_eq!(suggest_locale_for_region("OC1"), Some("en_AU".to_string()));
+        assert_eq!(suggest_locale_for_region("PH2"), Some("en_PH".to_string()));
+        assert_eq!(suggest_locale_for_region("SG2"), Some("en_SG".to_string()));
+        assert_eq!(suggest_locale_for_region("ME1"), Some("ar_AE".to_string()));
         assert_eq!(suggest_locale_for_region("KR"), Some("ko_KR".to_string()));
         assert_eq!(suggest_locale_for_region("EUW1"), Some("en_GB".to_string()));
         assert_eq!(suggest_locale_for_region("UNKNOWN"), None);
+        for platform in KNOWN_PLATFORMS {
+            assert!(
+                suggest_locale_for_region(platform).is_some(),
+                "{platform} has no locale"
+            );
+        }
     }
 
     #[test]
@@ -878,18 +1194,16 @@ mod tests {
                 }
             ])).unwrap()
         });
-        let raw = metadata.to_string();
-        let mut bytes = b"RIOT\x02\x00deadbeef16.13.790.6961".to_vec();
-        bytes.extend_from_slice(raw.as_bytes());
-        bytes.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        let bytes = rofl2_fixture_bytes(&metadata, "16.13.790.6961");
 
-        let parsed = read_rofl2_metadata(&bytes).expect("metadata should parse");
-        let version = find_ascii_version(&bytes[..128.min(bytes.len())]);
-        let stats = match_stats(&parsed, Some("16.13.1"));
-        let players = &stats.players;
+        let replay = inspect_bytes("LA2-1604952545.rofl", &bytes);
+        let players = &replay.players;
 
-        assert_eq!(version, Some("16.13.790.6961".to_string()));
-        assert_eq!(get_u64(&parsed, &["gameLength"]), Some(123000));
+        assert_eq!(replay.status, ReplayStatus::Parsed);
+        assert_eq!(replay.game_version.as_deref(), Some("16.13.790.6961"));
+        assert_eq!(replay.data_dragon_version.as_deref(), Some("16.13"));
+        assert_eq!(replay.game_duration_ms, Some(123000));
+        assert_eq!(replay.metadata["statsJson"], STATS_PLACEHOLDER);
         assert_eq!(players.len(), 3);
         assert_eq!(players[0].name, "Tester#LA2");
         assert_eq!(players[0].champion, "Nasus");
@@ -907,12 +1221,13 @@ mod tests {
         assert_eq!(players[1].riot_tag_line, None);
         assert_eq!(players[1].puuid, None);
         assert_eq!(players[1].gold_spent, 0);
-        assert_eq!(team_summary(players), (5, 7, Some("Blue".to_string())));
+        assert_eq!((replay.blue_kills, replay.red_kills), (5, 7));
+        assert_eq!(replay.winning_team.as_deref(), Some("Blue"));
 
-        assert!(stats.ended_in_surrender);
-        assert!(!stats.ended_in_early_surrender);
-        assert_eq!(stats.teams.len(), 2);
-        let (blue, red) = (&stats.teams[0], &stats.teams[1]);
+        assert!(replay.ended_in_surrender);
+        assert!(!replay.ended_in_early_surrender);
+        assert_eq!(replay.teams.len(), 2);
+        let (blue, red) = (&replay.teams[0], &replay.teams[1]);
         assert_eq!((blue.team.as_str(), blue.win), ("Blue", true));
         assert_eq!((blue.kills, blue.deaths, blue.assists), (5, 5, 6));
         assert_eq!(blue.gold_earned, 11428);
@@ -921,28 +1236,80 @@ mod tests {
         assert_eq!((red.team.as_str(), red.win), ("Red", false));
         assert_eq!((red.kills, red.deaths, red.inhibitors), (7, 2, 1));
 
-        let empty = match_stats(&serde_json::json!({}), None);
+        let empty = match_stats(&serde_json::json!({}));
         assert!(empty.players.is_empty() && empty.teams.is_empty());
     }
 
     #[test]
-    fn extracts_region_and_match_from_file_name() {
-        assert_eq!(
-            region_and_match_from_file_name("LA2-1604952545.rofl"),
-            (Some("LA2".to_string()), Some("1604952545".to_string()))
-        );
+    fn huge_stat_values_saturate_instead_of_panicking() {
+        let row = |team: &str| {
+            serde_json::json!({
+                "TEAM": team,
+                "CHAMPIONS_KILLED": "4294967295",
+                "GOLD_EARNED": "1e30",
+                "MINIONS_KILLED": "4294967295",
+                "NEUTRAL_MINIONS_KILLED": "10",
+                "TURRETS_KILLED": "-5",
+                "DRAGON_KILLS": "4294967295",
+            })
+        };
+        let metadata = serde_json::json!({
+            "statsJson": serde_json::json!([row("100"), row("100"), row("200")]).to_string()
+        });
+
+        let stats = match_stats(&metadata);
+
+        assert_eq!(stats.players[0].creep_score, u32::MAX);
+        assert_eq!(stats.players[0].gold_earned, u32::MAX);
+        assert_eq!(stats.teams[0].kills, u32::MAX);
+        assert_eq!(stats.teams[0].dragons, u32::MAX);
+        assert_eq!(stats.teams[0].towers, 0);
+        assert_eq!(team_summary(&stats.players).0, u32::MAX);
     }
 
     #[test]
-    fn parses_optional_real_replay_sample() {
-        let Ok(path) = std::env::var("CHRONORIFT_REPLAY_SAMPLE") else {
-            return;
-        };
+    fn extracts_region_and_match_from_file_name() {
+        let parse = region_and_match_from_file_name;
+        let both = |region: &str, id: &str| (Some(region.to_string()), Some(id.to_string()));
+        assert_eq!(parse("LA2-1604952545.rofl"), both("LA2", "1604952545"));
+        assert_eq!(
+            parse("046a1a6c-LA2-1621247134.rofl"),
+            both("LA2", "1621247134")
+        );
+        assert_eq!(parse("euw1-42.ROFL"), both("EUW1", "42"));
+        assert_eq!(parse("my-game-kr-7.rofl"), both("KR", "7"));
+        assert_eq!(parse("NA1-222"), both("NA1", "222"));
+        assert_eq!(parse("046a1a6c-1621247134.rofl"), (None, None));
+        assert_eq!(parse("XX9-123.rofl"), (None, None));
+        assert_eq!(parse("LA2-12a.rofl"), (None, None));
+        assert_eq!(parse("LA2-.rofl"), (None, None));
+        assert_eq!(parse("LA2.rofl"), (None, None));
+        assert_eq!(parse("-1.rofl"), (None, None));
+        assert_eq!(parse("LA2-1621247134 (1).rofl"), (None, None));
+        assert_eq!(parse("ñ.rofl"), (None, None));
+        assert_eq!(parse(""), (None, None));
+    }
 
-        let replay = inspect_file(path).expect("real replay should parse");
+    #[test]
+    fn metadata_platform_must_be_known() {
+        assert_eq!(known_platform("la2"), Some("LA2".to_string()));
+        assert_eq!(known_platform("PBE1"), None);
+        assert_eq!(known_platform(""), None);
+    }
+
+    #[test]
+    #[ignore = "needs CHRONORIFT_REPLAY_SAMPLE"]
+    fn parses_real_replay_sample() {
+        let replay = inspect_file(replay_sample_path()).expect("real replay should parse");
 
         assert_eq!(replay.status, ReplayStatus::Parsed);
-        assert!(replay.game_version.is_some());
+        assert_eq!(replay.format, ReplayFormat::Rofl2);
+        assert_eq!(replay.game_version.as_deref(), Some("16.17.810.4348"));
+        assert_eq!(replay.patch.as_deref(), Some("16.17"));
+        assert_eq!(replay.data_dragon_version.as_deref(), Some("16.17"));
+        assert_eq!(replay.region.as_deref(), Some("LA2"));
+        assert_eq!(replay.match_id.as_deref(), Some("1621247134"));
+        assert_eq!(replay.suggested_locale.as_deref(), Some("es_AR"));
         assert_eq!(replay.players.len(), 10);
         assert!(replay.game_duration_ms.unwrap_or_default() > 0);
         assert_eq!(replay.teams.len(), 2);
@@ -952,5 +1319,7 @@ mod tests {
         assert!(replay.teams.iter().any(|team| team.win));
         assert!(replay.players.iter().all(|player| player.puuid.is_some()));
         assert!(replay.players.iter().all(|player| player.level > 0));
+        assert_eq!(replay.metadata["statsJson"], STATS_PLACEHOLDER);
+        assert!(serde_json::to_string(&replay).unwrap().len() < 64 * 1024);
     }
 }

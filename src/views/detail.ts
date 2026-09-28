@@ -248,7 +248,7 @@ function playerRow(player: PlayerStats, teamKills: number, context: MatchContext
   const damageShare = Math.max(2, Math.round((player.damageToChampions / maxDamage) * 100));
 
   return h("tr", {},
-    h("td", { class: "cell-champ" }, champCluster(player, championName, champion?.image ?? player.championImageUrl, assets)),
+    h("td", { class: "cell-champ" }, champCluster(player, championName, champion?.image ?? null, assets)),
     h("td", { class: "cell-player" },
       playerName(player, context.replay.region),
       h("span", { class: "sub", text: `${championName} · ${positionLabel(player.position)}` }),
@@ -320,22 +320,22 @@ function smallIcon(src: string | undefined, label: string, extra = "") {
 function itemStrip(player: PlayerStats, assets: DataDragonAssets | null) {
   const bySlot = new Map(player.items.map((item) => [item.slot, item]));
   const strip = h("span", { class: "items" });
-  const slot = (id: string | undefined, fallbackUrl: string | null, trinket = false) => {
+  const slot = (id: string | undefined, trinket = false) => {
     const className = trinket ? "item is-trinket" : "item";
     if (!id || id === "0") return h("span", { class: `${className} is-empty` });
     const asset = assets?.items.get(id);
     const label = asset?.name ?? `Item ${id}`;
-    const src = asset?.image ?? fallbackUrl;
+    const src = asset?.image;
     return src
       ? h("img", { class: className, src, alt: label, title: label, loading: "lazy", decoding: "async" })
       : h("span", { class: `${className} is-empty`, title: label });
   };
   for (let index = 0; index < 6; index += 1) {
     const item = bySlot.get(index);
-    strip.append(slot(item?.id, item?.imageUrl ?? null));
+    strip.append(slot(item?.id));
   }
   const trinket = bySlot.get(6);
-  strip.append(slot(trinket?.id ?? player.trinket ?? undefined, trinket?.imageUrl ?? null, true));
+  strip.append(slot(trinket?.id ?? player.trinket ?? undefined, true));
   return strip;
 }
 
@@ -473,7 +473,7 @@ function statsTable(blue: PlayerStats[], red: PlayerStats[], context: MatchConte
   const headCells = players.map((player, index) => {
     const champion = findChampion(context.assets?.champions, player.champion);
     const name = champion?.name ?? player.champion;
-    const image = champion?.image ?? player.championImageUrl;
+    const image = champion?.image ?? null;
     const label = `${player.name || "Unknown"} · ${name}`;
     return h("th", { class: index === blue.length ? "num stat-player team-split" : "num stat-player", title: label },
       image

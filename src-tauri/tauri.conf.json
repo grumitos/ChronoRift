@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "chronorift",
+  "productName": "ChronoRift",
   "version": "0.1.0",
   "identifier": "app.chronorift.desktop",
   "build": {
@@ -10,7 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "withGlobalTauri": true,
+    "withGlobalTauri": false,
     "windows": [
       {
         "title": "ChronoRift",
@@ -21,12 +21,26 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self'",
+        "img-src": "'self' data: https://ddragon.leagueoflegends.com https://raw.communitydragon.org",
+        "connect-src": "'self' ipc: http://ipc.localhost https://ddragon.leagueoflegends.com",
+        "style-src": "'self' 'unsafe-inline'"
+      },
+      "devCsp": {
+        "default-src": "'self' http://localhost:1420",
+        "img-src": "'self' data: https://ddragon.leagueoflegends.com https://raw.communitydragon.org",
+        "connect-src": "'self' ipc: http://ipc.localhost https://ddragon.leagueoflegends.com http://localhost:1420 ws://localhost:1420 ws://localhost:1421",
+        "style-src": "'self' 'unsafe-inline'"
+      }
     }
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "nsis",
+      "msi"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

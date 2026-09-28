@@ -2,6 +2,7 @@ mod client;
 mod clients;
 mod launcher;
 mod library;
+mod locale;
 mod repair;
 mod rofl;
 mod settings;
@@ -11,12 +12,15 @@ use settings::Settings;
 use std::path::PathBuf;
 use tauri::Manager;
 
+// Async + blocking pool: file I/O must not stall the UI thread.
 #[tauri::command]
-fn inspect_replay(path: String) -> Result<ReplayInspection, String> {
-    rofl::inspect_file(path).map_err(|err| err.to_string())
+async fn inspect_replay(path: String) -> Result<ReplayInspection, String> {
+    tauri::async_runtime::spawn_blocking(move || rofl::inspect_file(path))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
 }
 
-// Async + blocking pool: scanning reads every replay and must not stall the UI thread.
 #[tauri::command]
 async fn scan_replay_folder(path: String) -> Result<library::ReplayLibrary, String> {
     tauri::async_runtime::spawn_blocking(move || library::scan_replay_folder(path))
@@ -48,8 +52,11 @@ fn save_settings(app: tauri::AppHandle, settings: Settings) -> Result<Settings, 
 }
 
 #[tauri::command]
-fn launch_replay(request: launcher::LaunchReplayRequest) -> Result<(), String> {
-    launcher::launch_replay(request).map_err(|err| err.to_string())
+async fn launch_replay(request: launcher::LaunchReplayRequest) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || launcher::launch_replay(request))
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]

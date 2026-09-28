@@ -195,16 +195,15 @@ function buildTeam(
     for (let slot = 0; slot < itemCount; slot += 1) {
       let id = build.items[slot];
       if (oldPatch && [3877, 3876, 3869, 3870].includes(id)) id = 3860;
-      items.push({ slot, id: String(id), imageUrl: null });
+      items.push({ slot, id: String(id) });
     }
-    items.push({ slot: 6, id: String(build.trinket), imageUrl: null });
+    items.push({ slot: 6, id: String(build.trinket) });
     const multi = k >= 8 ? 3 : k >= 4 ? 2 : k > 0 ? 1 : 0;
     const player: PlayerStats = {
       name,
       riotTagLine: tag,
       puuid: null,
       champion,
-      championImageUrl: null,
       team,
       position: role,
       win,
@@ -296,7 +295,7 @@ function inspection(sample: Sample): ReplayInspection {
     patch,
     region: sample.region,
     suggestedLocale: SUGGESTED_LOCALES[sample.region] ?? "en_US",
-    dataDragonVersion: `${patch}.1`,
+    dataDragonVersion: patch,
     matchId,
     gameDurationMs: durationMs,
     winningTeam: sample.winner,
@@ -311,7 +310,7 @@ function inspection(sample: Sample): ReplayInspection {
       gameVersion: sample.gameVersion,
       lastGameChunkId: Math.round(sample.minutes),
       lastKeyFrameId: Math.round(sample.minutes / 2),
-      statsJson: `[10 player entries omitted in preview]`,
+      statsJson: "<parsed into players>",
     },
     notes: [],
   };
@@ -324,7 +323,7 @@ const SUGGESTED_LOCALES: Record<string, string> = {
   JP1: "ja_JP",
   KR: "ko_KR",
   LA1: "es_MX",
-  LA2: "es_MX",
+  LA2: "es_AR",
   NA1: "en_US",
 };
 

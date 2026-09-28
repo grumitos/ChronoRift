@@ -242,23 +242,24 @@ mod tests {
             .iter()
             .map(|r| r.file_name.as_str())
             .collect();
-        assert_eq!(names, vec!["NA1-222.ROFL", "LA2-111.rofl"]);
-        assert_eq!(library.replays[0].modified_ms, Some(1_700_000_100_000));
-        assert_eq!(library.replays[0].patch.as_deref(), Some("14.10"));
-        assert_eq!(library.replays[0].region.as_deref(), Some("NA1"));
-        assert_eq!(library.replays[0].match_id.as_deref(), Some("222"));
-        assert!(library.replays[0].size_bytes > 0);
-        assert_eq!(library.errors.len(), 1);
-        assert!(library.errors[0].path.ends_with("broken.rofl"));
-        assert!(!library.errors[0].message.is_empty());
+        // broken.rofl has a fresh mtime, so it sorts first; it is listed as invalid.
+        assert_eq!(names, vec!["broken.rofl", "NA1-222.ROFL", "LA2-111.rofl"]);
+        assert_eq!(library.replays[0].status, ReplayStatus::Invalid);
+        assert_eq!(library.replays[0].format, ReplayFormat::Unknown);
+        let na = &library.replays[1];
+        assert_eq!(na.status, ReplayStatus::Parsed);
+        assert_eq!(na.modified_ms, Some(1_700_000_100_000));
+        assert_eq!(na.patch.as_deref(), Some("14.10"));
+        assert_eq!(na.region.as_deref(), Some("NA1"));
+        assert_eq!(na.match_id.as_deref(), Some("222"));
+        assert!(na.size_bytes > 0);
+        assert!(library.errors.is_empty());
     }
 
     #[test]
-    fn scans_optional_real_replay_sample() {
-        let Ok(sample) = std::env::var("CHRONORIFT_REPLAY_SAMPLE") else {
-            return;
-        };
-        let sample = PathBuf::from(sample);
+    #[ignore = "needs CHRONORIFT_REPLAY_SAMPLE"]
+    fn scans_real_replay_sample() {
+        let sample = rofl::replay_sample_path();
         let dir = temp_dir("sample");
         let file_name = sample.file_name().expect("sample file name");
         fs::copy(&sample, dir.join(file_name)).unwrap();
@@ -268,17 +269,28 @@ mod tests {
         let library = scan_replay_folder(&dir).expect("scan should succeed");
         fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(library.replays.len(), 1);
-        let replay = &library.replays[0];
+        assert_eq!(library.replays.len(), 2);
+        assert!(library.errors.is_empty());
+        let broken = library
+            .replays
+            .iter()
+            .find(|r| r.file_name == "broken.rofl")
+            .expect("broken replay listed");
+        assert_eq!(broken.status, ReplayStatus::Invalid);
+        let replay = library
+            .replays
+            .iter()
+            .find(|r| r.file_name != "broken.rofl")
+            .expect("sample listed");
         assert_eq!(replay.status, ReplayStatus::Parsed);
-        assert!(replay.patch.is_some());
-        assert!(replay.region.is_some());
+        assert_eq!(replay.game_version.as_deref(), Some("16.17.810.4348"));
+        assert_eq!(replay.patch.as_deref(), Some("16.17"));
+        assert_eq!(replay.region.as_deref(), Some("LA2"));
+        assert_eq!(replay.match_id.as_deref(), Some("1621247134"));
         assert!(replay.game_duration_ms.unwrap_or_default() > 0);
         assert!(replay.modified_ms.is_some());
-        assert!(!replay.blue_champions.is_empty());
-        assert!(!replay.red_champions.is_empty());
-        assert_eq!(library.errors.len(), 1);
-        assert!(library.errors[0].path.ends_with("broken.rofl"));
+        assert_eq!(replay.blue_champions.len(), 5);
+        assert_eq!(replay.red_champions.len(), 5);
     }
 
     #[test]
