@@ -3,6 +3,10 @@
 
 import {
   PREVIEW_UNAVAILABLE,
+  type ClientInstallPlan,
+  type ClientRepairPlan,
+  type CommandError,
+  type DownloadProgress,
   type InstalledClient,
   type PlayerItem,
   type PlayerStats,
@@ -12,6 +16,7 @@ import {
   type Settings,
   type TeamSummary,
 } from "./api";
+import type { InstallState } from "./state";
 
 type Role = "TOP" | "JUNGLE" | "MIDDLE" | "BOTTOM" | "UTILITY";
 type Kind = "ad" | "ap" | "tank" | "enchanter";
@@ -409,6 +414,16 @@ summaries.push(
 
 const clients: InstalledClient[] = [
   {
+    patch: "15.6",
+    resolvedVersion: "15.6.6721234",
+    region: "KR",
+    locale: "ko_KR",
+    destinationPath: `${CLIENTS_ROOT}\\15.6-ko_KR-old`,
+    // Version 1 layout: game files directly in the destination, no Game folder.
+    executablePath: `${CLIENTS_ROOT}\\15.6-ko_KR-old\\League of Legends.exe`,
+    executableExists: true,
+  },
+  {
     patch: "14.8",
     resolvedVersion: "14.8.5812283",
     region: "EUW1",
@@ -451,9 +466,174 @@ export async function handle(command: string, args: Record<string, unknown>): Pr
       return clients.map((client) => ({ ...client }));
     case "plan_client_install":
     case "install_client":
-    case "launch_replay":
-      throw new Error(PREVIEW_UNAVAILABLE);
+    case "plan_client_repair":
+    case "repair_client":
+    case "launch_replay": {
+      const error: CommandError = { code: "unavailable", message: PREVIEW_UNAVAILABLE };
+      throw error;
+    }
+    case "cancel_client_install":
+      return false;
     default:
       throw new Error(`Unknown command: ${command}`);
+  }
+}
+
+// Static install states for screenshots: `?demo=plan|inexact|repair|progress|localeUnavailable`.
+// Preview only; nothing here runs or simulates a download.
+
+export type Demo = {
+  replayPath: string;
+  locale?: string;
+  install: Partial<InstallState>;
+};
+
+const LOCALES = [
+  "ar_AE", "cs_CZ", "de_DE", "el_GR", "en_AU", "en_GB", "en_PH", "en_SG", "en_US", "es_AR",
+  "es_ES", "es_MX", "fr_FR", "hu_HU", "it_IT", "ja_JP", "ko_KR", "pl_PL", "pt_BR", "ro_RO",
+  "ru_RU", "th_TH", "tr_TR", "vi_VN", "zh_MY", "zh_TW",
+];
+
+function replayPath(region: string): string {
+  return summaries.find((summary) => summary.region === region)?.path ?? summaries[0].path;
+}
+
+function samplePlan(overrides: Partial<ClientInstallPlan>): ClientInstallPlan {
+  const destinationPath = `${CLIENTS_ROOT}\\15.6-ko_KR`;
+  return {
+    planId: "plan-demo",
+    expiresAtMs: now + 30 * 60_000,
+    patch: "15.6",
+    requestedVersion: "15.6.6721234",
+    resolvedVersion: "15.6.6721234",
+    exactBuild: true,
+    source: "archive",
+    region: "KR",
+    manifestRegion: "KR",
+    locale: "ko_KR",
+    localeAssets: "ko_KR",
+    availableLocales: LOCALES,
+    destinationPath,
+    gamePath: `${destinationPath}\\Game`,
+    executablePath: `${destinationPath}\\Game\\League of Legends.exe`,
+    manifestUrl: "https://lol.secure.dyn.riotcdn.net/channels/public/releases/0A1B2C3D4E5F6071.manifest",
+    fileCount: 1412,
+    downloadBytes: 3_612_884_231,
+    installBytes: 5_904_112_004,
+    requestCount: 186,
+    ...overrides,
+  };
+}
+
+function sampleRepairPlan(): ClientRepairPlan {
+  const destinationPath = `${CLIENTS_ROOT}\\15.6-ko_KR`;
+  const wad = (name: string) => `DATA\\FINAL\\Champions\\${name}.wad.client`;
+  return {
+    planId: "repair-demo",
+    expiresAtMs: now + 30 * 60_000,
+    patch: "15.6",
+    resolvedVersion: "15.6.6721234",
+    exactBuild: true,
+    source: "archive",
+    region: "KR",
+    locale: "ko_KR",
+    localeAssets: "ko_KR",
+    destinationPath,
+    gamePath: `${destinationPath}\\Game`,
+    manifestUrl: "https://lol.secure.dyn.riotcdn.net/channels/public/releases/0A1B2C3D4E5F6071.manifest",
+    stateStatus: "inProgress",
+    totalFiles: 1412,
+    okFiles: 1180,
+    missingFiles: 214,
+    wrongSizeFiles: 18,
+    missingPaths: ["Ahri", "Akali", "Alistar", "Amumu", "Anivia", "Annie"].map(wad),
+    wrongSizePaths: [wad("Aatrox"), "DATA\\FINAL\\Maps\\Shipping\\Map11.wad.client"],
+    downloadBytes: 612_004_882,
+    installBytes: 1_020_331_907,
+    replaceDownloadBytes: 48_112_330,
+    replaceInstallBytes: 81_550_204,
+    staleTempFiles: 3,
+  };
+}
+
+function sampleProgress(): DownloadProgress {
+  return {
+    destinationPath: `${CLIENTS_ROOT}\\15.6-ko_KR`,
+    stage: "download",
+    detail: "DATA\\FINAL\\Champions\\Orianna.ko_KR.wad.client",
+    downloadedBytes: 1_402_118_331,
+    totalBytes: 3_612_884_231,
+    percent: 38.8,
+    filesDone: 548,
+    filesTotal: 1412,
+    done: false,
+  };
+}
+
+export function demoInstall(kind: string): Demo | null {
+  switch (kind) {
+    case "plan":
+      return { replayPath: replayPath("KR"), install: { phase: "review", op: "plan", plan: samplePlan({}) } };
+    case "inexact": {
+      const destinationPath = `${CLIENTS_ROOT}\\13.24-es_AR`;
+      return {
+        replayPath: replayPath("LA2"),
+        locale: "es_AR",
+        install: {
+          phase: "review",
+          op: "plan",
+          plan: samplePlan({
+            patch: "13.24",
+            requestedVersion: "13.24.5501150",
+            resolvedVersion: "13.24.5503702",
+            exactBuild: false,
+            region: "LA2",
+            manifestRegion: "NA1",
+            locale: "es_AR",
+            localeAssets: "es_MX",
+            destinationPath,
+            gamePath: `${destinationPath}\\Game`,
+            executablePath: `${destinationPath}\\Game\\League of Legends.exe`,
+            fileCount: 1377,
+            downloadBytes: 3_318_004_112,
+            installBytes: 5_512_441_870,
+            requestCount: 171,
+          }),
+        },
+      };
+    }
+    case "repair":
+      return {
+        replayPath: replayPath("KR"),
+        install: { phase: "repairReview", op: "repairPlan", repairPlan: sampleRepairPlan() },
+      };
+    case "progress":
+      return {
+        replayPath: replayPath("KR"),
+        install: { phase: "installing", op: "install", plan: samplePlan({}), progress: sampleProgress() },
+      };
+    case "localeUnavailable":
+      return {
+        replayPath: replayPath("KR"),
+        locale: "zh_CN",
+        install: {
+          phase: "failed",
+          op: "plan",
+          request: {
+            patch: "15.6",
+            gameVersion: "15.6.672.1234",
+            region: "KR",
+            locale: "zh_CN",
+            destinationPath: `${CLIENTS_ROOT}\\15.6-zh_CN`,
+          },
+          error: {
+            code: "localeUnavailable",
+            message: `Locale zh_CN is not offered by this client. Available: ${LOCALES.join(", ")}`,
+            availableLocales: LOCALES,
+          },
+        },
+      };
+    default:
+      return null;
   }
 }

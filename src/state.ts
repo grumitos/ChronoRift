@@ -1,6 +1,9 @@
 import type {
   ClientInstallPlan,
+  ClientInstallRequest,
   ClientInstallResult,
+  ClientRepairPlan,
+  CommandError,
   DownloadProgress,
   InstalledClient,
   ReplayInspection,
@@ -9,7 +12,53 @@ import type {
 } from "./api";
 import type { Asset, DataDragonAssets } from "./datadragon";
 
-export type InstallPhase = "idle" | "planning" | "review" | "installing" | "done" | "failed";
+export type InstallPhase =
+  | "idle"
+  | "planning"
+  | "review"
+  | "installing"
+  | "repairPlanning"
+  | "repairReview"
+  | "repairing"
+  | "done"
+  | "failed";
+
+/** Which command produced `install.error` or `install.result`. */
+export type InstallOp = "plan" | "install" | "repairPlan" | "repair";
+
+export type InstallState = {
+  phase: InstallPhase;
+  op: InstallOp | null;
+  /** The request the current install plan was made from. */
+  request: ClientInstallRequest | null;
+  plan: ClientInstallPlan | null;
+  repairPlan: ClientRepairPlan | null;
+  replaceWrongSize: boolean;
+  progress: DownloadProgress | null;
+  cancelling: boolean;
+  result: ClientInstallResult | null;
+  error: CommandError | null;
+};
+
+export function idleInstall(): InstallState {
+  return {
+    phase: "idle",
+    op: null,
+    request: null,
+    plan: null,
+    repairPlan: null,
+    replaceWrongSize: false,
+    progress: null,
+    cancelling: false,
+    result: null,
+    error: null,
+  };
+}
+
+/** Phases in which a backend plan/install/repair is running. */
+export function isInstallBusy(phase: InstallPhase): boolean {
+  return phase === "planning" || phase === "installing" || phase === "repairPlanning" || phase === "repairing";
+}
 
 export type Topic =
   | "settings"
@@ -45,20 +94,17 @@ export const state = {
   /** Editable locale. Starts from settings or the replay's suggestion, never forced. */
   locale: "en_US",
   executablePath: "",
+  /** Server for installs. Starts from the replay region when known; "" = not chosen. */
+  region: "",
   destination: "",
   destinationEdited: false,
 
   clients: [] as InstalledClient[],
   clientsError: null as string | null,
 
-  install: {
-    phase: "idle" as InstallPhase,
-    plan: null as ClientInstallPlan | null,
-    progress: null as DownloadProgress | null,
-    result: null as ClientInstallResult | null,
-    error: null as string | null,
-  },
+  install: idleInstall(),
   launching: false,
+  launchError: null as string | null,
 
   status: { text: "", error: false },
 };

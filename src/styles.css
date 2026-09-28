@@ -76,7 +76,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
   color: inherit;
 }
@@ -1049,6 +1050,12 @@ button.player-name:hover {
   width: 72px;
 }
 
+.input-server {
+  flex: none;
+  width: 104px;
+  padding-right: 4px;
+}
+
 .field-error[hidden] {
   display: none;
 }
@@ -1078,6 +1085,13 @@ button.player-name:hover {
 .client-info {
   display: grid;
   min-width: 0;
+}
+
+.client-action {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 12px;
 }
 
 .client-info .sub {
@@ -1112,6 +1126,73 @@ button.player-name:hover {
   min-width: 0;
   overflow-wrap: anywhere;
   font-variant-numeric: tabular-nums;
+}
+
+.stack {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Warnings stay monochrome: weight and a rule, not color. */
+.notice {
+  padding-left: 10px;
+  border-left: 2px solid var(--text);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.locale-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.path-details summary {
+  width: fit-content;
+  color: var(--text-2);
+  cursor: pointer;
+}
+
+.path-details summary:hover {
+  color: var(--text);
+}
+
+.path-list {
+  display: grid;
+  gap: 2px;
+  margin-top: 8px;
+  max-height: 160px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--pane);
+  color: var(--text-2);
+}
+
+.path-list li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: fit-content;
+  cursor: pointer;
+}
+
+.check input {
+  margin: 0;
+  accent-color: var(--text);
+}
+
+.launch-error {
+  font-size: var(--fs-s);
+  overflow-wrap: anywhere;
 }
 
 .progress-head {

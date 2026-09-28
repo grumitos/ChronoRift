@@ -4,19 +4,23 @@
 import {
   api,
   errorMessage,
+  isTauri,
+  knownRegion,
   onDownloadProgress,
   pickFile,
   pickFolder,
+  toCommandError,
   type ClientInstallRequest,
   type InstalledClient,
 } from "./api";
 import { loadAssets, loadChampionIndex } from "./datadragon";
 import { isValidLocale, joinPath } from "./format";
-import { notify, setStatus, state } from "./state";
+import { idleInstall, isInstallBusy, notify, setStatus, state, type InstallOp } from "./state";
 
 export async function init() {
   void onDownloadProgress((progress) => {
-    if (state.install.phase !== "installing") return;
+    const phase = state.install.phase;
+    if (phase !== "installing" && phase !== "repairing") return;
     state.install.progress = progress;
     notify("client");
   }).catch((error) => setStatus(`Progress events unavailable: ${errorMessage(error)}`, true));
@@ -32,6 +36,20 @@ export async function init() {
 
   if (state.settings.clientsRoot) void refreshClients();
   if (state.settings.replayFolder) await scan();
+  if (!isTauri) await applyPreviewDemo();
+}
+
+/** Browser preview only: `?demo=plan|inexact|repair|progress|localeUnavailable` shows a static state. */
+async function applyPreviewDemo() {
+  const kind = new URLSearchParams(window.location.search).get("demo");
+  if (!kind) return;
+  const { demoInstall } = await import("./mock");
+  const demo = demoInstall(kind);
+  if (!demo) return;
+  await selectReplay(demo.replayPath);
+  if (demo.locale) setLocale(demo.locale);
+  state.install = { ...idleInstall(), ...demo.install };
+  notify("client");
 }
 
 async function persistSettings() {
@@ -112,7 +130,7 @@ export async function selectReplay(path: string) {
   state.replayLoading = true;
   state.assets = null;
   state.assetsError = null;
-  if (state.install.phase !== "installing") resetInstall();
+  if (!isInstallBusy(state.install.phase)) resetInstall();
   notify("selection", "replay", "assets", "client");
 
   try {
@@ -123,6 +141,7 @@ export async function selectReplay(path: string) {
       // Default only: the field stays visible and editable.
       state.locale = replay.suggestedLocale;
     }
+    if (!isInstallBusy(state.install.phase)) state.region = knownRegion(replay.region);
     updateDefaultDestination();
     void refreshAssets();
   } catch (error) {
@@ -173,6 +192,12 @@ export function useSuggestedLocale() {
   if (suggested) setLocale(suggested);
 }
 
+export function setRegion(value: string) {
+  state.region = knownRegion(value);
+  invalidatePlan();
+  notify("client");
+}
+
 export function setDestination(value: string) {
   state.destination = value;
   state.destinationEdited = value.trim() !== "";
@@ -193,6 +218,7 @@ export async function chooseDestination() {
 /** Updates the path while typing; pass `persist` once editing is done. */
 export function setExecutablePath(value: string, persist = true) {
   state.executablePath = value.trim();
+  state.launchError = null;
   if (persist) {
     state.settings.executablePath = state.executablePath || null;
     void persistSettings();
@@ -243,9 +269,16 @@ export async function refreshClients() {
   notify("clients", "client");
 }
 
+/** v2 installs keep the executable in <dest>/Game; v1 installs cannot be launched. */
+export function hasGameLayout(executablePath: string): boolean {
+  return /[\\/]Game[\\/]League of Legends\.exe$/i.test(executablePath);
+}
+
 export function useClient(client: InstalledClient) {
+  if (!hasGameLayout(client.executablePath)) return;
   state.executablePath = client.executablePath;
   state.settings.executablePath = client.executablePath;
+  state.launchError = null;
   if (isValidLocale(client.locale) && client.locale !== state.locale) {
     state.locale = client.locale;
     state.settings.locale = client.locale;
@@ -264,21 +297,32 @@ function updateDefaultDestination() {
 }
 
 function resetInstall() {
-  state.install = { phase: "idle", plan: null, progress: null, result: null, error: null };
+  state.install = idleInstall();
 }
 
+/** Drops a reviewed plan or a shown error once its inputs change. */
 function invalidatePlan() {
-  if (state.install.phase === "review" || state.install.phase === "failed") resetInstall();
+  const phase = state.install.phase;
+  if (phase === "review" || phase === "repairReview" || phase === "failed" || phase === "done") {
+    resetInstall();
+  }
+}
+
+function fail(op: InstallOp, error: unknown) {
+  state.install.phase = "failed";
+  state.install.op = op;
+  state.install.error = toCommandError(error);
+  state.install.cancelling = false;
 }
 
 export function installRequest(): ClientInstallRequest | null {
   const replay = state.replay;
   const destination = state.destination.trim();
-  if (!replay?.patch || !destination || !isValidLocale(state.locale)) return null;
+  if (!replay?.patch || !destination || !isValidLocale(state.locale) || !state.region) return null;
   return {
     patch: replay.patch,
     gameVersion: replay.gameVersion,
-    region: replay.region,
+    region: state.region,
     locale: state.locale,
     destinationPath: destination,
   };
@@ -286,8 +330,8 @@ export function installRequest(): ClientInstallRequest | null {
 
 export async function reviewInstallPlan() {
   const request = installRequest();
-  if (!request || state.install.phase === "installing") return;
-  state.install = { phase: "planning", plan: null, progress: null, result: null, error: null };
+  if (!request || isInstallBusy(state.install.phase)) return;
+  state.install = { ...idleInstall(), phase: "planning", op: "plan", request };
   notify("client");
   try {
     const plan = await api.planClientInstall(request);
@@ -296,38 +340,102 @@ export async function reviewInstallPlan() {
     state.install.phase = "review";
   } catch (error) {
     if (state.install.phase !== "planning") return;
-    state.install.phase = "failed";
-    state.install.error = errorMessage(error);
+    fail("plan", error);
   }
   notify("client");
 }
 
+/** Discards a reviewed plan or a finished result. */
 export function cancelInstallPlan() {
-  if (state.install.phase === "installing") return;
+  if (isInstallBusy(state.install.phase)) return;
   resetInstall();
   notify("client");
 }
 
 export async function confirmInstall() {
-  const request = installRequest();
-  if (!request || state.install.phase !== "review") return;
+  const plan = state.install.plan;
+  if (!plan || state.install.phase !== "review") return;
   state.install.phase = "installing";
+  state.install.op = "install";
   state.install.progress = null;
   notify("client");
   try {
-    const result = await api.installClient(request);
-    state.install.result = result;
-    state.install.phase = "done";
-    state.executablePath = result.executablePath;
-    state.settings.executablePath = result.executablePath;
-    void persistSettings();
-    setStatus(`Client ${result.resolvedVersion} installed`);
-    void refreshClients();
+    const result = await api.installClient(plan.planId);
+    finish("install", result);
   } catch (error) {
-    state.install.phase = "failed";
-    state.install.error = errorMessage(error);
+    fail("install", error);
   }
   notify("client");
+}
+
+export async function reviewRepair() {
+  const destinationPath = state.destination.trim();
+  if (!destinationPath || !isValidLocale(state.locale) || isInstallBusy(state.install.phase)) return;
+  state.install = { ...idleInstall(), phase: "repairPlanning", op: "repairPlan" };
+  notify("client");
+  try {
+    const plan = await api.planClientRepair({ destinationPath, locale: state.locale });
+    if (state.install.phase !== "repairPlanning") return;
+    state.install.repairPlan = plan;
+    state.install.phase = "repairReview";
+  } catch (error) {
+    if (state.install.phase !== "repairPlanning") return;
+    fail("repairPlan", error);
+  }
+  notify("client");
+}
+
+export function setReplaceWrongSize(value: boolean) {
+  if (state.install.phase !== "repairReview") return;
+  state.install.replaceWrongSize = value;
+  notify("client");
+}
+
+export async function confirmRepair() {
+  const plan = state.install.repairPlan;
+  if (!plan || state.install.phase !== "repairReview") return;
+  state.install.phase = "repairing";
+  state.install.op = "repair";
+  state.install.progress = null;
+  notify("client");
+  try {
+    const result = await api.repairClient({
+      planId: plan.planId,
+      replaceWrongSize: state.install.replaceWrongSize,
+    });
+    finish("repair", result);
+  } catch (error) {
+    fail("repair", error);
+  }
+  notify("client");
+}
+
+function finish(op: InstallOp, result: NonNullable<typeof state.install.result>) {
+  state.install.result = result;
+  state.install.phase = "done";
+  state.install.op = op;
+  state.install.cancelling = false;
+  state.executablePath = result.executablePath;
+  state.settings.executablePath = result.executablePath;
+  state.launchError = null;
+  void persistSettings();
+  setStatus(`Client ${result.resolvedVersion} ${op === "repair" ? "repaired" : "installed"}`);
+  void refreshClients();
+}
+
+/** Asks the backend to stop the running install or repair. Completed files stay. */
+export async function cancelInstall() {
+  const phase = state.install.phase;
+  if (phase !== "installing" && phase !== "repairing") return;
+  state.install.cancelling = true;
+  notify("client");
+  try {
+    await api.cancelClientInstall();
+  } catch (error) {
+    state.install.cancelling = false;
+    setStatus(`Could not cancel: ${errorMessage(error)}`, true);
+    notify("client");
+  }
 }
 
 export async function playReplay() {
@@ -335,6 +443,7 @@ export async function playReplay() {
   if (!replay || replay.status !== "parsed" || !state.executablePath || state.launching) return;
   if (!isValidLocale(state.locale)) return;
   state.launching = true;
+  state.launchError = null;
   notify("client");
   try {
     await api.launchReplay({
@@ -344,7 +453,8 @@ export async function playReplay() {
     });
     setStatus(`Launched ${replay.fileName} with ${state.locale}`);
   } catch (error) {
-    setStatus(`Launch failed: ${errorMessage(error)}`, true);
+    state.launchError = errorMessage(error);
+    setStatus("Launch failed", true);
   } finally {
     state.launching = false;
     notify("client");

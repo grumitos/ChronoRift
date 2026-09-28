@@ -80,15 +80,21 @@ export function positionLabel(position: string): string {
 export function stageLabel(stage: string | undefined): string {
   switch (stage) {
     case "resolve":
-      return "Resolving manifest";
+      return "Finding client release";
     case "manifest":
       return "Downloading manifest";
     case "plan":
       return "Planning files";
     case "download":
-      return "Downloading and extracting files";
+      return "Downloading files";
+    case "repair":
+      return "Repairing files";
     case "complete":
       return "Complete";
+    case "cancelled":
+      return "Cancelled";
+    case "failed":
+      return "Failed";
     default:
       return stage ?? "Working";
   }
