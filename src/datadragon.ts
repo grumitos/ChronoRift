@@ -156,19 +156,22 @@ export function findChampion(
   return champions?.get(normalizeKey(champion)) ?? champions?.get(champion) ?? null;
 }
 
-let latestChampions: Promise<Map<string, Asset>> | null = null;
+const championIndexes = new Map<string, Promise<Map<string, Asset>>>();
 
 /**
- * Champion icons for the library list: one en_US table from the newest
+ * Champion icons and names for the library list: one table from the newest
  * DataDragon release serves every row (champion ids are stable across patches).
+ * Names are in `locale`, with an en_US fallback.
  */
-export function loadChampionIndex(): Promise<Map<string, Asset>> {
-  latestChampions ??= (async () => {
-    const latest = (await fetchVersions())[0];
-    return championMap(latest, await fetchJson<ChampionJson>(latest, "en_US", "champion.json"));
-  })().catch((error) => {
-    latestChampions = null;
-    throw error;
-  });
-  return latestChampions;
+export function loadChampionIndex(locale: string): Promise<Map<string, Asset>> {
+  let index = championIndexes.get(locale);
+  if (!index) {
+    index = (async () => {
+      const latest = (await fetchVersions())[0];
+      return championMap(latest, await fetchJson<ChampionJson>(latest, locale, "champion.json"));
+    })();
+    index.catch(() => championIndexes.delete(locale));
+    championIndexes.set(locale, index);
+  }
+  return index;
 }

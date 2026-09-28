@@ -890,6 +890,17 @@ button.player-name:hover {
   border: 1px solid var(--line);
 }
 
+.item-text {
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 7px;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+
 .item.is-trinket {
   margin-left: 6px;
   border-radius: 50%;

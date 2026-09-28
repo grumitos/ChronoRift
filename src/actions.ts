@@ -33,10 +33,51 @@ export async function init() {
   state.locale = state.settings.locale ?? "en_US";
   state.executablePath = state.settings.executablePath ?? "";
   notify("settings", "client");
+  void restoreWindowSize();
 
   if (state.settings.clientsRoot) void refreshClients();
   if (state.settings.replayFolder) await scan();
+  const last = state.settings.lastReplay;
+  if (last && state.library?.replays.some((replay) => replay.path === last)) {
+    await selectReplay(last);
+  }
   if (!isTauri) await applyPreviewDemo();
+}
+
+// Window size ------------------------------------------------------------
+
+const RESIZE_SAVE_DELAY_MS = 600;
+
+/** Restores the saved inner size, then saves later resizes (debounced). Desktop only. */
+async function restoreWindowSize() {
+  if (!isTauri) return;
+  try {
+    const { getCurrentWindow, LogicalSize } = await import("@tauri-apps/api/window");
+    const win = getCurrentWindow();
+    const { windowWidth, windowHeight } = state.settings;
+    if (windowWidth && windowHeight) await win.setSize(new LogicalSize(windowWidth, windowHeight));
+
+    let timer: number | undefined;
+    await win.onResized(() => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(async () => {
+        try {
+          if (await win.isMaximized() || await win.isMinimized()) return;
+          const size = (await win.innerSize()).toLogical(await win.scaleFactor());
+          const width = Math.round(size.width);
+          const height = Math.round(size.height);
+          if (width === state.settings.windowWidth && height === state.settings.windowHeight) return;
+          state.settings.windowWidth = width;
+          state.settings.windowHeight = height;
+          await persistSettings();
+        } catch {
+          // Size is a convenience; never bother the user about it.
+        }
+      }, RESIZE_SAVE_DELAY_MS);
+    });
+  } catch (error) {
+    setStatus(`Could not restore window size: ${errorMessage(error)}`, true);
+  }
 }
 
 /** Browser preview only: `?demo=plan|inexact|repair|progress|localeUnavailable` shows a static state. */
@@ -75,14 +116,7 @@ export async function scan() {
     state.library = library;
     const count = library.replays.length;
     setStatus(`${count} replay${count === 1 ? "" : "s"} in folder`);
-    if (library.replays.some((replay) => replay.blueChampions.length || replay.redChampions.length)) {
-      void loadChampionIndex()
-        .then((index) => {
-          state.libraryChampions = index;
-          notify("library");
-        })
-        .catch(() => {});
-    }
+    refreshChampionIndex();
   } catch (error) {
     state.library = null;
     state.libraryError = errorMessage(error);
@@ -90,6 +124,25 @@ export async function scan() {
     state.libraryLoading = false;
     notify("library");
   }
+}
+
+/** Champion names for library icons and the filter, in the selected locale. Offline: ids only. */
+let championIndexKey = "";
+
+function refreshChampionIndex() {
+  const library = state.library;
+  if (!library?.replays.some((replay) => replay.blueChampions.length || replay.redChampions.length)) return;
+  const locale = isValidLocale(state.locale) ? state.locale : "en_US";
+  const key = `${library.folder}:${locale}`;
+  if (key === championIndexKey && state.libraryChampions) return;
+  void loadChampionIndex(locale)
+    .then((index) => {
+      if (state.library !== library) return;
+      state.libraryChampions = index;
+      championIndexKey = key;
+      notify("library");
+    })
+    .catch(() => {});
 }
 
 export async function changeReplayFolder() {
@@ -132,6 +185,10 @@ export async function selectReplay(path: string) {
   state.assetsError = null;
   if (!isInstallBusy(state.install.phase)) resetInstall();
   notify("selection", "replay", "assets", "client");
+  if (state.settings.lastReplay !== path) {
+    state.settings.lastReplay = path;
+    void persistSettings();
+  }
 
   try {
     const replay = await api.inspectReplay(path);
@@ -140,6 +197,7 @@ export async function selectReplay(path: string) {
     if (!state.settings.locale && replay.suggestedLocale && isValidLocale(replay.suggestedLocale)) {
       // Default only: the field stays visible and editable.
       state.locale = replay.suggestedLocale;
+      refreshChampionIndex();
     }
     if (!isInstallBusy(state.install.phase)) state.region = knownRegion(replay.region);
     updateDefaultDestination();
@@ -155,6 +213,8 @@ export async function selectReplay(path: string) {
   }
 }
 
+export const STATIC_DATA_UNAVAILABLE = "Static data unavailable (offline?)";
+
 async function refreshAssets() {
   const replay = state.replay;
   if (!replay || replay.status !== "parsed") return;
@@ -168,7 +228,9 @@ async function refreshAssets() {
     state.assetsError = null;
   } catch (error) {
     if (state.replay !== replay) return;
-    state.assetsError = `Static data unavailable: ${errorMessage(error)}`;
+    // One quiet note; the views fall back to text. Details go to the console only.
+    console.warn("DataDragon unavailable", error);
+    state.assetsError = STATIC_DATA_UNAVAILABLE;
   }
   notify("assets");
 }
@@ -183,6 +245,7 @@ export function setLocale(value: string) {
     state.settings.locale = state.locale;
     void persistSettings();
     void refreshAssets();
+    refreshChampionIndex();
   }
   notify("client");
 }
@@ -269,13 +332,9 @@ export async function refreshClients() {
   notify("clients", "client");
 }
 
-/** v2 installs keep the executable in <dest>/Game; v1 installs cannot be launched. */
-export function hasGameLayout(executablePath: string): boolean {
-  return /[\\/]Game[\\/]League of Legends\.exe$/i.test(executablePath);
-}
-
+/** v1 installs (no Game folder) cannot be launched. */
 export function useClient(client: InstalledClient) {
-  if (!hasGameLayout(client.executablePath)) return;
+  if (client.legacyLayout) return;
   state.executablePath = client.executablePath;
   state.settings.executablePath = client.executablePath;
   state.launchError = null;
@@ -283,6 +342,7 @@ export function useClient(client: InstalledClient) {
     state.locale = client.locale;
     state.settings.locale = client.locale;
     void refreshAssets();
+    refreshChampionIndex();
   }
   void persistSettings();
   setStatus(`Using client ${client.resolvedVersion} (${client.locale})`);

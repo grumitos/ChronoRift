@@ -76,6 +76,9 @@ export const state = {
     clientsRoot: null,
     executablePath: null,
     locale: null,
+    lastReplay: null,
+    windowWidth: null,
+    windowHeight: null,
   } as Settings,
 
   library: null as ReplayLibrary | null,

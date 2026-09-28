@@ -10,8 +10,9 @@ export function mountLibrary(root: HTMLElement) {
     class: "input filter",
     type: "search",
     placeholder: "Filter replays",
+    title: "Champion, player, patch, server, or match id",
     spellcheck: false,
-    attrs: { "aria-label": "Filter replays" },
+    attrs: { "aria-label": "Filter replays by champion, player, patch, server, or match id" },
     on: { input: () => setFilter(filter.value) },
   });
   const count = h("span", { class: "library-count" });
@@ -70,7 +71,7 @@ export function mountLibrary(root: HTMLElement) {
     } else {
       const query = state.filter.trim().toLowerCase();
       const visible = query
-        ? library.replays.filter((replay) => matches(replay, query))
+        ? library.replays.filter((replay) => matches(replay, query, state.libraryChampions))
         : library.replays;
       count.textContent = query
         ? `${visible.length} of ${library.replays.length}`
@@ -101,20 +102,20 @@ export function mountLibrary(root: HTMLElement) {
   render();
 }
 
-function matches(replay: ReplaySummary, query: string): boolean {
-  const haystack = [
+/** Matches champions (id and name in the loaded locale), player names, patch, server, and match id. */
+function matches(replay: ReplaySummary, query: string, champions: Map<string, Asset> | null): boolean {
+  const champs = [...replay.blueChampions, ...replay.redChampions];
+  const fields = [
     replay.fileName,
     replay.patch,
     replay.region,
     replay.matchId,
     replay.gameVersion,
-    ...replay.blueChampions,
-    ...replay.redChampions,
-  ]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-  return haystack.includes(query);
+    ...champs,
+    ...champs.map((id) => findChampion(champions, id)?.name),
+    ...replay.players,
+  ];
+  return fields.some((field) => Boolean(field) && field!.toLowerCase().includes(query));
 }
 
 function row(replay: ReplaySummary, champions: Map<string, Asset> | null) {
@@ -173,10 +174,13 @@ function champStrip(ids: string[], champions: Map<string, Asset> | null, winner:
   const strip = h("span", { class: winner ? "champ-strip" : "champ-strip is-loser" });
   for (const id of ids) {
     const asset = findChampion(champions, id);
+    const monogram = () => h("span", { class: "mini-champ mini-champ-text", title: asset?.name ?? id, text: id.slice(0, 2) });
     if (asset) {
-      strip.append(h("img", { class: "mini-champ", src: asset.image, alt: asset.name, title: asset.name, loading: "lazy", decoding: "async" }));
+      const img = h("img", { class: "mini-champ", src: asset.image, alt: asset.name, title: asset.name, loading: "lazy", decoding: "async" });
+      img.addEventListener("error", () => img.replaceWith(monogram()), { once: true });
+      strip.append(img);
     } else {
-      strip.append(h("span", { class: "mini-champ mini-champ-text", title: id, text: id.slice(0, 2) }));
+      strip.append(monogram());
     }
   }
   return strip;

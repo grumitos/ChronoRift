@@ -135,6 +135,7 @@ function body(replay: ReplayInspection, assets: DataDragonAssets | null): Node[]
   const context: MatchContext = {
     replay,
     assets,
+    offline: !assets && Boolean(state.assetsError),
     minutes: replay.gameDurationMs ? replay.gameDurationMs / 60_000 : 0,
     maxDamage: Math.max(1, ...replay.players.map((player) => player.damageToChampions)),
   };
@@ -174,6 +175,8 @@ function body(replay: ReplayInspection, assets: DataDragonAssets | null): Node[]
 type MatchContext = {
   replay: ReplayInspection;
   assets: DataDragonAssets | null;
+  /** DataDragon failed: text fallbacks, no spell/rune placeholders. */
+  offline: boolean;
   minutes: number;
   maxDamage: number;
 };
@@ -248,7 +251,7 @@ function playerRow(player: PlayerStats, teamKills: number, context: MatchContext
   const damageShare = Math.max(2, Math.round((player.damageToChampions / maxDamage) * 100));
 
   return h("tr", {},
-    h("td", { class: "cell-champ" }, champCluster(player, championName, champion?.image ?? null, assets)),
+    h("td", { class: "cell-champ" }, champCluster(player, championName, champion?.image ?? null, context)),
     h("td", { class: "cell-player" },
       playerName(player, context.replay.region),
       h("span", { class: "sub", text: `${championName} · ${positionLabel(player.position)}` }),
@@ -277,22 +280,36 @@ function playerRow(player: PlayerStats, teamKills: number, context: MatchContext
       String(player.visionScore),
       h("span", { class: "sub", text: `${player.wardsPlaced}/${player.wardsKilled}/${player.controlWardsBought}` }),
     ),
-    h("td", { class: "cell-items" }, itemStrip(player, assets)),
+    h("td", { class: "cell-items" }, itemStrip(player, context)),
   );
+}
+
+/** An image that turns into `fallback()` if it fails to load (offline, blocked CDN). */
+function icon(props: { class?: string; src: string; label: string }, fallback: () => HTMLElement) {
+  const img = h("img", { class: props.class, src: props.src, alt: props.label, title: props.label, loading: "lazy", decoding: "async" });
+  img.addEventListener("error", () => img.replaceWith(fallback()), { once: true });
+  return img;
+}
+
+function monogram(name: string, className: string) {
+  return h("span", { class: className, text: name.slice(0, 2), title: name, attrs: { role: "img", "aria-label": name } });
 }
 
 function champCluster(
   player: PlayerStats,
   name: string,
   image: string | null,
-  assets: DataDragonAssets | null,
+  context: MatchContext,
 ) {
+  const { assets, offline } = context;
   const portrait = h("span", { class: "champ" },
     image
-      ? h("img", { src: image, alt: name, title: name, loading: "lazy", decoding: "async" })
-      : h("span", { class: "champ-fallback", text: name.slice(0, 2), title: name }),
+      ? icon({ src: image, label: name }, () => monogram(name, "champ-fallback"))
+      : monogram(name, "champ-fallback"),
     player.level ? h("span", { class: "level", text: String(player.level), title: `Level ${player.level}` }) : null,
   );
+  // Without static data there is nothing useful to show for spells and runes.
+  if (offline) return h("span", { class: "champ-cluster" }, portrait);
   const spells = h("span", { class: "icon-stack" },
     ...[0, 1].map((index) => {
       const key = player.summonerSpells[index];
@@ -312,12 +329,11 @@ function champCluster(
 
 function smallIcon(src: string | undefined, label: string, extra = "") {
   const className = extra ? `icon-sm ${extra}` : "icon-sm";
-  return src
-    ? h("img", { class: className, src, alt: label, title: label, loading: "lazy", decoding: "async" })
-    : h("span", { class: `${className} is-empty`, title: label });
+  const empty = () => h("span", { class: `${className} is-empty`, title: label, attrs: { role: "img", "aria-label": label } });
+  return src ? icon({ class: className, src, label }, empty) : empty();
 }
 
-function itemStrip(player: PlayerStats, assets: DataDragonAssets | null) {
+function itemStrip(player: PlayerStats, { assets, offline }: MatchContext) {
   const bySlot = new Map(player.items.map((item) => [item.slot, item]));
   const strip = h("span", { class: "items" });
   const slot = (id: string | undefined, trinket = false) => {
@@ -325,10 +341,10 @@ function itemStrip(player: PlayerStats, assets: DataDragonAssets | null) {
     if (!id || id === "0") return h("span", { class: `${className} is-empty` });
     const asset = assets?.items.get(id);
     const label = asset?.name ?? `Item ${id}`;
-    const src = asset?.image;
-    return src
-      ? h("img", { class: className, src, alt: label, title: label, loading: "lazy", decoding: "async" })
-      : h("span", { class: `${className} is-empty`, title: label });
+    const text = () => h("span", { class: `${className} item-text`, text: id, title: label, attrs: { role: "img", "aria-label": label } });
+    if (asset) return icon({ class: className, src: asset.image, label }, text);
+    // While static data loads, keep a quiet empty slot instead of flashing ids.
+    return assets || offline ? text() : h("span", { class: `${className} is-empty`, title: label });
   };
   for (let index = 0; index < 6; index += 1) {
     const item = bySlot.get(index);
@@ -477,8 +493,8 @@ function statsTable(blue: PlayerStats[], red: PlayerStats[], context: MatchConte
     const label = `${player.name || "Unknown"} · ${name}`;
     return h("th", { class: index === blue.length ? "num stat-player team-split" : "num stat-player", title: label },
       image
-        ? h("img", { class: "stat-champ", src: image, alt: name, loading: "lazy", decoding: "async" })
-        : h("span", { class: "stat-champ champ-fallback", text: name.slice(0, 2) }),
+        ? icon({ class: "stat-champ", src: image, label }, () => monogram(name, "stat-champ champ-fallback"))
+        : monogram(name, "stat-champ champ-fallback"),
     );
   });
 

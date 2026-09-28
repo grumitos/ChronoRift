@@ -19,7 +19,6 @@ import {
   chooseExecutable,
   confirmInstall,
   confirmRepair,
-  hasGameLayout,
   installRequest,
   playReplay,
   reviewInstallPlan,
@@ -273,7 +272,7 @@ function step(label: string, forId: string | null, ...body: Node[]) {
 
 function clientRow(client: InstalledClient) {
   const inUse = client.executablePath === state.executablePath;
-  const gameLayout = hasGameLayout(client.executablePath);
+  const gameLayout = !client.legacyLayout;
   let action: Node;
   if (!client.executableExists) {
     action = h("span", { class: "hint error-text", text: "Executable missing" });
@@ -396,7 +395,15 @@ function repairView(plan: ClientRepairPlan): HTMLElement {
   });
   return h("div", { class: "plan" },
     h("p", { text: `Repair client ${plan.resolvedVersion} (${plan.locale}).` }),
-    plan.exactBuild ? null : h("p", { class: "notice", attrs: { role: "note" }, text: "This install is not the exact build of its replay. Playback may fail." }),
+    plan.exactBuild
+      ? null
+      : h("p", {
+          class: "notice",
+          attrs: { role: "note" },
+          text: plan.requestedVersion
+            ? `This install is not the exact build of its replay (replay ${plan.requestedVersion}, closest ${plan.resolvedVersion}). Playback may fail.`
+            : "This install is not the exact build of its replay. Playback may fail.",
+        }),
     plan.stateStatus === "inProgress"
       ? h("p", { class: "hint", text: "The last install or repair in this folder did not finish." })
       : null,

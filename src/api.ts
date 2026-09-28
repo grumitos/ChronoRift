@@ -23,6 +23,8 @@ export type ReplaySummary = {
   /** DataDragon champion ids in player order, e.g. ["Urgot", "LeeSin"]. */
   blueChampions: string[];
   redChampions: string[];
+  /** Riot ID game names in player order (both teams); empty names are skipped. */
+  players: string[];
 };
 
 export type ReplayLibrary = {
@@ -124,6 +126,7 @@ export type ReplayInspection = {
   players: PlayerStats[];
   /** Replay metadata JSON; its raw `statsJson` string is replaced by "<parsed into players>". */
   metadata: unknown;
+  /** Only things the user should know (warnings, unsupported reasons); empty for a normal read. */
   notes: string[];
   /** Blue then Red; empty when the replay carries no stats. */
   teams: TeamSummary[];
@@ -136,6 +139,11 @@ export type Settings = {
   clientsRoot: string | null;
   executablePath: string | null;
   locale: string | null;
+  /** Replay selected last; restored on startup when it is still in the library. */
+  lastReplay: string | null;
+  /** Inner window size in logical pixels; the backend clamps it to at least 900x600. */
+  windowWidth: number | null;
+  windowHeight: number | null;
 };
 
 export type InstalledClient = {
@@ -146,6 +154,8 @@ export type InstalledClient = {
   destinationPath: string;
   executablePath: string;
   executableExists: boolean;
+  /** True when the executable is not <destinationPath>/Game/League of Legends.exe (v1 install); cannot be launched. */
+  legacyLayout: boolean;
 };
 
 export type ClientInstallRequest = {
@@ -219,6 +229,8 @@ export type ClientRepairPlan = {
   planId: string;
   expiresAtMs: number;
   patch: string;
+  /** Replay build the install was planned for, when the saved state knows it. */
+  requestedVersion: string | null;
   resolvedVersion: string;
   exactBuild: boolean;
   source: ClientSource;
@@ -298,12 +310,17 @@ export type CommandErrorCode =
   | "unknownPlan"
   | "cancelled"
   | "busy"
+  /** launch_replay */
+  | "invalidReplay"
+  | "invalidExecutable"
+  | "unsupportedPlatform"
+  | "spawn"
   /** Frontend only: browser preview has no backend for this command. */
   | "unavailable"
   /** Frontend only: a plain string or unexpected value was thrown. */
   | "unknown";
 
-/** Rejection shape of the install commands; anything else is normalized into it. */
+/** Rejection shape of the install and launch commands; anything else is normalized into it. */
 export type CommandError = {
   code: CommandErrorCode;
   /** Human readable, safe to show as is. */
@@ -410,7 +427,8 @@ const ERROR_CODES = new Set<string>([
   "invalidRegion", "invalidPatch", "invalidLocale", "localeUnavailable", "invalidDestination",
   "releaseNotFound", "network", "manifest", "io", "unsafePath", "wouldOverwrite",
   "notChronoRiftInstall", "localeMismatch", "missingExecutable", "unknownPlan", "cancelled",
-  "busy", "unavailable", "unknown",
+  "busy", "invalidReplay", "invalidExecutable", "unsupportedPlatform", "spawn", "unavailable",
+  "unknown",
 ]);
 
 /** Turns any thrown value (backend object, string, Error) into a CommandError. */

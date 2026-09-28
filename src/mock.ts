@@ -356,6 +356,7 @@ SAMPLES.forEach((sample) => {
     redKills: replay.redKills,
     blueChampions: sample.blue.map(([, , champion]) => champion),
     redChampions: sample.red.map(([, , champion]) => champion),
+    players: [...sample.blue, ...sample.red].map(([name]) => name),
   });
 });
 
@@ -383,6 +384,7 @@ function brokenReplay(
     redKills: 0,
     blueChampions: [],
     redChampions: [],
+    players: [],
   };
   inspections.set(path, {
     ...summary,
@@ -422,6 +424,7 @@ const clients: InstalledClient[] = [
     // Version 1 layout: game files directly in the destination, no Game folder.
     executablePath: `${CLIENTS_ROOT}\\15.6-ko_KR-old\\League of Legends.exe`,
     executableExists: true,
+    legacyLayout: true,
   },
   {
     patch: "14.8",
@@ -431,6 +434,7 @@ const clients: InstalledClient[] = [
     destinationPath: `${CLIENTS_ROOT}\\14.8-en_GB`,
     executablePath: `${CLIENTS_ROOT}\\14.8-en_GB\\Game\\League of Legends.exe`,
     executableExists: true,
+    legacyLayout: false,
   },
 ];
 
@@ -440,6 +444,9 @@ let settings: Settings = {
   clientsRoot: startEmpty ? null : CLIENTS_ROOT,
   executablePath: null,
   locale: null,
+  lastReplay: null,
+  windowWidth: null,
+  windowHeight: null,
 };
 
 export async function handle(command: string, args: Record<string, unknown>): Promise<unknown> {
@@ -532,6 +539,7 @@ function sampleRepairPlan(): ClientRepairPlan {
     planId: "repair-demo",
     expiresAtMs: now + 30 * 60_000,
     patch: "15.6",
+    requestedVersion: "15.6.6721234",
     resolvedVersion: "15.6.6721234",
     exactBuild: true,
     source: "archive",
