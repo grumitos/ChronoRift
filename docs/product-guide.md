@@ -79,7 +79,13 @@ Stages:
 7. Write install metadata.
 8. Mark executable ready.
 
-The first installer includes neutral files, Windows files, and files matching the visible locale. It refuses to overwrite existing files; resume/repair is a later feature.
+The first installer includes neutral files, Windows files, and files matching the visible locale. It refuses to overwrite existing files. An interrupted or damaged install is handled by an explicit repair flow:
+
+- ChronoRift writes `.chronorift/install-state.json` while installing and marks it complete at the end.
+- "Review repair" compares the planned files with disk and shows missing files, wrong-size files, and stale temp files, with sizes.
+- Repair downloads only missing files. Wrong-size files are replaced only when the user explicitly allows it in that plan.
+- Only ChronoRift's own temp files in `.chronorift/tmp` are ever deleted.
+- A running install or repair can be cancelled; only one runs at a time.
 
 ## Deliberate Non-Goals For First Cut
 

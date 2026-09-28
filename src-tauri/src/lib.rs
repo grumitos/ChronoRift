@@ -2,6 +2,7 @@ mod client;
 mod clients;
 mod launcher;
 mod library;
+mod repair;
 mod rofl;
 mod settings;
 
@@ -71,11 +72,38 @@ async fn plan_client_install(
         .map_err(|err| err.to_string())
 }
 
+#[tauri::command]
+async fn plan_client_repair(
+    app: tauri::AppHandle,
+    request: client::ClientInstallRequest,
+) -> Result<repair::ClientRepairPlan, String> {
+    repair::plan_client_repair(app, request)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn repair_client(
+    app: tauri::AppHandle,
+    request: repair::ClientRepairRequest,
+) -> Result<client::ClientInstallResult, String> {
+    repair::repair_client(app, request)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn cancel_client_install(app: tauri::AppHandle) -> bool {
+    client::cancel_client_install(&app)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .manage(client::InstallCancel::default())
+        .manage(client::InstallBusy::default())
         .invoke_handler(tauri::generate_handler![
             inspect_replay,
             scan_replay_folder,
@@ -84,7 +112,10 @@ pub fn run() {
             find_installed_clients,
             launch_replay,
             install_client,
-            plan_client_install
+            plan_client_install,
+            plan_client_repair,
+            repair_client,
+            cancel_client_install
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

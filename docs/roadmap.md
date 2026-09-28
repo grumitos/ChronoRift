@@ -174,3 +174,65 @@ Player profiles: public sites address players by Riot ID + region, not PUUID, so
 The frontend derives kill participation, KDA ratio, CS/min, gold/min, and damage share from these.
 
 The `download-progress` event keeps its current shape.
+
+## Frontend/Backend Contract (Milestone 2)
+
+All payloads are camelCase JSON. M1 commands are unchanged except that `install_client` now also writes install state, honors cancel, and is exclusive with `repair_client`.
+
+| Command | Args | Returns |
+| --- | --- | --- |
+| `plan_client_repair` | `{ request: ClientInstallRequest }` | `ClientRepairPlan` (read-only) |
+| `repair_client` | `{ request: ClientRepairRequest }` | `ClientInstallResult` |
+| `cancel_client_install` | none | `boolean` (true when an install/repair was running) |
+
+```ts
+type ClientRepairRequest = {
+  install: ClientInstallRequest;
+  replaceWrongSize: boolean;         // default false; wrong-size files are left untouched unless true
+};
+
+type ClientRepairPlan = {
+  patch: string;
+  resolvedVersion: string;
+  region: string;
+  locale: string;
+  destinationPath: string;
+  manifestUrl: string;
+  totalFiles: number;
+  okFiles: number;                   // exists with the exact manifest size
+  missingFiles: number;
+  wrongSizeFiles: number;            // exists but size differs (or is not a regular file)
+  missingPaths: string[];            // first 50
+  wrongSizePaths: string[];          // first 50
+  downloadBytes: number;             // to fetch missing files
+  installBytes: number;              // written for missing files
+  replaceDownloadBytes: number;      // extra if replaceWrongSize
+  replaceInstallBytes: number;       // extra if replaceWrongSize
+  staleTempFiles: number;            // files in <dest>/.chronorift/tmp (deleted by repair)
+  hasPriorState: boolean;            // <dest>/.chronorift/install-state.json exists
+  priorStateMatches: boolean;        // same manifestUrl + locale
+};
+
+// <dest>/.chronorift/install-state.json, written at install/repair start
+type InstallState = {
+  version: 1;
+  status: "inProgress" | "complete";
+  patch: string;
+  resolvedVersion: string;
+  region: string;
+  locale: string;
+  manifestUrl: string;
+  destinationPath: string;
+  files: { path: string; size: number }[];
+  startedAtMs: number;
+  updatedAtMs: number;
+};
+```
+
+Behavior:
+
+- `install_client` / `plan_client_install` still refuse existing targets (or stale temp files) with the message `"<path> already exists. Review repair to resume or fix this install."`; the UI should offer "Review repair" (`plan_client_repair`) when it sees it.
+- `repair_client` downloads missing files, replaces wrong-size files only when `replaceWrongSize` is true, deletes only files directly in `<dest>/.chronorift/tmp`, then writes `install.json` (full-client totals), marks state `complete`, and fails if `League of Legends.exe` is still missing.
+- Only one install/repair runs at a time; a second call fails with `"Another install is running"`.
+- Cancel is cooperative (checked between chunks and files). On cancel the current temp file is removed, state stays `inProgress`, a final `download-progress` event is emitted with `stage: "cancelled"` and `done: true`, and the command fails with `"Install cancelled"`.
+- `download-progress` keeps its shape. Stages: `resolve`, `manifest`, `plan`, `download` (install) or `repair` (repair), `complete`, `cancelled`.

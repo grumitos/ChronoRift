@@ -2,14 +2,17 @@ use cdragon_rman::{BundleChunk, Rman};
 use reqwest::{header, Url};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error::Error,
     fmt::{self, Display},
     fs::{self, File, OpenOptions},
     io::{Cursor, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
+
+use crate::repair::{self, InstallState};
 
 const INSTALL_PROGRESS_EVENT: &str = "download-progress";
 const PRODUCT: &str = "lol";
@@ -17,6 +20,52 @@ const PLATFORM: &str = "windows";
 const GAME_ARTIFACT: &str = "lol-game-client";
 const GAME_EXE: &str = "League of Legends.exe";
 const PLATFORM_MARKERS: [&str; 2] = ["windows", "macos"];
+pub(crate) const METADATA_DIR: &str = ".chronorift";
+pub(crate) const TEMP_DIR: &str = "tmp";
+
+/// Cooperative cancel flag for the running install/repair (Tauri managed state).
+#[derive(Debug, Default)]
+pub struct InstallCancel(pub AtomicBool);
+
+/// Set while an install or repair is running (Tauri managed state).
+#[derive(Debug, Default)]
+pub struct InstallBusy(pub AtomicBool);
+
+/// Holds the busy flag for one install/repair and releases it on drop.
+pub(crate) struct BusyGuard<'a>(&'a AtomicBool);
+
+impl<'a> BusyGuard<'a> {
+    /// Claims the busy flag and clears any stale cancel request.
+    pub(crate) fn start(
+        busy: &'a AtomicBool,
+        cancel: &AtomicBool,
+    ) -> Result<Self, ClientInstallError> {
+        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ClientInstallError::Busy)?;
+        cancel.store(false, Ordering::SeqCst);
+        Ok(Self(busy))
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+pub(crate) fn check_cancel(cancel: &AtomicBool) -> Result<(), ClientInstallError> {
+    if cancel.load(Ordering::SeqCst) {
+        Err(ClientInstallError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+/// Requests cancel of the running install/repair. Returns whether one was running.
+pub fn cancel_client_install(app: &AppHandle) -> bool {
+    app.state::<InstallCancel>().0.store(true, Ordering::SeqCst);
+    app.state::<InstallBusy>().0.load(Ordering::SeqCst)
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -96,6 +145,8 @@ pub enum ClientInstallError {
     WouldOverwrite(PathBuf),
     MissingExecutable(PathBuf),
     Emit(tauri::Error),
+    Cancelled,
+    Busy,
 }
 
 impl Display for ClientInstallError {
@@ -140,7 +191,7 @@ impl Display for ClientInstallError {
             }
             Self::WouldOverwrite(path) => write!(
                 f,
-                "Refusing to overwrite existing file. Choose an empty folder or remove: {}",
+                "{} already exists. Review repair to resume or fix this install.",
                 path.display()
             ),
             Self::MissingExecutable(path) => write!(
@@ -149,6 +200,8 @@ impl Display for ClientInstallError {
                 path.display()
             ),
             Self::Emit(err) => write!(f, "Could not publish install progress: {err}"),
+            Self::Cancelled => write!(f, "Install cancelled"),
+            Self::Busy => write!(f, "Another install is running"),
         }
     }
 }
@@ -171,41 +224,74 @@ pub async fn install_client(
     app: AppHandle,
     request: ClientInstallRequest,
 ) -> Result<ClientInstallResult, ClientInstallError> {
-    let planned = build_install_plan(&app, &request).await?;
+    let busy = app.state::<InstallBusy>();
+    let cancel = app.state::<InstallCancel>();
+    let _guard = BusyGuard::start(&busy.0, &cancel.0)?;
+    let destination = PathBuf::from(request.destination_path.trim());
+    let outcome = run_install(&app, &request, &cancel.0).await;
+    report_cancel(&app, &destination, outcome)
+}
+
+async fn run_install(
+    app: &AppHandle,
+    request: &ClientInstallRequest,
+    cancel: &AtomicBool,
+) -> Result<ClientInstallResult, ClientInstallError> {
+    let planned = build_install_plan(app, request).await?;
     let destination = PathBuf::from(&planned.plan.destination_path);
     let bundle_base = bundle_base_from_manifest_url(&planned.plan.manifest_url)?;
     fs::create_dir_all(&destination)?;
+    let mut state = InstallState::new(&planned.plan, &planned.files, repair::now_ms());
+    repair::write_install_state(&destination, &state)?;
 
+    let files = planned.files.iter().collect::<Vec<_>>();
     download_files(
-        &app,
+        app,
         &destination,
-        &bundle_base,
-        &planned.files,
-        planned.plan.download_bytes,
+        &DownloadJob {
+            bundle_base: &bundle_base,
+            files: &files,
+            total_download_bytes: planned.plan.download_bytes,
+            stage: "download",
+            replace_existing: &HashSet::new(),
+            cancel,
+        },
     )
     .await?;
 
+    finish_install(app, &destination, &planned.plan, &mut state)
+}
+
+/// Verifies the executable, writes install.json, marks the state complete, and emits "complete".
+pub(crate) fn finish_install(
+    app: &AppHandle,
+    destination: &Path,
+    plan: &ClientInstallPlan,
+    state: &mut InstallState,
+) -> Result<ClientInstallResult, ClientInstallError> {
     let executable = destination.join(GAME_EXE);
     if !executable.is_file() {
         return Err(ClientInstallError::MissingExecutable(executable));
     }
 
     let result = ClientInstallResult {
-        patch: planned.plan.patch,
-        resolved_version: planned.plan.resolved_version,
-        region: planned.plan.region,
-        locale: planned.plan.locale,
-        destination_path: planned.plan.destination_path,
+        patch: plan.patch.clone(),
+        resolved_version: plan.resolved_version.clone(),
+        region: plan.region.clone(),
+        locale: plan.locale.clone(),
+        destination_path: plan.destination_path.clone(),
         executable_path: executable.display().to_string(),
-        manifest_url: planned.plan.manifest_url,
-        file_count: planned.plan.file_count,
-        download_bytes: planned.plan.download_bytes,
-        install_bytes: planned.plan.install_bytes,
+        manifest_url: plan.manifest_url.clone(),
+        file_count: plan.file_count,
+        download_bytes: plan.download_bytes,
+        install_bytes: plan.install_bytes,
     };
-    write_install_metadata(&destination, &result)?;
+    write_install_metadata(destination, &result)?;
+    state.mark_complete(repair::now_ms());
+    repair::write_install_state(destination, state)?;
     emit_progress(
-        &app,
-        &destination,
+        app,
+        destination,
         "complete",
         "Client ready",
         result.download_bytes,
@@ -213,6 +299,26 @@ pub async fn install_client(
         true,
     )?;
     Ok(result)
+}
+
+/// On cancel, publishes a final "cancelled" progress event; the error is passed through.
+pub(crate) fn report_cancel<T>(
+    app: &AppHandle,
+    destination: &Path,
+    outcome: Result<T, ClientInstallError>,
+) -> Result<T, ClientInstallError> {
+    if matches!(outcome, Err(ClientInstallError::Cancelled)) {
+        let _ = emit_progress(
+            app,
+            destination,
+            "cancelled",
+            "Install cancelled",
+            0,
+            None,
+            true,
+        );
+    }
+    outcome
 }
 
 pub async fn plan_client_install(
@@ -231,16 +337,25 @@ struct SelectedRelease {
 }
 
 #[derive(Debug, Clone)]
-struct InstallFile {
-    path: String,
-    filesize: u32,
-    chunks: Vec<BundleChunk>,
+pub(crate) struct InstallFile {
+    pub(crate) path: String,
+    pub(crate) filesize: u32,
+    pub(crate) chunks: Vec<BundleChunk>,
+}
+
+impl InstallFile {
+    pub(crate) fn download_bytes(&self) -> u64 {
+        self.chunks
+            .iter()
+            .map(|chunk| u64::from(chunk.bundle_size))
+            .sum()
+    }
 }
 
 #[derive(Debug, Clone)]
-struct PlannedInstall {
-    plan: ClientInstallPlan,
-    files: Vec<InstallFile>,
+pub(crate) struct PlannedInstall {
+    pub(crate) plan: ClientInstallPlan,
+    pub(crate) files: Vec<InstallFile>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -269,7 +384,18 @@ struct Download {
     url: String,
 }
 
+/// Resolves the manifest and preflights the destination: fails on any existing target.
 async fn build_install_plan(
+    app: &AppHandle,
+    request: &ClientInstallRequest,
+) -> Result<PlannedInstall, ClientInstallError> {
+    let planned = resolve_install(app, request).await?;
+    preflight_targets(Path::new(&planned.plan.destination_path), &planned.files)?;
+    Ok(planned)
+}
+
+/// Resolves the manifest and selects locale files without looking at the destination.
+pub(crate) async fn resolve_install(
     app: &AppHandle,
     request: &ClientInstallRequest,
 ) -> Result<PlannedInstall, ClientInstallError> {
@@ -316,7 +442,6 @@ async fn build_install_plan(
 
     let rman = read_rman_manifest(manifest)?;
     let files = select_install_files(&rman, &locale)?;
-    preflight_targets(&destination, &files)?;
     let (download_bytes, install_bytes) = install_totals(&files);
 
     Ok(PlannedInstall {
@@ -336,11 +461,7 @@ async fn build_install_plan(
 }
 
 fn install_totals(files: &[InstallFile]) -> (u64, u64) {
-    let download_bytes = files
-        .iter()
-        .flat_map(|file| file.chunks.iter())
-        .map(|chunk| u64::from(chunk.bundle_size))
-        .sum::<u64>();
+    let download_bytes = files.iter().map(InstallFile::download_bytes).sum::<u64>();
     let install_bytes = files
         .iter()
         .map(|file| u64::from(file.filesize))
@@ -536,77 +657,100 @@ fn preflight_targets(destination: &Path, files: &[InstallFile]) -> Result<(), Cl
             return Err(ClientInstallError::WouldOverwrite(target));
         }
     }
+    if let Some(temp) = repair::stale_temp_files(destination)?.into_iter().next() {
+        return Err(ClientInstallError::WouldOverwrite(temp));
+    }
     Ok(())
 }
 
-async fn download_files(
+pub(crate) struct DownloadJob<'a> {
+    pub(crate) bundle_base: &'a str,
+    pub(crate) files: &'a [&'a InstallFile],
+    pub(crate) total_download_bytes: u64,
+    /// Progress stage for chunk downloads ("download" or "repair").
+    pub(crate) stage: &'a str,
+    /// Manifest paths whose existing target may be replaced; anything else must not exist.
+    pub(crate) replace_existing: &'a HashSet<&'a str>,
+    pub(crate) cancel: &'a AtomicBool,
+}
+
+pub(crate) fn temp_dir(destination: &Path) -> PathBuf {
+    destination.join(METADATA_DIR).join(TEMP_DIR)
+}
+
+pub(crate) async fn download_files(
     app: &AppHandle,
     destination: &Path,
-    bundle_base: &str,
-    files: &[InstallFile],
-    total_download_bytes: u64,
+    job: &DownloadJob<'_>,
 ) -> Result<(), ClientInstallError> {
     let client = reqwest::Client::new();
-    let temp_dir = destination.join(".chronorift").join("tmp");
+    let temp_dir = temp_dir(destination);
     fs::create_dir_all(&temp_dir)?;
     let mut downloaded_bytes = 0;
 
-    for file in files {
+    for file in job.files {
+        check_cancel(job.cancel)?;
         let target = resolve_install_path(destination, &file.path)?;
         let temp_path = temp_dir.join(temp_name_for_manifest_path(&file.path));
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut output = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(file) => file,
-            Err(err) => return Err(ClientInstallError::Io(err)),
-        };
-
-        for chunk in &file.chunks {
-            let chunk_result = download_bundle_range(&client, bundle_base, chunk).await;
-            let compressed = match chunk_result {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    let _ = fs::remove_file(&temp_path);
-                    return Err(err);
-                }
-            };
-            downloaded_bytes += compressed.len() as u64;
-            emit_progress(
-                app,
-                destination,
-                "download",
-                &file.path,
-                downloaded_bytes,
-                Some(total_download_bytes),
-                false,
-            )?;
-
-            let decompressed = match zstd::bulk::decompress(&compressed, chunk.target_size as usize)
-            {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    let _ = fs::remove_file(&temp_path);
-                    return Err(ClientInstallError::Zstd(err));
-                }
-            };
-            if let Err(err) = output.write_all(&decompressed) {
-                let _ = fs::remove_file(&temp_path);
-                return Err(ClientInstallError::Io(err));
-            }
-        }
-        if let Err(err) = output.flush() {
+        let written = download_to_temp(
+            &client,
+            app,
+            destination,
+            job,
+            file,
+            &temp_path,
+            &mut downloaded_bytes,
+        )
+        .await;
+        if let Err(err) = written {
             let _ = fs::remove_file(&temp_path);
-            return Err(ClientInstallError::Io(err));
+            return Err(err);
         }
-        drop(output);
+        let allowed = job.replace_existing.contains(file.path.as_str());
+        if !allowed && fs::symlink_metadata(&target).is_ok() {
+            let _ = fs::remove_file(&temp_path);
+            return Err(ClientInstallError::WouldOverwrite(target));
+        }
         fs::rename(&temp_path, target)?;
     }
 
+    Ok(())
+}
+
+async fn download_to_temp(
+    client: &reqwest::Client,
+    app: &AppHandle,
+    destination: &Path,
+    job: &DownloadJob<'_>,
+    file: &InstallFile,
+    temp_path: &Path,
+    downloaded_bytes: &mut u64,
+) -> Result<(), ClientInstallError> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)?;
+    for chunk in &file.chunks {
+        check_cancel(job.cancel)?;
+        let compressed = download_bundle_range(client, job.bundle_base, chunk).await?;
+        *downloaded_bytes += compressed.len() as u64;
+        emit_progress(
+            app,
+            destination,
+            job.stage,
+            &file.path,
+            *downloaded_bytes,
+            Some(job.total_download_bytes),
+            false,
+        )?;
+        let decompressed = zstd::bulk::decompress(&compressed, chunk.target_size as usize)
+            .map_err(ClientInstallError::Zstd)?;
+        output.write_all(&decompressed)?;
+    }
+    output.flush()?;
     Ok(())
 }
 
@@ -643,7 +787,7 @@ fn write_install_metadata(
     destination: &Path,
     result: &ClientInstallResult,
 ) -> Result<(), ClientInstallError> {
-    let metadata_dir = destination.join(".chronorift");
+    let metadata_dir = destination.join(METADATA_DIR);
     fs::create_dir_all(&metadata_dir)?;
     let mut file = File::create(metadata_dir.join("install.json"))?;
     serde_json::to_writer_pretty(&mut file, result).map_err(ClientInstallError::Metadata)?;
@@ -651,7 +795,7 @@ fn write_install_metadata(
     Ok(())
 }
 
-fn emit_progress(
+pub(crate) fn emit_progress(
     app: &AppHandle,
     destination: &Path,
     stage: &str,
@@ -723,7 +867,9 @@ pub(crate) fn normalize_locale(locale: &str) -> Option<String> {
     })
 }
 
-fn bundle_base_from_manifest_url(manifest_url: &str) -> Result<String, ClientInstallError> {
+pub(crate) fn bundle_base_from_manifest_url(
+    manifest_url: &str,
+) -> Result<String, ClientInstallError> {
     let mut url = Url::parse(manifest_url)
         .map_err(|_| ClientInstallError::InvalidManifestUrl(manifest_url.to_string()))?;
     let path = url.path();
@@ -739,7 +885,7 @@ fn bundle_base_from_manifest_url(manifest_url: &str) -> Result<String, ClientIns
     Ok(url.to_string().trim_end_matches('/').to_string())
 }
 
-fn resolve_install_path(
+pub(crate) fn resolve_install_path(
     destination: &Path,
     manifest_path: &str,
 ) -> Result<PathBuf, ClientInstallError> {
