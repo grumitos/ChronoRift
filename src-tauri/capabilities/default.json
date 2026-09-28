@@ -5,7 +5,16 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-set-size",
+    "core:window:allow-inner-size",
+    "core:window:allow-scale-factor",
     "dialog:default",
-    "opener:default"
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://www.op.gg/*" },
+        { "url": "https://www.leagueofgraphs.com/*" }
+      ]
+    }
   ]
 }

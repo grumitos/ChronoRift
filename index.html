@@ -2,124 +2,13 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="icon" href="data:," />
     <title>ChronoRift</title>
-    <script type="module" src="/src/main.ts" defer></script>
+    <script type="module" src="/src/main.ts"></script>
   </head>
-
   <body>
-    <main class="shell">
-      <aside class="sidebar" aria-label="Replay controls">
-        <div>
-          <p class="eyebrow">ChronoRift</p>
-          <h1>Replay Library</h1>
-        </div>
-
-        <button id="open-replay" type="button">Open .rofl</button>
-
-        <label class="field">
-          <span>Client install folder</span>
-          <div class="inline">
-            <input id="install-folder" type="text" spellcheck="false" placeholder="D:\LoL Clients\14.8" />
-            <button id="choose-install-folder" type="button" aria-label="Choose install folder">...</button>
-          </div>
-        </label>
-
-        <label class="field">
-          <span>League executable</span>
-          <div class="inline">
-            <input id="exe-path" type="text" spellcheck="false" placeholder="...\Game\League of Legends.exe" />
-            <button id="choose-executable" type="button" aria-label="Choose League executable">...</button>
-          </div>
-        </label>
-
-        <label class="field compact">
-          <span>Locale</span>
-          <input id="locale" type="text" value="en_US" maxlength="5" spellcheck="false" />
-        </label>
-
-        <button id="download-client" type="button" disabled>Download / install client</button>
-        <button id="play-replay" type="button" disabled>Play replay</button>
-      </aside>
-
-      <section class="content" aria-live="polite">
-        <div class="topline">
-          <div>
-            <p class="eyebrow">Selected replay</p>
-            <h2 id="file-name">No replay loaded</h2>
-          </div>
-          <span id="status-pill" class="pill muted">Idle</span>
-        </div>
-
-        <dl class="metrics">
-          <div>
-            <dt>Patch</dt>
-            <dd id="patch">-</dd>
-          </div>
-          <div>
-            <dt>Game version</dt>
-            <dd id="version">-</dd>
-          </div>
-          <div>
-            <dt>Match ID</dt>
-            <dd id="match-id">-</dd>
-          </div>
-          <div>
-            <dt>Duration</dt>
-            <dd id="duration">-</dd>
-          </div>
-          <div>
-            <dt>Score</dt>
-            <dd id="score">-</dd>
-          </div>
-          <div>
-            <dt>Server</dt>
-            <dd id="region">-</dd>
-          </div>
-          <div>
-            <dt>Suggested locale</dt>
-            <dd id="suggested-locale">-</dd>
-          </div>
-        </dl>
-
-        <section class="scoreboard" aria-label="Scoreboard">
-          <div class="team-column">
-            <div class="team-heading">
-              <h3>Blue</h3>
-              <span id="blue-score">0</span>
-            </div>
-            <div id="blue-team" class="player-list"></div>
-          </div>
-          <div class="team-column">
-            <div class="team-heading">
-              <h3>Red</h3>
-              <span id="red-score">0</span>
-            </div>
-            <div id="red-team" class="player-list"></div>
-          </div>
-        </section>
-
-        <section class="install-panel" aria-label="Client installation">
-          <div>
-            <p class="eyebrow">Client</p>
-            <h3 id="client-state">Waiting for replay</h3>
-          </div>
-          <div class="progress">
-            <div id="progress-bar"></div>
-          </div>
-          <p id="progress-text">Open a replay to detect the required patch.</p>
-        </section>
-
-        <section class="panel" aria-label="Replay metadata">
-          <div class="panel-heading">
-            <h3>Metadata</h3>
-            <span id="note"></span>
-          </div>
-          <pre id="metadata">{}</pre>
-        </section>
-      </section>
-    </main>
+    <div id="app" class="app"></div>
   </body>
 </html>
