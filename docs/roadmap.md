@@ -236,3 +236,166 @@ Behavior:
 - Only one install/repair runs at a time; a second call fails with `"Another install is running"`.
 - Cancel is cooperative (checked between chunks and files). On cancel the current temp file is removed, state stays `inProgress`, a final `download-progress` event is emitted with `stage: "cancelled"` and `done: true`, and the command fails with `"Install cancelled"`.
 - `download-progress` keeps its shape. Stages: `resolve`, `manifest`, `plan`, `download` (install) or `repair` (repair), `complete`, `cancelled`.
+
+## Install pipeline contract (v2)
+
+Supersedes the install/repair parts of the Milestone 1 and 2 contracts (`plan_client_install`, `install_client`, `plan_client_repair`, `repair_client`, `InstallState`, the `download-progress` shape). `find_installed_clients` and `cancel_client_install` keep their shapes. All payloads are camelCase JSON. Architecture notes: [architecture.md](architecture.md#install-client-install-pipeline).
+
+| Command | Args | Returns | Errors (`code`) |
+| --- | --- | --- | --- |
+| `plan_client_install` | `{ request: ClientInstallRequest }` | `ClientInstallPlan` | `busy`, `invalidRegion`, `invalidPatch`, `invalidLocale`, `localeUnavailable`, `invalidDestination`, `releaseNotFound`, `network`, `manifest`, `wouldOverwrite`, `unsafePath`, `io`, `cancelled` |
+| `install_client` | `{ request: { planId } }` | `ClientInstallResult` | `busy`, `unknownPlan`, `wouldOverwrite`, `network`, `manifest`, `io`, `missingExecutable`, `cancelled` |
+| `plan_client_repair` | `{ request: ClientRepairPlanRequest }` | `ClientRepairPlan` | `busy`, `invalidDestination`, `invalidLocale`, `localeUnavailable`, `notChronoRiftInstall`, `localeMismatch`, `network`, `manifest`, `io`, `cancelled` |
+| `repair_client` | `{ request: ClientRepairRequest }` | `ClientInstallResult` | `busy`, `unknownPlan`, `notChronoRiftInstall`, `wouldOverwrite`, `network`, `manifest`, `io`, `missingExecutable`, `cancelled` |
+| `cancel_client_install` | none | `boolean` (true when a plan/install/repair was running) | — |
+
+```ts
+// Failures of the four commands above reject with this object (not a string).
+type CommandError = {
+  code:
+    | "invalidRegion" | "invalidPatch" | "invalidLocale" | "localeUnavailable"
+    | "invalidDestination" | "releaseNotFound" | "network" | "manifest" | "io"
+    | "unsafePath" | "wouldOverwrite" | "notChronoRiftInstall" | "localeMismatch"
+    | "missingExecutable" | "unknownPlan" | "cancelled" | "busy";
+  message: string;                   // human readable, safe to show as is
+  path?: string;                     // io, wouldOverwrite, notChronoRiftInstall, missingExecutable
+  availableLocales?: string[];       // localeUnavailable: what the manifest offers (sorted)
+};
+
+type ClientInstallRequest = {
+  patch: string;                     // "16.17" (a full version is accepted too)
+  gameVersion: string | null;        // replay build, e.g. "16.17.810.4348"; must match patch
+  region: string | null;             // required: BR1 EUN1 EUW1 JP1 KR LA1 LA2 ME1 NA1 OC1 PH2 RU SG2 TH2 TR1 TW2 VN2
+                                     // null/other → invalidRegion "Choose a server…" (no NA1 default)
+  locale: string;                    // xx_YY; must be offered by the manifest (else localeUnavailable)
+  destinationPath: string;           // absolute; the client goes to <destinationPath>/Game
+};
+
+type ClientInstallPlan = {
+  planId: string;                    // pass to install_client; valid ~30 min, until installed, or until 3 newer plans
+  expiresAtMs: number;
+  patch: string;                     // "16.17"
+  requestedVersion: string | null;   // archive form, "16.17.8104348"
+  resolvedVersion: string;           // archive form of the build that will be installed
+  exactBuild: boolean;               // resolvedVersion === requestedVersion; show a warning when false
+  source: "archive" | "sieve";       // archive = github.com/Morilli/riot-manifests; sieve = Riot (current patch only)
+  region: string;                    // requested server
+  manifestRegion: string;            // archive region dir the manifest came from (e.g. NA1 when LA2 lacked it)
+  locale: string;                    // requested locale
+  localeAssets: string;              // locale whose asset files are installed: es_AR → "es_MX", en_GB → "en_US"
+  availableLocales: string[];        // locales this manifest offers, sorted
+  destinationPath: string;
+  gamePath: string;                  // <destinationPath>/Game
+  executablePath: string;            // <destinationPath>/Game/League of Legends.exe
+  manifestUrl: string;
+  fileCount: number;
+  downloadBytes: number;             // bytes on the wire after dedupe + range coalescing
+  installBytes: number;              // bytes written to disk
+  requestCount: number;              // HTTP range requests the download needs
+};
+
+type ClientInstallResult = {
+  patch: string;
+  requestedVersion: string | null;
+  resolvedVersion: string;
+  exactBuild: boolean;
+  source: "archive" | "sieve";
+  region: string;
+  manifestRegion: string;
+  locale: string;
+  destinationPath: string;
+  gamePath: string;
+  executablePath: string;            // launch this; GameBaseDir = destinationPath
+  manifestUrl: string;
+  fileCount: number;                 // whole client
+  downloadBytes: number;             // downloaded by this run
+  installBytes: number;              // whole client
+  requestCount: number;              // requests made by this run
+};
+
+type ClientRepairPlanRequest = {
+  destinationPath: string;           // must contain .chronorift/install-state.json (else notChronoRiftInstall)
+  locale: string;                    // must equal the installed locale (else localeMismatch)
+};
+
+type ClientRepairPlan = {
+  planId: string;
+  expiresAtMs: number;
+  patch: string;
+  resolvedVersion: string;
+  exactBuild: boolean;
+  source: "archive" | "sieve";
+  region: string;
+  locale: string;
+  localeAssets: string;
+  destinationPath: string;
+  gamePath: string;                  // <dest>/Game (or <dest> for v1 installs)
+  manifestUrl: string;               // from install-state.json; repair never re-resolves
+  stateStatus: "inProgress" | "complete";
+  totalFiles: number;
+  okFiles: number;
+  missingFiles: number;
+  wrongSizeFiles: number;
+  missingPaths: string[];            // first 50
+  wrongSizePaths: string[];          // first 50
+  downloadBytes: number;             // to fetch missing files
+  installBytes: number;
+  replaceDownloadBytes: number;      // extra if replaceWrongSize
+  replaceInstallBytes: number;
+  staleTempFiles: number;            // deleted by repair_client
+};
+
+type ClientRepairRequest = {
+  planId: string;
+  replaceWrongSize: boolean;         // default false
+};
+
+// Event "download-progress"
+type DownloadProgress = {
+  destinationPath: string;
+  stage: "resolve" | "manifest" | "plan" | "download" | "repair" | "complete" | "cancelled" | "failed";
+  detail: string;                    // human-readable step, or the error message for "failed"
+  downloadedBytes: number;
+  totalBytes: number | null;
+  percent: number | null;
+  filesDone: number;
+  filesTotal: number;
+  done: boolean;                     // true on the last event of an operation
+};
+```
+
+Behavior:
+
+- Resolution order: archive exact build (request region dir, then `NA1`, `EUW1`) → archive builds of the same patch, newest first (skipping manifests Riot answers 403/404 for) → Riot Sieve (current patch only). `exactBuild: false` or `source: "sieve"` must be visible in the plan UI. When nothing is downloadable the error is `releaseNotFound` with the reasons in `message`.
+- Planning downloads only the manifest (checked for cancel) and never writes to the destination. It fails with `wouldOverwrite` (and `path`) if any target file, `.chronorift/install-state.json`, or a temp file already exists; the UI should then offer "Review repair".
+- `install_client` installs exactly the pinned plan; unknown or expired ids fail with `unknownPlan` (plan again).
+- Progress events are throttled to about 10 per second. Stage changes and the final event are always sent: `plan` with `done: true` when a plan is ready, `complete` after install/repair, `cancelled` on cancel, `failed` on any other error.
+- Cancel is checked between network reads (manifest and bundles) and between ranges. Files already completed stay; their temp files are cleaned; `install-state.json` stays `inProgress`.
+- Repair reads `install-state.json` (v1 or v2), downloads the manifest at its `manifestUrl`, replaces wrong-size files only with `replaceWrongSize`, deletes only files directly in `.chronorift/tmp`, and ends like an install.
+
+On disk (`<dest>/.chronorift/`), version 2, paths relative to `<dest>`:
+
+```ts
+type Release = {
+  patch: string; resolvedVersion: string; requestedVersion: string | null; exactBuild: boolean;
+  source: "archive" | "sieve"; region: string; manifestRegion: string; locale: string; manifestUrl: string;
+};
+type InstallState = Release & {     // install-state.json, written at install/repair start
+  version: 2;
+  status: "inProgress" | "complete";
+  gameDir: "Game" | "";              // "" = v1 layout (files directly in <dest>)
+  files: { path: string; size: number }[];   // relative to gameDir
+  startedAtMs: number;
+  updatedAtMs: number;
+};
+type InstallRecord = Release & {     // install.json, written on completion
+  version: 2;
+  gameDir: "Game" | "";
+  fileCount: number;
+  downloadBytes: number;
+  installBytes: number;
+  installedAtMs: number;
+};
+```
+
+Version 1 files (no `version` in `install.json`, `version: 1` in the state; absolute `destinationPath`/`executablePath`) are still read by `find_installed_clients` and repair.
