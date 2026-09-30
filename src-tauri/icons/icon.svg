@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- Fuente de `tauri icon`. Loseta con chaflán del 18 %, el mismo que las esquinas de la marca. -->
+  <path d="M210 40H814L984 210V814L814 984H210L40 814V210Z" fill="#1E1E22"/>
+  <svg x="192" y="192" width="640" height="640" viewBox="0 0 24 24" fill="#EDEDEF">
+    <path d="M2 5.6L5.6 2H20.16L17.56 4.6H6.68L4.6 6.68V17.56L2 20.16Z"/>
+    <path d="M22 18.4L18.4 22H3.84L6.44 19.4H17.32L19.4 17.32V6.44L22 3.84Z"/>
+    <path d="M11.35 7.9V16.1L6.35 12Z"/>
+    <path d="M17.65 7.9V16.1L12.65 12Z"/>
+  </svg>
+</svg>

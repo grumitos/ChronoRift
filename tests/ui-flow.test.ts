@@ -1,0 +1,692 @@
+// Flujo completo de la UI real (index.html + src/main.ts) sobre happy-dom, con el IPC de Tauri
+// simulado por @tauri-apps/api/mocks y los datos estáticos servidos por un fetch local.
+// Los datos son sintéticos: no se usan Riot IDs reales.
+import { GlobalRegistrator } from "@happy-dom/global-registrator";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+
+const REPLAY_DIR = "C:\\Replays";
+const REPLAY_A = `${REPLAY_DIR}\\LA2-1625354615.rofl`;
+const REPLAY_B = `${REPLAY_DIR}\\LA2-1621247134.rofl`;
+const CLIENTS_ROOT = "E:\\ChronoRift";
+const BUILD_A = "16.18.817.5716";
+const BUILD_B = "16.17.810.4348";
+const DESTINATION = `${CLIENTS_ROOT}\\${BUILD_A}\\Game`;
+const EXECUTABLE = `${DESTINATION}\\League of Legends.exe`;
+const DD = "https://ddragon.leagueoflegends.com";
+const CD = "https://raw.communitydragon.org/16.18/plugins/rcp-be-lol-game-data/global";
+// La app pide DataDragon y CommunityDragon a la caché en disco del backend (esquema lolasset).
+const CACHE = "lolasset://localhost";
+const ORIGINS: Record<string, string> = { ddragon: DD, cdragon: "https://raw.communitydragon.org" };
+const viaCache = (url: string) =>
+  url.startsWith(`${DD}/`) ? `${CACHE}/ddragon${url.slice(DD.length)}` : `${CACHE}/cdragon${url.slice(ORIGINS.cdragon.length)}`;
+const fromCache = (url: string) => {
+  const match = url.match(/^lolasset:\/\/localhost\/(ddragon|cdragon)(\/.*)$/);
+  return match ? `${ORIGINS[match[1]]}${match[2]}` : null;
+};
+const GIB = 1024 ** 3;
+const OWNER = "Yo#LAS";
+
+const champions = ["Urgot", "MonkeyKing", "Veigar", "Caitlyn", "Pyke", "Sett", "Quinn", "Hwei", "Smolder", "Nautilus"];
+const positions = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"];
+
+// Jugador 8 (rojo, BOT) es el dueño de la biblioteca: el único que se repite entre partidas.
+function players(redWins: boolean, game: string) {
+  return champions.map((champion, index) => {
+    const [gameName, tagLine] = index === 8 ? ["Yo", "LAS"] : [`Jugador${game}${index}`, "LAS"];
+    const red = index >= 5;
+    return {
+      name: `${gameName}#${tagLine}`,
+      gameName,
+      tagLine,
+      champion,
+      championImageUrl: `${DD}/cdn/16.18.1/img/champion/${champion}.png`,
+      team: red ? "Red" : "Blue",
+      position: positions[index % 5],
+      win: red === redWins,
+      level: 16 + (index % 3),
+      kills: index + 1,
+      deaths: 2,
+      assists: 3,
+      creepScore: 150 + index,
+      goldEarned: 12_000 + index * 100,
+      damageToChampions: 20_000 + index * 1_000,
+      physicalDamageToChampions: 12_000 + index * 600,
+      magicDamageToChampions: 7_000 + index * 300,
+      trueDamageToChampions: 1_000 + index * 100,
+      damageTaken: 25_000,
+      damageSelfMitigated: 18_000,
+      healShieldOnTeammates: index === 4 ? 9_000 : 0,
+      timeDeadSeconds: 120 + index,
+      visionScore: 30,
+      turretKills: 1,
+      dragonKills: index === 1 ? 2 : 0,
+      baronKills: 0,
+      heraldKills: 0,
+      voidgrubKills: 0,
+      items: [
+        { slot: 0, id: "3508", imageUrl: `${DD}/cdn/16.18.1/img/item/3508.png` },
+        // Misión de rol (ROLE_BOUND_ITEM): solo el dueño en la partida A; la B no tiene ninguna.
+        ...(index === 8 && game === BUILD_A
+          ? [{ slot: 7, id: "3020", imageUrl: `${DD}/cdn/16.18.1/img/item/3020.png` }]
+          : []),
+      ],
+      summonerSpells: ["4", "14"],
+      perks: ["8005"],
+      keystone: "8005",
+      primaryStyle: "8000",
+      subStyle: "8400",
+    };
+  });
+}
+
+function teams(list: ReturnType<typeof players>) {
+  return ["Blue", "Red"].map((team) => {
+    const members = list.filter((player) => player.team === team);
+    return {
+      team,
+      win: members.some((player) => player.win),
+      kills: members.reduce((total, player) => total + player.kills, 0),
+      goldEarned: members.reduce((total, player) => total + player.goldEarned, 0),
+      damageToChampions: members.reduce((total, player) => total + player.damageToChampions, 0),
+      towers: team === "Blue" ? 3 : 9,
+      inhibitors: team === "Blue" ? 0 : 2,
+      dragons: members.reduce((total, player) => total + player.dragonKills, 0),
+      barons: 0,
+      heralds: 0,
+      voidgrubs: 0,
+      atakhan: 0,
+    };
+  });
+}
+
+function inspection(path: string, version: string, patch: string, durationMs: number, redWins: boolean) {
+  const list = players(redWins, version);
+  return {
+    path,
+    fileName: path.slice(REPLAY_DIR.length + 1),
+    format: "rofl2",
+    status: "parsed",
+    gameVersion: version,
+    patch,
+    region: "LA2",
+    suggestedLocale: "es_MX",
+    dataDragonVersion: `${patch}.1`,
+    matchId: path.slice(REPLAY_DIR.length + 5, -5),
+    gameDurationMs: durationMs,
+    winningTeam: redWins ? "Red" : "Blue",
+    blueKills: 15,
+    redKills: 40,
+    players: list,
+    teams: teams(list),
+    metadata: {},
+    notes: [],
+  };
+}
+
+const replays: Record<string, ReturnType<typeof inspection>> = {
+  [REPLAY_A]: inspection(REPLAY_A, BUILD_A, "16.18", 2_194_553, true),
+  [REPLAY_B]: inspection(REPLAY_B, BUILD_B, "16.17", 2_698_573, false),
+};
+
+const library = {
+  folderPath: REPLAY_DIR,
+  entries: [REPLAY_A, REPLAY_B].map((path, index) => {
+    const replay = replays[path];
+    return {
+      path,
+      fileName: replay.fileName,
+      fileSize: 19_000_000,
+      modifiedAtMs: 1_758_344_477_000 - index * 86_400_000,
+      format: "rofl2",
+      status: "parsed",
+      gameVersion: replay.gameVersion,
+      patch: replay.patch,
+      region: "LA2",
+      matchId: replay.matchId,
+      gameDurationMs: replay.gameDurationMs,
+      winningTeam: replay.winningTeam,
+      blueKills: 15,
+      redKills: 40,
+      playerCount: 10,
+      players: replay.players.map(({ name, champion, team, position, kills, deaths, assists, win }) => ({
+        name, champion, team, position, kills, deaths, assists, win,
+      })),
+    };
+  }),
+  failures: [{ path: `${REPLAY_DIR}\\broken.rofl`, message: "Invalid ROFL header: missing RIOT classic magic" }],
+};
+
+function plan(mode: string, locale: string) {
+  return {
+    mode,
+    patch: "16.18",
+    resolvedVersion: "16.18.8175716",
+    gameBuild: BUILD_A,
+    exactBuild: true,
+    source: "manifestIndex",
+    region: "LA2",
+    locale,
+    clientsRoot: CLIENTS_ROOT,
+    destinationPath: DESTINATION,
+    manifestUrl: "https://lol.secure.dyn.riotcdn.net/channels/public/releases/344E097FEB027691.manifest",
+    fileCount: 4_056,
+    affectedFileCount: mode === "resume" ? 293 : 416,
+    reusedFileCount: mode === "resume" ? 123 : 0,
+    repairedFileCount: 0,
+    downloadBytes: (mode === "resume" ? 18 : 23.5) * GIB,
+    installBytes: 29.3 * GIB,
+    totalInstallBytes: 29.3 * GIB,
+  };
+}
+
+const staticData: Record<string, unknown> = {
+  [`${DD}/api/versions.json`]: ["16.19.1", "16.18.1", "16.17.1"],
+  [`${DD}/cdn/16.18.1/data/es_MX/champion.json`]: {
+    data: Object.fromEntries(
+      champions.map((id) => [id, { id, name: id === "MonkeyKing" ? "Wukong" : id, image: { full: `${id}.png` } }]),
+    ),
+  },
+  [`${DD}/cdn/16.18.1/data/es_MX/item.json`]: {
+    data: {
+      "3508": { name: "Filo de la tormenta", image: { full: "3508.png" } },
+      "3020": { name: "Botas del Hechicero", image: { full: "3020.png" } },
+    },
+  },
+  [`${CD}/es_mx/v1/summoner-spells.json`]: [
+    { id: 4, name: "Destello", description: "Teletransporta", iconPath: "/lol-game-data/assets/DATA/Spells/Icons2D/Summoner_Flash.png" },
+    { id: 14, name: "Ignición", description: "Quema", iconPath: "/lol-game-data/assets/DATA/Spells/Icons2D/SummonerIgnite.png" },
+  ],
+  [`${CD}/es_mx/v1/perks.json`]: [
+    { id: 8005, name: "Ataque intensificado", iconPath: "/lol-game-data/assets/v1/perk-images/Styles/Precision/PressTheAttack/PressTheAttack.png" },
+  ],
+  [`${CD}/es_mx/v1/perkstyles.json`]: {
+    styles: [{ id: 8400, name: "Valor", iconPath: "/lol-game-data/assets/v1/perk-images/Styles/7204_Resolve.png" }],
+  },
+};
+
+type Call = { cmd: string; args: any };
+const calls: Call[] = [];
+const fetched: string[] = [];
+const dialogAnswers: Array<string | null> = [];
+let settings: { clientsRoot: string | null } = { clientsRoot: CLIENTS_ROOT };
+let planFailure: string | null = null;
+let launchFailure: string | null = null;
+let revealFailure: string | null = null;
+let vanguard = "stopped";
+let pendingInstall: { resolve: (value: unknown) => void; reject: (reason: unknown) => void } | null = null;
+// Estado en disco que devuelve el backend simulado para cada compilación.
+const disk: Record<string, { state: string; installedBytes: number; totalInstallBytes: number | null }> = {
+  [BUILD_A]: { state: "missing", installedBytes: 0, totalInstallBytes: null },
+  [BUILD_B]: { state: "missing", installedBytes: 0, totalInstallBytes: null },
+};
+const realFetch = globalThis.fetch;
+
+function localStatus(build: string) {
+  const current = disk[build];
+  const destinationPath = `${settings.clientsRoot}\\${build}\\Game`;
+  return {
+    gameBuild: build,
+    destinationPath,
+    state: current.state,
+    executablePath: current.state === "ready" ? `${destinationPath}\\League of Legends.exe` : null,
+    locale: current.state === "missing" ? null : "es_MX",
+    installedBytes: current.installedBytes,
+    totalInstallBytes: current.totalInstallBytes,
+  };
+}
+
+// Backend simulado: responde como los comandos de Rust y registra cada llamada.
+async function backend(cmd: string, args: any) {
+  calls.push({ cmd, args });
+  switch (cmd) {
+    case "get_settings":
+      return { ...settings };
+    case "set_clients_root": {
+      const path = String(args.path).trim();
+      settings = { clientsRoot: /^[A-Za-z]:\\?$/.test(path) ? `${path.slice(0, 2)}\\ChronoRift` : path };
+      return { ...settings };
+    }
+    case "plugin:dialog|open":
+      return dialogAnswers.shift() ?? null;
+    case "plugin:opener|reveal_item_in_dir":
+      if (revealFailure) throw revealFailure;
+      return null;
+    case "plugin:opener|open_url":
+      return null;
+    case "inspect_replay_folder":
+      return library;
+    case "inspect_replay":
+      return replays[args.path];
+    case "client_statuses":
+      return Object.fromEntries(args.versions.map((version: string) => [version, localStatus(version)]));
+    case "list_clients":
+      return Object.keys(disk).filter((build) => disk[build].state !== "missing").map(localStatus);
+    case "plan_client_install":
+      if (planFailure) throw planFailure;
+      return plan(disk[BUILD_A].state === "partial" ? "resume" : "install", args.request.locale);
+    case "install_client":
+      return new Promise((resolve, reject) => {
+        pendingInstall = { resolve, reject };
+      });
+    case "cancel_client_install":
+      disk[BUILD_A] = { state: "partial", installedBytes: 6 * GIB, totalInstallBytes: 29.3 * GIB };
+      pendingInstall?.reject("Client work stopped; completed files are kept for resuming");
+      return null;
+    case "launch_replay":
+      if (launchFailure) throw launchFailure;
+      return null;
+    case "vanguard_status":
+      return vanguard;
+    default:
+      throw new Error(`Unexpected command ${cmd}`);
+  }
+}
+
+function el<T extends Element = HTMLElement>(selector: string): T {
+  const node = document.querySelector(selector);
+  if (!node) throw new Error(`Missing ${selector}`);
+  return node as unknown as T;
+}
+
+const text = (selector: string) => el(selector).textContent?.replace(/\s+/g, " ").trim() ?? "";
+const called = (cmd: string) => calls.filter((call) => call.cmd === cmd);
+const click = (selector: string) => el<HTMLButtonElement>(selector).click();
+
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 3_000) {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error(`Timed out waiting for ${label}`);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function typeInto(selector: string, value: string, events: string[] = ["input"]) {
+  const field = el<HTMLInputElement | HTMLSelectElement>(selector);
+  field.value = value;
+  for (const type of events) field.dispatchEvent(new Event(type, { bubbles: true }));
+}
+
+async function emitProgress(stage: string, downloadedBytes: number, totalBytes: number | null, detail = "") {
+  const { emit } = await import("@tauri-apps/api/event");
+  await emit("download-progress", {
+    destinationPath: DESTINATION,
+    downloadedBytes,
+    totalBytes,
+    percent: totalBytes ? (downloadedBytes / totalBytes) * 100 : null,
+    done: stage === "complete",
+    stage,
+    detail,
+  });
+}
+
+beforeAll(async () => {
+  GlobalRegistrator.register({ url: "http://localhost:1420/", width: 1360, height: 840 });
+  const html = await Bun.file(new URL("../index.html", import.meta.url)).text();
+  document.body.innerHTML = html
+    .slice(html.indexOf("<body>") + "<body>".length, html.indexOf("</body>"))
+    .replace(/<script\b[\s\S]*?<\/script>/g, "");
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = input instanceof Request ? input.url : String(input);
+    fetched.push(url);
+    // Solo responde lo que llega por la caché: una petición directa al CDN queda en 404.
+    const upstream = fromCache(url);
+    const body = upstream ? staticData[upstream] : undefined;
+    return body === undefined
+      ? new Response("not found", { status: 404 })
+      : new Response(JSON.stringify(body), { status: 200 });
+  }) as typeof fetch;
+
+  const { mockIPC } = await import("@tauri-apps/api/mocks");
+  mockIPC(backend, { shouldMockEvents: true });
+  await import("../src/main.ts");
+  await waitFor(() => el<HTMLInputElement>("#install-folder").value === CLIENTS_ROOT, "persisted clients folder");
+});
+
+afterAll(async () => {
+  const { clearMocks } = await import("@tauri-apps/api/mocks");
+  clearMocks();
+  globalThis.fetch = realFetch;
+  await GlobalRegistrator.unregister();
+});
+
+describe("library → match → client → launch", () => {
+  test("opening a folder detects the owner and renders the match without any client work", async () => {
+    // Sin carpeta: solo el estado vacío, sin lista, cuenta ni ruta.
+    expect(el("#library-list").hidden).toBe(true);
+    expect(el("#library-empty").hidden).toBe(false);
+    expect(el("#replay-count").hidden).toBe(true);
+    expect(el("#folder-path").hidden).toBe(true);
+
+    dialogAnswers.push(REPLAY_DIR);
+    click("#open-library");
+    await waitFor(() => document.querySelectorAll(".replay-row").length === 2, "replay rows");
+    await waitFor(() => text("#file-name") === "LA2-1625354615.rofl", "first replay");
+    // Cada repetición de la lista se lee de antemano: elegir otra no espera al backend.
+    await waitFor(
+      () => new Set(called("inspect_replay").map((call) => call.args.path)).size === 2,
+      "prefetched replays",
+    );
+
+    // El Riot ID presente en todas las partidas es el dueño: victoria en una, derrota en la otra.
+    expect(text("#library-owner-name")).toBe(OWNER);
+    const rows = [...document.querySelectorAll<HTMLButtonElement>(".replay-row")];
+    expect(rows.map((row) => row.querySelector(".result-badge")?.textContent)).toEqual(["V", "D"]);
+    expect(rows[0].getAttribute("aria-current")).toBe("true");
+    expect(rows[0].getAttribute("aria-label")).toContain("9/2/3");
+    expect(rows[0].getAttribute("aria-label")).toContain("cliente no instalado");
+    expect(text("#library-summary")).toBe("0/2 builds · 1 con error");
+    // El archivo que no se pudo leer queda al final: fila gris con el motivo, sin selección.
+    const failed = el("#library-list .failed-row");
+    expect(el("#library-list").lastElementChild).toBe(failed);
+    expect(failed.tagName).toBe("DIV");
+    expect(failed.querySelector(".replay-row__name")?.textContent).toBe("broken.rofl");
+    expect(failed.querySelector(".failed-row__reason")?.getAttribute("title")).toBe(library.failures[0].message);
+    expect(text("#replay-count")).toBe("3");
+
+    expect(text("#result-chip")).toBe("Victoria");
+    expect(text("#result-side")).toBe("Lado rojo");
+    expect(text("#blue-score")).toBe("15");
+    expect(text("#red-score")).toBe("40");
+    expect(el("#red-score").classList.contains("is-winner")).toBe(true);
+    expect(text("#duration")).toBe("36:34");
+    expect(text("#version")).toBe(BUILD_A);
+    expect(text("#match-id")).toBe("1625354615");
+    // El ID abre la partida en League of Graphs (región LA2 → las).
+    click("#match-id");
+    await waitFor(() => called("plugin:opener|open_url").length === 1, "match page");
+    expect(called("plugin:opener|open_url")[0].args.url).toBe("https://www.leagueofgraphs.com/match/las/1625354615");
+    // Copiar se confirma en el mismo botón: el ícono pasa a una marca, sin texto.
+    const { icon } = await import("../src/dom.ts");
+    click("#copy-match-id");
+    await waitFor(() => el("#copy-match-id svg").innerHTML === icon("check").innerHTML, "copy feedback");
+    expect(await navigator.clipboard.readText()).toBe("1625354615");
+    await waitFor(() => text("#client-location") === DESTINATION, "local client status");
+    expect(text("#client-status-text")).toBe("No instalado");
+    expect(text("#client-locale")).toBe("es_MX");
+    expect(el("#client-location").classList.contains("is-muted")).toBe(true);
+    expect(el("#reveal-client").hidden).toBe(true);
+    expect(text("#client-action-label")).toBe("Preparar cliente");
+    expect(el<HTMLButtonElement>("#play-replay").disabled).toBe(true);
+
+    // Marcador: dos equipos, el dueño resaltado y objetivos por equipo.
+    const teamBlocks = document.querySelectorAll("#teams .sb-team");
+    expect(teamBlocks).toHaveLength(2);
+    expect(teamBlocks[1].querySelector(".objectives")?.textContent).toContain("Torres9");
+    const owner = el("#teams .sb-player.is-owner");
+    expect(owner.querySelector(".owner-tag")?.textContent).toBe("Tú");
+    expect(owner.querySelector(".kda__line")?.textContent).toBe("9 / 2 / 3");
+
+    // Recursos del parche en el idioma de la interfaz: retratos, hechizos, runas y objetos.
+    await waitFor(() => !!document.querySelector("#teams .slot img[alt='Destello']"), "spell icons");
+    const wukong = document.querySelectorAll("#teams .sb-player")[1];
+    expect(wukong.getAttribute("aria-label")).toContain("Wukong");
+    expect(wukong.querySelector<HTMLImageElement>(".slot img[alt='Destello']")?.getAttribute("src")).toBe(
+      viaCache(`${CD}/default/data/spells/icons2d/summoner_flash.png`),
+    );
+    expect(wukong.querySelector(".slot img[alt='Valor']")).not.toBeNull();
+    expect(wukong.querySelector(".slot--item")?.getAttribute("title")).toBe("Filo de la tormenta");
+
+    // Con misiones de rol cada fila tiene 8 ranuras: inventario, misión de rol y abalorio.
+    const ownerItems = el("#teams .sb-player.is-owner .items");
+    expect(ownerItems.querySelectorAll(".slot")).toHaveLength(8);
+    expect(ownerItems.querySelector(".slot--role")?.getAttribute("title")).toBe("Botas del Hechicero");
+    expect(ownerItems.lastElementChild?.classList.contains("slot--trinket")).toBe(true);
+
+    // Abrir repeticiones nunca planifica, descarga, instala, lanza ni guarda configuración.
+    for (const cmd of ["plan_client_install", "install_client", "cancel_client_install", "launch_replay", "set_clients_root"]) {
+      expect(called(cmd)).toHaveLength(0);
+    }
+    expect(called("client_statuses").at(-1)?.args).toEqual({
+      clientsRoot: CLIENTS_ROOT,
+      versions: [BUILD_A, BUILD_B],
+    });
+    // Nada va directo a internet: datos e imágenes pasan por la caché en disco.
+    expect(fetched.length).toBeGreaterThan(0);
+    expect(fetched.every((url) => url.startsWith(`${CACHE}/`))).toBe(true);
+    const images = [...document.querySelectorAll<HTMLImageElement>("img")].map((image) => image.getAttribute("src") ?? "");
+    expect(images.length).toBeGreaterThan(0);
+    expect(images.every((src) => src.startsWith(`${CACHE}/`))).toBe(true);
+  });
+
+  test("search and result filters narrow the library", () => {
+    typeInto("#replay-search", "16.17");
+    expect(document.querySelectorAll(".replay-row")).toHaveLength(1);
+    expect(document.querySelectorAll(".failed-row")).toHaveLength(0);
+    expect(text("#replay-count")).toBe("1/3");
+    // Los archivos ilegibles se buscan por su nombre.
+    typeInto("#replay-search", "broken");
+    expect(document.querySelectorAll(".replay-row")).toHaveLength(0);
+    expect(document.querySelectorAll(".failed-row")).toHaveLength(1);
+    expect(text("#replay-count")).toBe("1/3");
+    typeInto("#replay-search", "sin coincidencias");
+    expect(el("#library-list").hidden).toBe(true);
+    expect(text("#library-empty-text")).toBe("Sin resultados");
+    typeInto("#replay-search", "");
+    expect(el("#library-list").hidden).toBe(false);
+
+    // Victorias y Derrotas solo muestran partidas del dueño: sin archivos ilegibles.
+    click("#result-filter [data-filter='loss']");
+    expect(document.querySelectorAll(".replay-row")).toHaveLength(1);
+    expect(document.querySelectorAll(".failed-row")).toHaveLength(0);
+    expect(text("#result-filter [data-count='loss']")).toBe("1");
+    click("#result-filter [data-filter='all']");
+    expect(document.querySelectorAll(".replay-row")).toHaveLength(2);
+    expect(document.querySelectorAll(".failed-row")).toHaveLength(1);
+  });
+
+  test("stats and file tabs show team totals, damage by type and the replay path", () => {
+    click(".tab[data-tab='stats']");
+    const compare = [...document.querySelectorAll("#team-compare .compare-row")];
+    expect(compare.map((row) => row.querySelector(".compare-row__label")?.textContent)).toContain("Torres");
+    const towers = compare.find((row) => row.querySelector(".compare-row__label")?.textContent === "Torres")!;
+    expect(towers.querySelectorAll(".compare-row__value")[1].classList.contains("is-lead")).toBe(true);
+    expect(document.querySelectorAll("#damage-chart .dmg-row")).toHaveLength(10);
+    expect(el("#damage-chart .dmg-row.is-owner").querySelectorAll(".dmg-row__stack span")).toHaveLength(3);
+    expect(document.querySelectorAll("#player-table .ptable__row:not(.ptable__row--head)")).toHaveLength(10);
+
+    click(".tab[data-tab='file']");
+    expect(text("#file-facts")).toContain(REPLAY_A);
+    expect(text("#file-facts")).toContain("ROFL2");
+    click(".tab[data-tab='board']");
+    expect(el("#panel-board").hidden).toBe(false);
+  });
+
+  test("the plan shows destination, locale, sizes and source before anything is downloaded", async () => {
+    click("#client-action");
+    await waitFor(() => !el("#client-drawer").hidden, "drawer");
+    // El foco entra al panel al abrirlo.
+    expect(document.activeElement?.id).toBe("drawer-close");
+    await waitFor(() => text("#plan-download-size") !== "…", "plan values");
+
+    expect(called("plan_client_install")[0].args.request).toEqual({
+      patch: "16.18",
+      gameVersion: BUILD_A,
+      region: "LA2",
+      locale: "es_MX",
+      clientsRoot: CLIENTS_ROOT,
+      confirmed: null,
+    });
+    expect(text("#plan-version")).toBe(BUILD_A);
+    expect(text("#plan-mode")).toBe("Nueva");
+    expect(text("#plan-destination")).toBe(DESTINATION);
+    expect(text("#plan-file-count")).toContain("416");
+    expect(text("#plan-download-size")).toMatch(/^23[.,]5 GiB$/);
+    expect(text("#plan-install-size")).toMatch(/^29[.,]3 GiB$/);
+    expect(text("#plan-source")).toBe("riot-manifests");
+    expect(text("#confirm-label")).toBe("Descargar");
+    expect(called("install_client")).toHaveLength(0);
+
+    // Cambiar el idioma vuelve a planificar antes de poder confirmar.
+    typeInto("#locale", "en_US", ["change"]);
+    await waitFor(() => called("plan_client_install").length === 2, "re-plan");
+    expect(called("plan_client_install")[1].args.request.locale).toBe("en_US");
+    typeInto("#locale", "es_MX", ["change"]);
+    await waitFor(() => called("plan_client_install").length === 3 && !el<HTMLButtonElement>("#confirm-client-action").disabled, "plan ready");
+  });
+
+  test("confirming shows real progress and stopping keeps a resumable client", async () => {
+    click("#confirm-client-action");
+    await waitFor(() => pendingInstall !== null, "install_client call");
+    expect(called("install_client")[0].args.request.confirmed).toEqual({
+      mode: "install",
+      resolvedVersion: "16.18.8175716",
+      destinationPath: DESTINATION,
+    });
+    expect(el("#progress-view").hidden).toBe(false);
+    expect(el("#activity").hidden).toBe(false);
+
+    await emitProgress("manifest", 0, null, "Downloading manifest");
+    await emitProgress("download", 5 * GIB, 25 * GIB, "DATA/FINAL/Champions/Aatrox.es_MX.wad.client");
+    await waitFor(() => text("#progress-percent") === "20 %", "progress percent");
+    expect(text("#progress-file")).toBe("DATA/FINAL/Champions/Aatrox.es_MX.wad.client");
+    expect(el("#progress-bar").style.width).toBe("20%");
+    expect(el("#stages li[data-stage='manifest']").dataset.status).toBe("done");
+    expect(el("#stages li[data-stage='download']").dataset.status).toBe("active");
+    expect(text("#activity-percent")).toBe("20 %");
+    expect(text("#client-status-text")).toBe("Descargando · 20 %");
+    expect(el("#client-progress").hidden).toBe(false);
+    expect(el("#client-progress-bar").style.width).toBe("20%");
+    expect(text("#client-location")).toBe(DESTINATION);
+
+    click("#stop-client-action");
+    await waitFor(() => called("cancel_client_install").length === 1, "cancel command");
+    await waitFor(() => el("#client-drawer").hidden, "drawer closed after stop");
+    await waitFor(() => text("#client-status-text") === "Incompleto · 20 %", "partial status");
+    expect(text("#client-action-label")).toBe("Reanudar");
+    expect(el("#client-progress").hidden).toBe(true);
+    expect(el("#activity").hidden).toBe(true);
+    expect(el<HTMLButtonElement>("#play-replay").disabled).toBe(true);
+    pendingInstall = null;
+  });
+
+  test("resuming finishes the client; Vanguard is shown until it stops, then the replay launches", async () => {
+    click("#client-action");
+    await waitFor(() => text("#plan-mode") === "Reanudar", "resume plan");
+    expect(text("#drawer-title")).toBe("Reanudar");
+    expect(text("#confirm-label")).toBe("Reanudar");
+    expect(el<HTMLSelectElement>("#locale").value).toBe("es_MX");
+
+    // Otro idioma en el plan: el backend simulado deja el cliente en es_MX (su install.json), y la
+    // barra y el inicio deben usar ese idioma instalado, no el elegido en el plan.
+    const plans = called("plan_client_install").length;
+    typeInto("#locale", "en_US", ["change"]);
+    await waitFor(
+      () => called("plan_client_install").length === plans + 1 && !el<HTMLButtonElement>("#confirm-client-action").disabled,
+      "en_US plan",
+    );
+
+    click("#confirm-client-action");
+    await waitFor(() => pendingInstall !== null, "resume install call");
+    expect(called("install_client")[1].args.request.confirmed.mode).toBe("resume");
+    disk[BUILD_A] = { state: "ready", installedBytes: 29.3 * GIB, totalInstallBytes: 29.3 * GIB };
+    pendingInstall!.resolve({ ...plan("resume", "es_MX"), executablePath: EXECUTABLE, downloadSeconds: 1470 });
+    await waitFor(() => text("#client-status-text") === "Listo", "ready status");
+    expect(text("#client-location")).toBe(DESTINATION);
+    expect(text("#client-locale")).toBe("es_MX");
+    expect(el("#client-action").hidden).toBe(true);
+    expect(el("#reveal-client").hidden).toBe(false);
+    expect(el("#client-drawer").hidden).toBe(true);
+    expect(el<HTMLButtonElement>("#play-replay").disabled).toBe(false);
+
+    // Con Vanguard cargado el estado lo indica, pero Reproducir sigue disponible.
+    vanguard = "running";
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => text("#client-status-text") === "Vanguard activo", "vanguard state");
+    expect(el("#client-glyph").dataset.state).toBe("blocked");
+    expect(el<HTMLButtonElement>("#play-replay").disabled).toBe(false);
+
+    launchFailure = "Could not launch League executable: Access is denied. (os error 5)";
+    click("#play-replay");
+    await waitFor(() => text("#client-error").includes("os error 5"), "blocked launch");
+    expect(text("#client-status-text")).toBe("Vanguard activo");
+    expect(el("#client-error").hidden).toBe(false);
+
+    // Al volver a la ventana tras detener Vanguard desde la bandeja, el cliente vuelve a estar listo.
+    vanguard = "stopped";
+    launchFailure = null;
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => text("#client-status-text") === "Listo", "vanguard stopped");
+    expect(text("#client-location")).toBe(DESTINATION);
+    expect(el("#client-error").hidden).toBe(true);
+    expect(el("#client-glyph").dataset.state).toBe("ready");
+
+    click("#play-replay");
+    await waitFor(() => called("launch_replay").length === 2, "launch call");
+    expect(called("launch_replay")[1].args.request).toEqual({
+      replayPath: REPLAY_A,
+      executablePath: EXECUTABLE,
+      locale: "es_MX",
+    });
+    await waitFor(() => text("#client-status-text") === "Reproduciendo", "launched");
+
+    // Sin Vanguard, cualquier otro error se muestra tal cual.
+    launchFailure = "League executable does not exist: E:\\ChronoRift\\gone.exe";
+    click("#play-replay");
+    await waitFor(() => text("#client-status-text") === "No se pudo reproducir", "launch error");
+    expect(text("#client-error")).toContain("gone.exe");
+    launchFailure = null;
+
+    click("#reveal-client");
+    await waitFor(() => called("plugin:opener|reveal_item_in_dir").length === 1, "reveal call");
+    expect(called("plugin:opener|reveal_item_in_dir")[0].args).toEqual({ paths: [EXECUTABLE] });
+
+    // Un "Mostrar en carpeta" fallido se ve en la partida, no solo en la vista Clientes.
+    revealFailure = "The system cannot find the file specified. (os error 2)";
+    click(".replay-caption [data-action='reveal-replay']");
+    await waitFor(() => text("#client-error").includes("os error 2"), "reveal error");
+    expect(text("#client-error")).toStartWith("No se pudo abrir la carpeta.");
+    expect(called("plugin:opener|reveal_item_in_dir")[1].args).toEqual({ paths: [REPLAY_A] });
+    expect(text("#client-status-text")).toBe("Listo");
+    revealFailure = null;
+  });
+
+  test("a build that cannot be resolved is reported without starting client work", async () => {
+    planFailure = "No lol-game-client manifest found for LA2 16.17.8104348 (16.17) in Riot Sieve or the riot-manifests index";
+    // Ya precargada: se muestra en el mismo clic, sin estado de carga ni otra lectura.
+    const reads = called("inspect_replay").length;
+    document.querySelectorAll<HTMLButtonElement>(".replay-row")[1].click();
+    expect(text("#file-name")).toBe("LA2-1621247134.rofl");
+    expect(el("#replay-workspace").getAttribute("aria-busy")).toBe("false");
+    expect(called("inspect_replay")).toHaveLength(reads);
+    expect(text("#result-chip")).toBe("Derrota");
+    // Sin objetos de misión de rol en la partida no hay ranura para ellos: 6 objetos y el abalorio.
+    expect(el("#teams .sb-player .items").querySelectorAll(".slot")).toHaveLength(7);
+    expect(document.querySelector("#teams .slot--role")).toBeNull();
+
+    click("#client-action");
+    await waitFor(() => !el("#plan-error").hidden, "plan error");
+    expect(text("#plan-error")).toContain("16.17.8104348");
+    expect(el<HTMLButtonElement>("#confirm-client-action").disabled).toBe(true);
+    expect(called("install_client")).toHaveLength(2);
+    click("#drawer-close");
+    // Sin transición en curso el panel se oculta en el acto y el foco vuelve a la barra del cliente.
+    expect(el("#client-drawer").hidden).toBe(true);
+    expect(el("#drawer-scrim").hidden).toBe(true);
+    expect(document.activeElement?.id).toBe("client-action");
+    planFailure = null;
+  });
+
+  test("the clients view lists builds and saves the downloads folder through the backend", async () => {
+    click(".nav-item[data-view='clients']");
+    await waitFor(() => called("list_clients").length > 0, "list_clients call");
+    await waitFor(() => document.querySelectorAll("#builds-list .builds__row").length === 2, "build rows");
+    const rows = [...document.querySelectorAll<HTMLElement>("#builds-list .builds__row")];
+    expect(rows.map((row) => row.dataset.build)).toEqual([BUILD_A, BUILD_B]);
+    expect(rows[0].querySelector(".builds__state")?.textContent).toBe("Listo");
+    expect(rows[1].querySelector(".builds__state")?.textContent).toBe("No instalado");
+    expect(text("#clients-installed")).toBe("1/2");
+
+    typeInto("#install-folder", "E:\\", ["change"]);
+    await waitFor(() => settings.clientsRoot === "E:\\ChronoRift", "normalized folder");
+    expect(called("set_clients_root").at(-1)?.args).toEqual({ path: "E:\\" });
+    await waitFor(() => el<HTMLInputElement>("#install-folder").value === "E:\\ChronoRift", "field value");
+
+    dialogAnswers.push("D:\\Clientes LoL");
+    click("#choose-install-folder");
+    await waitFor(() => el<HTMLInputElement>("#install-folder").value === "D:\\Clientes LoL", "picked folder");
+    expect(text("#storage-root")).toBe("D:\\Clientes LoL");
+
+    click(".nav-item[data-view='library']");
+    expect(el("#library-view").hidden).toBe(false);
+  });
+});

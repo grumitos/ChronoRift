@@ -1,125 +1,379 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/src/styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0E0E10" />
     <title>ChronoRift</title>
-    <script type="module" src="/src/main.ts" defer></script>
+    <link rel="stylesheet" href="/src/styles.css" />
   </head>
-
   <body>
-    <main class="shell">
-      <aside class="sidebar" aria-label="Replay controls">
-        <div>
-          <p class="eyebrow">ChronoRift</p>
-          <h1>Replay Library</h1>
+    <a class="skip-link" href="#main-content">Ir al contenido</a>
+    <div class="app">
+      <header class="appbar" data-tauri-drag-region>
+        <div class="brand" data-tauri-drag-region>
+          <span data-icon="logo" class="brand__mark"></span>
+          <span class="brand__name" translate="no">ChronoRift</span>
         </div>
-
-        <button id="open-replay" type="button">Open .rofl</button>
-
-        <label class="field">
-          <span>Client install folder</span>
-          <div class="inline">
-            <input id="install-folder" type="text" spellcheck="false" placeholder="D:\LoL Clients\14.8" />
-            <button id="choose-install-folder" type="button" aria-label="Choose install folder">...</button>
-          </div>
-        </label>
-
-        <label class="field">
-          <span>League executable</span>
-          <div class="inline">
-            <input id="exe-path" type="text" spellcheck="false" placeholder="...\Game\League of Legends.exe" />
-            <button id="choose-executable" type="button" aria-label="Choose League executable">...</button>
-          </div>
-        </label>
-
-        <label class="field compact">
-          <span>Locale</span>
-          <input id="locale" type="text" value="en_US" maxlength="5" spellcheck="false" />
-        </label>
-
-        <button id="download-client" type="button" disabled>Download / install client</button>
-        <button id="play-replay" type="button" disabled>Play replay</button>
-      </aside>
-
-      <section class="content" aria-live="polite">
-        <div class="topline">
-          <div>
-            <p class="eyebrow">Selected replay</p>
-            <h2 id="file-name">No replay loaded</h2>
-          </div>
-          <span id="status-pill" class="pill muted">Idle</span>
+        <nav class="appbar__nav" aria-label="Secciones">
+          <button type="button" class="nav-item" data-view="library">Biblioteca</button>
+          <button type="button" class="nav-item" data-view="clients">Clientes</button>
+        </nav>
+        <div class="appbar__end">
+          <button type="button" class="activity" id="activity" data-action="show-progress" hidden>
+            <span data-icon="download" class="icon icon--sm"></span>
+            <span class="activity__label">Descargando</span>
+            <span class="mono" id="activity-build">—</span>
+            <span class="meter meter--mini" aria-hidden="true"><span class="meter__fill" id="activity-bar"></span></span>
+            <span class="mono" id="activity-percent">—</span>
+          </button>
+          <button type="button" class="storage-chip" id="storage-chip" data-view="clients">
+            <span data-icon="drive" class="icon icon--sm"></span>
+            <span class="mono ellipsis" id="storage-root">—</span>
+          </button>
         </div>
+        <div class="window-controls">
+          <button type="button" class="window-control" id="window-minimize" aria-label="Minimizar" title="Minimizar">
+            <span data-icon="minimize"></span>
+          </button>
+          <button type="button" class="window-control" id="window-maximize" aria-label="Maximizar" title="Maximizar">
+            <span data-icon="maximize"></span>
+          </button>
+          <button type="button" class="window-control window-control--close" id="window-close" aria-label="Cerrar" title="Cerrar">
+            <span data-icon="close"></span>
+          </button>
+        </div>
+      </header>
 
-        <dl class="metrics">
-          <div>
-            <dt>Patch</dt>
-            <dd id="patch">-</dd>
-          </div>
-          <div>
-            <dt>Game version</dt>
-            <dd id="version">-</dd>
-          </div>
-          <div>
-            <dt>Match ID</dt>
-            <dd id="match-id">-</dd>
-          </div>
-          <div>
-            <dt>Duration</dt>
-            <dd id="duration">-</dd>
-          </div>
-          <div>
-            <dt>Score</dt>
-            <dd id="score">-</dd>
-          </div>
-          <div>
-            <dt>Server</dt>
-            <dd id="region">-</dd>
-          </div>
-          <div>
-            <dt>Suggested locale</dt>
-            <dd id="suggested-locale">-</dd>
-          </div>
-        </dl>
-
-        <section class="scoreboard" aria-label="Scoreboard">
-          <div class="team-column">
-            <div class="team-heading">
-              <h3>Blue</h3>
-              <span id="blue-score">0</span>
+      <div class="view view--library" id="library-view">
+        <aside class="library" aria-label="Biblioteca">
+          <div class="library__head">
+            <div class="library__title">
+              <h2>Biblioteca</h2>
+              <span class="count mono" id="replay-count" hidden>0</span>
+              <div class="library__tools">
+                <button type="button" class="icon-button" id="refresh-library" aria-label="Actualizar" title="Actualizar" disabled>
+                  <span data-icon="refresh"></span>
+                </button>
+                <button type="button" class="icon-button" id="open-library" aria-label="Abrir carpeta" title="Abrir carpeta">
+                  <span data-icon="folder"></span>
+                </button>
+              </div>
             </div>
-            <div id="blue-team" class="player-list"></div>
-          </div>
-          <div class="team-column">
-            <div class="team-heading">
-              <h3>Red</h3>
-              <span id="red-score">0</span>
+            <div class="library__path mono" id="folder-path" hidden></div>
+            <label class="search">
+              <span class="sr-only">Buscar</span>
+              <span data-icon="search" class="search__icon"></span>
+              <input id="replay-search" type="search" placeholder="Buscar" autocomplete="off" spellcheck="false" disabled />
+            </label>
+            <div class="segmented" role="group" aria-label="Resultado" id="result-filter" hidden>
+              <button type="button" data-filter="all" aria-pressed="true">Todas <span class="mono" data-count="all">0</span></button>
+              <button type="button" data-filter="win" aria-pressed="false">Victorias <span class="mono" data-count="win">0</span></button>
+              <button type="button" data-filter="loss" aria-pressed="false">Derrotas <span class="mono" data-count="loss">0</span></button>
             </div>
-            <div id="red-team" class="player-list"></div>
           </div>
-        </section>
+          <div class="library__list" id="library-list" hidden></div>
+          <div class="library__empty" id="library-empty">
+            <p id="library-empty-text">Sin carpeta</p>
+            <button type="button" class="button button--primary" data-action="open-library">Abrir carpeta</button>
+          </div>
+          <footer class="library__foot">
+            <span class="library__owner" id="library-owner" hidden>
+              <span data-icon="user" class="icon icon--sm"></span>
+              <span class="mono ellipsis" id="library-owner-name"></span>
+            </span>
+            <span class="library__summary" id="library-summary"></span>
+          </footer>
+        </aside>
 
-        <section class="install-panel" aria-label="Client installation">
-          <div>
-            <p class="eyebrow">Client</p>
-            <h3 id="client-state">Waiting for replay</h3>
-          </div>
-          <div class="progress">
-            <div id="progress-bar"></div>
-          </div>
-          <p id="progress-text">Open a replay to detect the required patch.</p>
-        </section>
+        <main class="match" id="main-content" tabindex="-1">
+          <section class="match__empty" id="replay-empty">
+            <p id="empty-title">Sin repetición seleccionada</p>
+            <p class="match__empty-detail" id="empty-detail"></p>
+          </section>
 
-        <section class="panel" aria-label="Replay metadata">
-          <div class="panel-heading">
-            <h3>Metadata</h3>
-            <span id="note"></span>
+          <div class="match__view" id="replay-workspace" hidden>
+            <header class="match-head">
+              <div class="match-head__summary">
+                <div class="result">
+                  <div class="result__line">
+                    <span class="chip" id="result-chip">—</span>
+                    <span class="result__side" id="result-side"></span>
+                  </div>
+                  <h1 class="score" id="score">
+                    <span class="score__team">
+                      <span class="score__value" id="blue-score">0</span>
+                      <span class="score__label">AZUL</span>
+                    </span>
+                    <span class="score__dash" aria-hidden="true">–</span>
+                    <span class="score__team">
+                      <span class="score__value" id="red-score">0</span>
+                      <span class="score__label">ROJO</span>
+                    </span>
+                  </h1>
+                </div>
+
+                <dl class="facts">
+                  <div><dt>Fecha</dt><dd class="mono" id="match-date">—</dd></div>
+                  <div><dt>Duración</dt><dd class="mono" id="duration">—</dd></div>
+                  <div><dt>Parche</dt><dd class="mono" id="patch">—</dd></div>
+                  <div><dt>Región</dt><dd class="mono" id="region">—</dd></div>
+                  <div>
+                    <dt>Partida</dt>
+                    <dd class="mono facts__id">
+                      <button type="button" class="facts__link" id="match-id" disabled>—</button>
+                      <button type="button" class="icon-button icon-button--xs" id="copy-match-id" aria-label="Copiar ID de partida" title="Copiar ID de partida">
+                        <span data-icon="copy"></span>
+                      </button>
+                    </dd>
+                  </div>
+                </dl>
+              </div>
+
+              <div class="client-strip">
+                <div class="client-strip__item">
+                  <span class="client-strip__label">Estado</span>
+                  <span class="client-strip__status" role="status">
+                    <span class="glyph" id="client-glyph" data-state="missing"></span>
+                    <span id="client-status-text">—</span>
+                    <span class="meter meter--mini" id="client-progress" aria-hidden="true" hidden><span class="meter__fill" id="client-progress-bar"></span></span>
+                  </span>
+                </div>
+                <div class="client-strip__item">
+                  <span class="client-strip__label">Build</span>
+                  <span class="client-strip__value mono" id="version">—</span>
+                </div>
+                <div class="client-strip__item client-strip__item--location">
+                  <span class="client-strip__label">Ubicación</span>
+                  <span class="client-strip__path">
+                    <span class="client-strip__location mono ellipsis" id="client-location">—</span>
+                    <button type="button" class="icon-button icon-button--xs" id="reveal-client" aria-label="Abrir carpeta" title="Abrir carpeta" hidden>
+                      <span data-icon="folder" class="icon--sm"></span>
+                    </button>
+                  </span>
+                </div>
+                <div class="client-strip__item">
+                  <span class="client-strip__label">Idioma</span>
+                  <span class="client-strip__value mono" id="client-locale">—</span>
+                </div>
+                <div class="client-strip__actions">
+                  <button type="button" class="button button--square" id="choose-executable" aria-label="Elegir ejecutable" title="Elegir ejecutable">
+                    <span data-icon="exe"></span>
+                  </button>
+                  <button type="button" class="button" id="client-action" hidden>
+                    <span class="button__icon" id="client-action-icon"></span>
+                    <span id="client-action-label">Preparar cliente</span>
+                  </button>
+                  <button type="button" class="button button--primary button--play" id="play-replay" disabled>
+                    <span data-icon="play"></span>
+                    Reproducir
+                  </button>
+                </div>
+              </div>
+              <p class="client-error mono" id="client-error" role="alert" hidden></p>
+
+              <nav class="tabs" aria-label="Vistas de la partida">
+                <button type="button" class="tab" data-tab="board" aria-pressed="true">Marcador</button>
+                <button type="button" class="tab" data-tab="stats" aria-pressed="false">Estadísticas</button>
+                <button type="button" class="tab" data-tab="file" aria-pressed="false">Archivo</button>
+                <div class="replay-caption">
+                  <span data-icon="file" class="replay-caption__icon"></span>
+                  <span class="replay-caption__name mono ellipsis" id="file-name">—</span>
+                  <span aria-hidden="true">·</span>
+                  <span class="replay-caption__size mono" id="file-size">—</span>
+                  <button type="button" class="icon-button icon-button--sm" data-action="reveal-replay" aria-label="Mostrar en carpeta" title="Mostrar en carpeta">
+                    <span data-icon="folder" class="icon--sm"></span>
+                  </button>
+                </div>
+              </nav>
+            </header>
+
+            <div class="match__body">
+              <section class="scoreboard" id="panel-board" aria-label="Marcador">
+                <div class="sb-row sb-row--head" aria-hidden="true">
+                  <span></span>
+                  <span>Jugador</span>
+                  <span class="sb-col--loadout"></span>
+                  <span>KDA</span>
+                  <span class="sb-col--kp num">KP</span>
+                  <span>Daño</span>
+                  <span class="num">Oro</span>
+                  <span class="num">CS</span>
+                  <span class="sb-col--vision num">Visión</span>
+                  <span>Objetos</span>
+                </div>
+                <div id="teams"></div>
+              </section>
+
+              <section class="stats" id="panel-stats" aria-label="Estadísticas" hidden>
+                <p class="muted" id="stats-empty" hidden>Sin estadísticas</p>
+                <div class="stats__top" id="stats-top">
+                  <div class="stats__panel">
+                    <h3>Equipos</h3>
+                    <div class="compare-head" aria-hidden="true"><span></span><span class="num">AZUL</span><span></span><span>ROJO</span></div>
+                    <div id="team-compare"></div>
+                  </div>
+                  <div class="stats__panel">
+                    <div class="stats__panel-head">
+                      <h3>Daño a campeones</h3>
+                      <ul class="legend" aria-label="Leyenda">
+                        <li><span class="swatch swatch--physical"></span>Físico</li>
+                        <li><span class="swatch swatch--magic"></span>Mágico</li>
+                        <li><span class="swatch swatch--true"></span>Verdadero</li>
+                      </ul>
+                    </div>
+                    <div id="damage-chart"></div>
+                  </div>
+                </div>
+                <div class="stats__panel" id="stats-players">
+                  <h3>Jugadores</h3>
+                  <div class="ptable" id="player-table"></div>
+                </div>
+              </section>
+
+              <section class="file-panel" id="panel-file" aria-label="Archivo" hidden>
+                <dl class="file-facts" id="file-facts"></dl>
+                <div class="file-panel__actions">
+                  <button type="button" class="button" data-action="reveal-replay">
+                    <span data-icon="folder" class="icon icon--sm"></span>
+                    Mostrar en carpeta
+                  </button>
+                  <button type="button" class="button" id="copy-path">
+                    <span data-icon="copy" class="icon icon--sm"></span>
+                    Copiar ruta
+                  </button>
+                </div>
+              </section>
+            </div>
           </div>
-          <pre id="metadata">{}</pre>
-        </section>
-      </section>
-    </main>
+
+          <div class="drawer-scrim" id="drawer-scrim" hidden></div>
+          <aside class="drawer" id="client-drawer" aria-labelledby="drawer-title" tabindex="-1" hidden>
+            <header class="drawer__head">
+              <div class="drawer__heading">
+                <h2 id="drawer-title">Preparar cliente</h2>
+                <span class="muted" id="drawer-subtitle"></span>
+              </div>
+              <button type="button" class="icon-button" id="drawer-close" aria-label="Cerrar" title="Cerrar">
+                <span data-icon="close"></span>
+              </button>
+            </header>
+            <div class="drawer__body">
+              <div class="drawer__build">
+                <div class="drawer__build-line">
+                  <span class="muted">Build</span>
+                  <span class="chip chip--outline" id="plan-mode">—</span>
+                </div>
+                <span class="drawer__build-value mono" id="plan-version">—</span>
+              </div>
+
+              <div id="plan-view">
+                <dl class="kv">
+                  <div class="kv__row kv__row--stack">
+                    <dt>Destino</dt>
+                    <dd class="kv__inline">
+                      <span class="mono ellipsis" id="plan-destination">—</span>
+                      <button type="button" class="button button--sm" id="plan-change-root">Cambiar…</button>
+                    </dd>
+                  </div>
+                  <div class="kv__row kv__row--stack">
+                    <dt><label for="locale">Idioma</label></dt>
+                    <dd class="select-field">
+                      <select id="locale" class="select mono"></select>
+                      <span data-icon="chevron" class="select-field__icon"></span>
+                    </dd>
+                  </div>
+                  <div class="kv__row"><dt>Archivos</dt><dd class="mono" id="plan-file-count">—</dd></div>
+                  <div class="kv__row"><dt>Descarga</dt><dd class="mono" id="plan-download-size">—</dd></div>
+                  <div class="kv__row"><dt>En disco</dt><dd class="mono" id="plan-install-size">—</dd></div>
+                  <div class="kv__row"><dt>Fuente</dt><dd class="mono" id="plan-source">—</dd></div>
+                </dl>
+                <p class="drawer__error" id="plan-error" role="alert" hidden></p>
+              </div>
+
+              <div id="progress-view" hidden>
+                <div class="progress" role="status">
+                  <div class="progress__line">
+                    <span class="progress__percent" id="progress-percent">—</span>
+                    <span class="mono muted" id="progress-bytes"></span>
+                  </div>
+                  <div class="meter" role="progressbar" aria-label="Progreso de la descarga" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-track">
+                    <span class="meter__fill" id="progress-bar"></span>
+                  </div>
+                  <span class="mono muted ellipsis" id="progress-file"></span>
+                </div>
+                <ol class="stages" id="stages">
+                  <li data-stage="resolve">Resolver versión</li>
+                  <li data-stage="manifest">Leer manifiesto</li>
+                  <li data-stage="plan">Comparar archivos</li>
+                  <li data-stage="download">Descargar</li>
+                  <li data-stage="complete">Listo</li>
+                </ol>
+                <dl class="kv kv--compact">
+                  <div class="kv__row"><dt>Destino</dt><dd class="mono ellipsis" id="progress-destination">—</dd></div>
+                  <div class="kv__row"><dt>Idioma</dt><dd class="mono" id="progress-locale">—</dd></div>
+                </dl>
+              </div>
+            </div>
+            <footer class="drawer__foot">
+              <button type="button" class="button" id="cancel-client-action">Cancelar</button>
+              <button type="button" class="button button--primary" id="confirm-client-action" disabled>
+                <span class="button__icon" id="confirm-icon"><span data-icon="download" class="icon icon--sm"></span></span>
+                <span id="confirm-label">Descargar</span>
+              </button>
+              <button type="button" class="button" id="stop-client-action" hidden>
+                <span data-icon="stop" class="icon icon--sm"></span>
+                Detener
+              </button>
+            </footer>
+          </aside>
+        </main>
+      </div>
+
+      <div class="view view--clients" id="clients-view" hidden>
+        <main class="clients">
+          <h1>Clientes</h1>
+          <section class="card storage" aria-labelledby="clients-root-label">
+            <div class="storage__main">
+              <label id="clients-root-label" for="install-folder">Carpeta de descargas</label>
+              <div class="storage__field">
+                <input id="install-folder" class="input mono" type="text" autocomplete="off" spellcheck="false" />
+                <button type="button" class="button" id="choose-install-folder">Cambiar…</button>
+                <button type="button" class="button" id="reveal-clients-root">
+                  <span data-icon="folder" class="icon icon--sm"></span>
+                  Abrir
+                </button>
+              </div>
+              <p class="storage__error" id="clients-root-error" role="alert" hidden></p>
+              <p class="muted">No modifica tu instalación de League of Legends.</p>
+            </div>
+            <dl class="storage__stats">
+              <div><dt>Instalados</dt><dd class="mono" id="clients-installed">—</dd></div>
+              <div><dt>En disco</dt><dd class="mono" id="clients-bytes">—</dd></div>
+            </dl>
+          </section>
+
+          <section class="card builds" aria-labelledby="builds-title">
+            <div class="builds__head">
+              <h2 id="builds-title">Builds</h2>
+              <span class="count mono" id="builds-count">0</span>
+            </div>
+            <div class="builds__row builds__row--head" aria-hidden="true">
+              <span>Build</span>
+              <span>Parche</span>
+              <span class="num">Repeticiones</span>
+              <span>Idioma</span>
+              <span class="num">Tamaño</span>
+              <span>Estado</span>
+              <span></span>
+            </div>
+            <div id="builds-list"></div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

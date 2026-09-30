@@ -6,17 +6,21 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "bun test",
     "preview": "vite preview",
     "tauri": "tauri"
   },
   "dependencies": {
+    "@fontsource-variable/geist": "^5.3.0",
+    "@fontsource-variable/geist-mono": "^5.3.0",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-opener": "^2"
   },
   "devDependencies": {
+    "@happy-dom/global-registrator": "^20.14.5",
     "@tauri-apps/cli": "^2",
-    "vite": "^6.0.3",
-    "typescript": "~5.6.2"
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3"
   }
 }

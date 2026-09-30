@@ -47,4 +47,5 @@ Rejected. Users need control over disk layout and storage devices.
 - More visible UI state is needed.
 - Downloader state must be durable enough to recover from interruption.
 - Locale suggestion must be editable and treated as a default, not truth.
-- Existing files are not overwritten; resume/repair needs a separate explicit flow.
+- The initial installer refused all existing targets. [ADR-003](ADR-003-resume-repair.md) extends this decision with an explicit, previewed resume/repair flow while preserving the user-action boundary.
+- [ADR-004](ADR-004-historical-builds-and-client-layout.md) replaces the free-form destination with a persisted clients folder and one `<build>\Game` folder per build. The full destination is still shown before confirmation. It also adds the riot-manifests index as a second source for the manifest URL.
