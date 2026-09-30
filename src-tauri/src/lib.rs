@@ -11,7 +11,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
 };
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 /// Sale de lo ya leído al escanear la carpeta mientras el archivo no cambie.
 #[tauri::command]
@@ -38,10 +38,25 @@ async fn inspect_replay_folder(
 }
 
 /// Valida las rutas y crea el proceso fuera del hilo principal: una unidad lenta no congela la
-/// ventana.
+/// ventana. Un hilo espera al juego y avisa con `replay-exited` cuando se cierra.
 #[tauri::command]
-async fn launch_replay(request: launcher::LaunchReplayRequest) -> Result<(), String> {
-    blocking(move || launcher::launch_replay(request).map_err(|err| err.to_string())).await
+async fn launch_replay(
+    app: tauri::AppHandle,
+    request: launcher::LaunchReplayRequest,
+) -> Result<(), String> {
+    blocking(move || {
+        // La ruta tal como la envió la interfaz, que la compara con la repetición en curso.
+        let replay_path = request.replay_path.clone();
+        let game = launcher::launch_replay(request).map_err(|err| err.to_string())?;
+        launcher::watch_exit(game, replay_path, move |exited| {
+            // Si la app se está cerrando, no queda a quién avisar.
+            let _ = app.emit(launcher::REPLAY_EXITED_EVENT, exited);
+        })
+        .map_err(|err| {
+            format!("El juego se inició, pero ChronoRift no podrá saber cuándo se cierra: {err}")
+        })
+    })
+    .await
 }
 
 /// Estado del controlador de Riot Vanguard. Solo lee: ChronoRift nunca lo detiene.
@@ -59,8 +74,9 @@ async fn install_client(
         .ok()
         .and_then(|path| settings::load(&path).ok())
         .and_then(|settings| settings.download_connections);
+    // La instalación limpia la señal al empezar, y solo si no hay otra en curso: así una segunda
+    // llamada no borra el "Detener" de la primera.
     let cancel = app.state::<client::CancelSignal>().inner().clone();
-    cancel.reset();
     client::install_client(
         &app,
         request,
@@ -71,7 +87,7 @@ async fn install_client(
     .map_err(|err| err.to_string())
 }
 
-/// Detiene la instalación en curso entre ventanas de descarga; lo confirmado queda para reanudar.
+/// Detiene la instalación en curso: aborta las peticiones en vuelo; lo confirmado queda para reanudar.
 #[tauri::command]
 fn cancel_client_install(cancel: tauri::State<'_, client::CancelSignal>) {
     cancel.cancel();
@@ -87,21 +103,15 @@ async fn plan_client_install(
         .map_err(|err| err.to_string())
 }
 
-/// Estado en disco de las compilaciones pedidas, por versión de repetición. Solo lee.
+/// Estado en disco de las compilaciones pedidas, por versión de repetición. Solo lee. Si la unidad
+/// de la carpeta de clientes no está, rechaza con "La carpeta de clientes no está disponible: …".
 #[tauri::command]
 async fn client_statuses(
     clients_root: String,
     versions: Vec<String>,
 ) -> Result<HashMap<String, client::LocalClientStatus>, String> {
     blocking(move || {
-        Ok(versions
-            .into_iter()
-            .filter_map(|version| {
-                client::local_client_status(&clients_root, &version)
-                    .ok()
-                    .map(|status| (version, status))
-            })
-            .collect())
+        client::local_client_statuses(&clients_root, &versions).map_err(|error| error.to_string())
     })
     .await
 }
@@ -175,6 +185,12 @@ pub fn run() {
             |context, request, responder| {
                 let app = context.app_handle().clone();
                 let path = request.uri().path().to_string();
+                // CORS solo para la interfaz: `http_response` compara este origen con los de la app.
+                let origin = request
+                    .headers()
+                    .get(tauri::http::header::ORIGIN)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
                 tauri::async_runtime::spawn(async move {
                     let result = match app.try_state::<asset_cache::AssetCache>() {
                         Some(cache) => cache.get(&path).await,
@@ -182,7 +198,7 @@ pub fn run() {
                             "asset cache not ready".to_string(),
                         )),
                     };
-                    responder.respond(asset_cache::http_response(result));
+                    responder.respond(asset_cache::http_response(result, origin.as_deref()));
                 });
             },
         )

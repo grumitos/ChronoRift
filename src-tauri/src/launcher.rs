@@ -1,11 +1,17 @@
 use crate::client::GAME_EXE;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
     ffi::OsString,
     fmt::{self, Display},
+    io,
     path::{Path, PathBuf},
+    process::Child,
+    thread,
 };
+
+/// Evento que avisa a la interfaz que el juego iniciado por Reproducir se cerró.
+pub const REPLAY_EXITED_EVENT: &str = "replay-exited";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -13,6 +19,15 @@ pub struct LaunchReplayRequest {
     pub replay_path: String,
     pub executable_path: String,
     pub locale: Option<String>,
+}
+
+/// Carga de `replay-exited`: la ruta tal como la envió la interfaz, para que la compare con la
+/// repetición en curso, y el código de salida del juego (`None` si no se pudo esperar).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayExited {
+    pub replay_path: String,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -55,8 +70,28 @@ impl Display for LaunchError {
 
 impl Error for LaunchError {}
 
-pub fn launch_replay(request: LaunchReplayRequest) -> Result<(), LaunchError> {
+/// Inicia el juego con la repetición y devuelve el proceso, para esperar a que se cierre.
+pub fn launch_replay(request: LaunchReplayRequest) -> Result<Child, LaunchError> {
     launch_replay_impl(request)
+}
+
+/// Espera al proceso en un hilo propio y llama a `notify` cuando termina. Si esperar falla, el
+/// aviso llega igual, sin código de salida: la interfaz nunca queda en "Reproduciendo".
+pub fn watch_exit(
+    mut game: Child,
+    replay_path: String,
+    notify: impl FnOnce(ReplayExited) + Send + 'static,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("replay-exit".to_string())
+        .spawn(move || {
+            let exit_code = game.wait().ok().and_then(|status| status.code());
+            notify(ReplayExited {
+                replay_path,
+                exit_code,
+            });
+        })
+        .map(|_| ())
 }
 
 /// Proceso a lanzar, validado por completo antes de ejecutar nada.
@@ -122,18 +157,17 @@ fn plan_launch(request: LaunchReplayRequest) -> Result<LaunchPlan, LaunchError> 
 }
 
 #[cfg(target_os = "windows")]
-fn launch_replay_impl(request: LaunchReplayRequest) -> Result<(), LaunchError> {
+fn launch_replay_impl(request: LaunchReplayRequest) -> Result<Child, LaunchError> {
     let plan = plan_launch(request)?;
     std::process::Command::new(&plan.executable)
         .current_dir(&plan.working_dir)
         .args(&plan.args)
         .spawn()
-        .map(|_| ())
         .map_err(LaunchError::Spawn)
 }
 
 #[cfg(not(target_os = "windows"))]
-fn launch_replay_impl(_request: LaunchReplayRequest) -> Result<(), LaunchError> {
+fn launch_replay_impl(_request: LaunchReplayRequest) -> Result<Child, LaunchError> {
     Err(LaunchError::UnsupportedPlatform)
 }
 
@@ -151,14 +185,16 @@ mod tests {
     use super::*;
     use std::{
         fs,
-        time::{SystemTime, UNIX_EPOCH},
+        process::Command,
+        sync::mpsc,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    /// Arma el lanzamiento para un cliente con el diseño de ChronoRift sin ejecutar nada y
+    /// Arma el lanzamiento para un cliente con el diseño de ChronoRift sin iniciar el juego y
     /// comprueba que rutas inexistentes, otros ejecutables y locales con argumentos inyectados se
-    /// rechazan antes.
+    /// rechazan antes. El aviso de salida se prueba con un proceso inocuo en lugar del juego.
     #[test]
-    fn plans_a_replay_launch_for_a_chronorift_client_without_spawning() {
+    fn plans_a_replay_launch_and_reports_the_exit_without_starting_the_game() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -180,11 +216,18 @@ mod tests {
         let plan = plan_launch(request(&replay, &executable, "es_MX")).unwrap();
         assert_eq!(plan.executable, executable);
         assert_eq!(plan.working_dir, game);
-        assert_eq!(plan.args[0].as_os_str(), replay.as_os_str());
-        assert!(plan
-            .args
-            .contains(&format!("-GameBaseDir={}", build.display()).into()));
-        assert!(plan.args.contains(&"-Locale=es_MX".into()));
+        // Línea de comandos completa, en orden: la repetición y los parámetros de League.
+        let expected: Vec<OsString> = vec![
+            replay.clone().into_os_string(),
+            format!("-GameBaseDir={}", build.display()).into(),
+            "-SkipRads".into(),
+            "-SkipBuild".into(),
+            "-EnableLNP".into(),
+            "-UseNewX3D=1".into(),
+            "-UseNewX3DFramebuffers=1".into(),
+            "-Locale=es_MX".into(),
+        ];
+        assert_eq!(plan.args, expected);
 
         assert!(matches!(
             plan_launch(request(&root.join("missing.rofl"), &executable, "es_MX")),
@@ -224,11 +267,32 @@ mod tests {
                 "{locale}"
             );
         }
+
+        // Aviso de salida con un proceso inocuo que termina con código 3 en lugar del juego: la
+        // carga llega tal como la recibe la interfaz, con la ruta que envió.
+        #[cfg(windows)]
+        let harmless = Command::new("cmd").args(["/C", "exit", "3"]).spawn();
+        #[cfg(not(windows))]
+        let harmless = Command::new("sh").args(["-c", "exit 3"]).spawn();
+        let replay_path = replay.display().to_string();
+        let (sender, receiver) = mpsc::channel();
+        watch_exit(harmless.unwrap(), replay_path.clone(), move |exited| {
+            let _ = sender.send(exited);
+        })
+        .unwrap();
+        let exited = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the exit should be reported");
+        assert_eq!(
+            serde_json::to_value(exited).unwrap(),
+            serde_json::json!({ "replayPath": replay_path, "exitCode": 3 })
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
     /// Lanzamiento real, solo con CHRONORIFT_REAL_LAUNCH_EXE y CHRONORIFT_REAL_LAUNCH_REPLAY:
-    /// arranca el juego con la repetición y termina; el juego sigue abierto.
+    /// arranca el juego con la repetición como la app y termina cuando el juego se cierra, con la
+    /// carga de `replay-exited`. Si llega enseguida, el proceso no vive lo que dura la repetición.
     #[cfg(windows)]
     #[test]
     #[ignore = "starts League of Legends; run with --ignored"]
@@ -247,6 +311,14 @@ mod tests {
             locale: locale.clone(),
         };
         eprintln!("{:?}", plan_launch(request()).expect("launch plan"));
-        launch_replay(request()).expect("the game process should start");
+        let game = launch_replay(request()).expect("the game process should start");
+        let (sender, receiver) = mpsc::channel();
+        watch_exit(game, replay.clone(), move |exited| {
+            let _ = sender.send(exited);
+        })
+        .expect("the exit watcher should start");
+        eprintln!("waiting for the game to close");
+        let exited = receiver.recv().expect("the exit should be reported");
+        eprintln!("{}", serde_json::to_string(&exited).unwrap());
     }
 }

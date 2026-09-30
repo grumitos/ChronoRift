@@ -26,7 +26,7 @@ The UI must show:
 - editable locale
 - install destination
 - progress and current stage
-- final executable path
+- final result: the client's destination folder, with an action that opens it with `League of Legends.exe` selected
 
 ## Alternatives Considered
 

@@ -6,15 +6,17 @@ ChronoRift should make old `.rofl` files easy to inspect and replay without forc
 
 The core flow:
 
-1. User opens a `.rofl` file.
-2. ChronoRift reads metadata and shows patch, server, suggested locale, match id, and duration.
-3. ChronoRift loads DataDragon champion/item assets for the selected locale.
-4. ChronoRift shows the client for the replay's build in one strip: state, build, location under the saved clients folder (for example `E:\ChronoRift`), and locale. The user can also point to an existing executable.
+1. User opens a replay folder. ChronoRift lists its `.rofl` files by file date, newest first (on the same date, the higher match id first), and the folder is remembered for the next start.
+2. User picks a replay. ChronoRift reads its metadata and shows the result, patch, server, match id, duration, and the file's date labeled "Descargada": when the replay was downloaded or saved, not when the game was played.
+3. ChronoRift loads DataDragon champion/item assets for the interface language.
+4. ChronoRift shows the client for the replay's build in one strip: state, build, location under the saved clients folder (for example `E:\ChronoRift`), and locale. The user can also point to an existing executable; only a file named `League of Legends.exe` is accepted, and another one is rejected as soon as it is picked.
 5. If client work is requested, ChronoRift resolves the replay's exact build and classifies the work as a new install, resume, repair, or already ready.
 6. User checks the plan: build, whether it is the exact build, manifest source, mode, affected and reused file counts, download size, install size, the full destination `<clients folder>\<build>\Game`, and locale.
-7. User explicitly confirms the exact plan.
-8. Progress stays visible until the client is ready.
-9. User explicitly launches the replay. If Riot Vanguard is running, the client strip says so next to Reproducir, and the user exits Vanguard from its tray icon first.
+7. User explicitly confirms the exact plan, including its locale and manifest.
+8. Progress stays visible until the client is ready. Detener shows "Deteniendo…" at once; completed files stay for Reanudar.
+9. User explicitly launches the replay. The strip shows "Reproduciendo" until the game closes. If Riot Vanguard is running, the strip says "Vanguard activo" next to Reproducir, also while a game is open, and the user exits Vanguard from its tray icon first.
+
+If a download fails after its automatic retries (transient network failures are retried for about a minute), the reason stays under the client strip, with the drawer open or closed, until the next attempt. The plan is then recomputed on its own, so Reanudar opens a plan that is ready to confirm. One download runs at a time: while it runs, the actions that would start another build are disabled.
 
 ## Product Rules
 
@@ -22,14 +24,16 @@ The core flow:
 - Download, install, repair replacement, cleanup of ChronoRift temporary files, and launch are user-triggered.
 - The clients folder is always visible, editable, and remembered between sessions. The full destination is shown in the plan before anything is downloaded.
 - ChronoRift creates the clients folder and the build folder only when the user confirms a plan.
-- The locale is always visible and editable.
+- The locale is always visible. It is chosen in the plan, before anything is downloaded. A client downloaded by ChronoRift is then shown and launched with the locale it was installed with, and the strip does not edit it.
 - Locale can be suggested from replay server, but never silently forced.
 - Static-data loading may happen during inspection, but game-client work never does.
-- Failed or unsupported replay formats must say what is unsupported.
-- Downloader progress must come from real bytes/files, not fake timers.
+- A replay that cannot be read, or whose statistics were omitted (more than 32 players), says why and shows "—" instead of an invented score.
+- Downloader progress must come from real bytes/files, not fake timers, and never shows 100 % before the client is ready.
 - Heavy bundle downloads require an explicit confirmation after the manifest plan is visible.
-- Client work can be stopped at any time; completed files stay for resuming.
-- The client state shown for each replay (ready, partial, missing) is read from local files only.
+- Client work can be stopped at any time; completed files stay for resuming. A failed download is never silent.
+- The client state shown for each replay (ready, partial, missing) is read from local files only. Until it has been read, the state is neutral. If the clients folder is unavailable (for example a disconnected USB drive), the strip says so instead of "No instalado", and it is read again when the window regains focus.
+- When a newer build of the same patch is installed instead of the exact one, the strip shows that build marked "no exacta" and launches it.
+- A replay folder that cannot be read stays remembered, because a sleeping network drive or an unplugged USB disk comes back; "Actualizar" retries it.
 - Riot Vanguard is read, never controlled: ChronoRift does not stop it, change its configuration, or ask for elevation. Restarting Windows brings it back for online play.
 - Interface copy is labels and data only: no explanatory text. The single clarification kept is that ChronoRift does not modify the League of Legends installation.
 
@@ -53,7 +57,7 @@ ChronoRift maps known replay platform ids to a default locale:
 | TW2 | `zh_TW` |
 | VN2 | `vi_VN` |
 
-This is only a default. The plan keeps the locale editable because backups and downloaded clients may have different language assets. A client downloaded by ChronoRift only has the files of the locale it was installed with, so it is shown and launched with that locale; its plans (resume, verify) start from it too.
+This is only a default. The plan keeps the locale editable because backups and downloaded clients may have different language assets. A client downloaded by ChronoRift only has the files of the locale it was installed with, so it is shown and launched with that locale; its plans (resume, verify) start from it too. A chosen executable uses the replay's suggested locale or the one picked in the plan.
 
 ## Downloader/Installer Contract
 
@@ -103,6 +107,6 @@ The selected locale is attempted first, followed by a documented fallback. Stati
 - No account login.
 - No Riot API key.
 - No cloud sync.
-- No automatic install on file open.
+- No automatic install on opening a folder or a replay.
 - No custom UI framework until vanilla TypeScript hurts.
 - No database until JSON/cache files stop being enough.

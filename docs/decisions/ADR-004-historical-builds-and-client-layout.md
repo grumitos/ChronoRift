@@ -29,7 +29,7 @@ Resolution order for a replay build (`16.18.817.5716` becomes artifact `16.18.81
 2. The exact build in the riot-manifests index, trying the replay region, then `NA1`, then `EUW1`.
 3. The newest Sieve build of the same patch, flagged `exactBuild: false` so the plan shows that it may not play the replay.
 
-The index only supplies a URL. Every manifest URL must be HTTPS under `*.riotcdn.net` and end in `.manifest`, whichever source provided it. Bundles are derived from that URL, so all game bytes come from Riot's CDN. The plan shows the source (`Riot Sieve` or `riot-manifests`) and the manifest URL.
+The index only supplies a URL. Every manifest URL must be HTTPS under `*.riotcdn.net` and end in `.manifest`, whichever source provided it. Bundles are derived from that URL, so all game bytes come from Riot's CDN. The plan shows the source (`Riot Sieve` or `riot-manifests`) and flags a build that is not exact. The manifest URL is only a tooltip on the source.
 
 Layout:
 
@@ -55,5 +55,5 @@ Rejected for display consistency. The replay and `League of Legends.exe` both sh
 ## Consequences
 
 - Any build listed in the riot-manifests index can be planned, as long as Riot's CDN still serves its manifest and bundles.
-- ChronoRift depends on a third-party index for the URL of old builds. A compromised index can at most point to another Riot CDN manifest. The plan shows the source and URL, and the exact-build flag stays visible.
+- ChronoRift depends on a third-party index for the URL of old builds. A compromised index can at most point to another Riot CDN manifest. The plan shows the source, with the manifest URL in its tooltip, and the exact-build flag stays visible.
 - Existing ad-hoc destinations from earlier versions are not migrated. The plan simply proposes the new per-build folder.

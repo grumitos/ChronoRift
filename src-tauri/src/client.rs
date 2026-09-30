@@ -7,16 +7,21 @@ use std::{
     error::Error,
     fmt::{self, Display},
     fs::{self, File, OpenOptions},
+    future::Future,
     io::{self, Cursor, Seek, SeekFrom, Write},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
+    pin::{pin, Pin},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
+    task::Poll,
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Runtime};
+// `tokio::time` llega con la feature `time` que reqwest y hyper-util ya activan en el árbol.
+use tokio::time::{Interval, MissedTickBehavior};
 
 const INSTALL_PROGRESS_EVENT: &str = "download-progress";
 const PRODUCT: &str = "lol";
@@ -63,6 +68,26 @@ const MAX_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 /// Peticiones de rango en paralelo; `settings.json` puede cambiarlo (`downloadConnections`).
 const DEFAULT_CONNECTIONS: usize = 8;
 const MAX_CONNECTIONS: usize = 32;
+/// Espera antes de cada reintento de una ventana con un fallo pasajero: un intento y cinco
+/// reintentos, cerca de un minuto de tolerancia en total.
+const RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(32),
+];
+/// Sin tope total: una transferencia lenta pero viva sigue, y una que pasa este lapso sin recibir
+/// bytes se da por colgada (la ventana se reintenta).
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Intervalo mínimo entre eventos de progreso de la descarga: unos cinco por segundo.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
+/// Cada cuánto se revisa la parada (y el progreso) mientras se espera a la red o al disco.
+const TICK: Duration = Duration::from_millis(100);
+/// Topes de lectura: un manifiesto RMAN real ronda las decenas de MiB; Sieve y el índice, pocos KiB.
+const MAX_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_LISTING_BYTES: u64 = 4 * 1024 * 1024;
 const TEMP_SUFFIX: &str = "part";
 /// Copia del archivo reemplazado mientras dura el intercambio de una reparación.
 const BACKUP_SUFFIX: &str = "backup";
@@ -74,6 +99,8 @@ const METADATA_DIR: &str = ".chronorift";
 const INSTALL_METADATA: &str = "install.json";
 /// Plan confirmado de la instalación en curso; da el total si la descarga queda a medias.
 const PLAN_METADATA: &str = "plan.json";
+/// Candado entre procesos mientras dura una instalación en ese destino.
+const LOCK_FILE: &str = "install.lock";
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,6 +152,8 @@ pub struct ConfirmedPlan {
     pub mode: ClientWorkMode,
     pub resolved_version: String,
     pub destination_path: String,
+    pub locale: String,
+    pub manifest_url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -187,21 +216,44 @@ impl<R: Runtime> ProgressSink for AppHandle<R> {
     }
 }
 
-/// Señal para detener una instalación en curso. Lo ya confirmado queda en disco para reanudar.
+/// Estado compartido de las instalaciones del proceso: la señal para detener la que está en curso
+/// y la marca de que hay una. Lo ya confirmado queda en disco para reanudar.
 #[derive(Debug, Clone, Default)]
-pub struct CancelSignal(Arc<AtomicBool>);
+pub struct CancelSignal(Arc<InstallControl>);
+
+#[derive(Debug, Default)]
+struct InstallControl {
+    cancelled: AtomicBool,
+    running: AtomicBool,
+}
 
 impl CancelSignal {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-
-    pub fn reset(&self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.0.cancelled.store(true, Ordering::SeqCst);
     }
 
     fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Marca el comienzo de una instalación y limpia una parada vieja. Si ya hay otra en este
+    /// proceso, la rechaza sin tocar su señal.
+    fn begin(&self) -> Result<RunningInstall, ClientInstallError> {
+        self.0
+            .running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| ClientInstallError::AlreadyRunning)?;
+        self.0.cancelled.store(false, Ordering::SeqCst);
+        Ok(RunningInstall(Arc::clone(&self.0)))
+    }
+}
+
+/// Libera la marca de instalación en curso al terminar, también si falla o se detiene.
+struct RunningInstall(Arc<InstallControl>);
+
+impl Drop for RunningInstall {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::SeqCst);
     }
 }
 
@@ -226,6 +278,8 @@ pub struct LocalClientStatus {
     pub installed_bytes: u64,
     /// Total previsto, de `install.json` o del plan confirmado.
     pub total_install_bytes: Option<u64>,
+    /// `false` si, a falta de la compilación exacta, es la más nueva lista del mismo parche.
+    pub exact_build: bool,
 }
 
 /// Campos que el estado local lee de `install.json` o `plan.json`.
@@ -243,6 +297,9 @@ pub enum ClientInstallError {
     /// Bien escrito, pero el manifiesto no trae archivos para ese idioma.
     UnavailableLocale(String),
     InvalidClientsRoot(settings::SettingsError),
+    /// La unidad o el recurso compartido de la carpeta de clientes no existe (un disco USB
+    /// desconectado, por ejemplo).
+    ClientsRootUnavailable(String),
     InvalidReleaseVersion(String),
     InvalidManifestUrl(String),
     UntrustedManifestUrl(String),
@@ -251,6 +308,16 @@ pub enum ClientInstallError {
     Resolve(reqwest::Error),
     InvalidResolveResponse(serde_json::Error),
     ManifestIndex(reqwest::Error),
+    /// Fallaron Riot Sieve y el índice: se informan los dos motivos.
+    ResolveFailed {
+        sieve: Box<ClientInstallError>,
+        index: Box<ClientInstallError>,
+    },
+    /// La respuesta pasó el tope de lectura (manifiesto, Sieve o índice).
+    ResponseTooLarge {
+        host: String,
+        limit: u64,
+    },
     Metadata(serde_json::Error),
     ReleaseNotFound {
         region: String,
@@ -258,7 +325,15 @@ pub enum ClientInstallError {
         version: Option<String>,
     },
     Download(reqwest::Error),
+    /// El CDN declaró otro tamaño para el rango pedido, o ninguno.
     InvalidChunkSize {
+        expected: u32,
+        actual: Option<u64>,
+    },
+    /// El CDN no respondió 206 al rango (por ejemplo, 200 con el bundle entero). Se reintenta.
+    RangeIgnored(u16),
+    /// La respuesta terminó antes de completar el rango. Se reintenta.
+    IncompleteRange {
         expected: u32,
         actual: usize,
     },
@@ -280,10 +355,19 @@ pub enum ClientInstallError {
         version: String,
         destination: String,
     },
+    /// La confirmación trae otro idioma que el plan recalculado.
+    LocaleChanged {
+        confirmed: String,
+        planned: String,
+    },
+    /// La confirmación trae otro manifiesto que el plan recalculado.
+    ManifestChanged(String),
     MissingExecutable(PathBuf),
     Emit(tauri::Error),
     Worker(tauri::Error),
     Cancelled,
+    /// Ya hay una instalación en este proceso, o en otro sobre el mismo destino.
+    AlreadyRunning,
 }
 
 impl Display for ClientInstallError {
@@ -295,6 +379,9 @@ impl Display for ClientInstallError {
                 write!(f, "Idioma no disponible en este cliente: {locale}")
             }
             Self::InvalidClientsRoot(err) => write!(f, "{err}"),
+            Self::ClientsRootUnavailable(path) => {
+                write!(f, "La carpeta de clientes no está disponible: {path}")
+            }
             Self::InvalidReleaseVersion(version) => {
                 write!(f, "Versión de cliente inesperada: {version}")
             }
@@ -321,6 +408,12 @@ impl Display for ClientInstallError {
                 "No se pudo leer el índice riot-manifests: {}",
                 network_detail(err)
             ),
+            Self::ResolveFailed { sieve, index } => write!(f, "{sieve}. {index}"),
+            Self::ResponseTooLarge { host, limit } => write!(
+                f,
+                "Respuesta demasiado grande de {host}: supera {} MiB",
+                limit / (1024 * 1024)
+            ),
             Self::Metadata(err) => {
                 write!(f, "No se pudieron guardar los datos de la instalación: {err}")
             }
@@ -339,9 +432,26 @@ impl Display for ClientInstallError {
                 }
             }
             Self::Download(err) => write!(f, "Falló la descarga: {}", network_detail(err)),
-            Self::InvalidChunkSize { expected, actual } => write!(
+            Self::InvalidChunkSize {
+                expected,
+                actual: Some(actual),
+            } => write!(
                 f,
                 "Rango de bundle con tamaño inesperado: {actual} bytes en lugar de {expected}"
+            ),
+            Self::InvalidChunkSize {
+                expected,
+                actual: None,
+            } => write!(
+                f,
+                "Rango de bundle sin tamaño declarado; se esperaban {expected} bytes"
+            ),
+            Self::RangeIgnored(status) => {
+                write!(f, "El CDN no respetó el rango pedido: HTTP {status}")
+            }
+            Self::IncompleteRange { expected, actual } => write!(
+                f,
+                "Rango de bundle incompleto: {actual} de {expected} bytes"
             ),
             Self::InvalidChunkData { expected, actual } => write!(
                 f,
@@ -372,17 +482,51 @@ impl Display for ClientInstallError {
                 version,
                 destination,
             } => write!(f, "El plan cambió a {planned}: {version} en {destination}"),
+            Self::LocaleChanged { confirmed, planned } => write!(
+                f,
+                "El plan cambió de idioma: {planned} en lugar de {confirmed}"
+            ),
+            Self::ManifestChanged(url) => write!(f, "El plan cambió de manifiesto: {url}"),
             Self::MissingExecutable(path) => {
                 write!(f, "Falta el ejecutable: {}", path.display())
             }
             Self::Emit(err) => write!(f, "No se pudo publicar el progreso: {err}"),
             Self::Worker(err) => write!(f, "Falló una tarea de la descarga: {err}"),
             Self::Cancelled => write!(f, "Descarga detenida"),
+            Self::AlreadyRunning => write!(f, "Ya hay una descarga en curso."),
         }
     }
 }
 
 impl Error for ClientInstallError {}
+
+impl ClientInstallError {
+    /// Fallos pasajeros que vale la pena reintentar: tiempo agotado, conexión caída o rechazada,
+    /// 5xx, 429 y cuerpos incompletos. Nunca los de validación (tamaño, contenido, URL no
+    /// confiable) ni los demás 4xx.
+    fn is_transient(&self) -> bool {
+        match self {
+            Self::Download(error) => is_transient_network(error),
+            Self::RangeIgnored(_) | Self::IncompleteRange { .. } => true,
+            _ => false,
+        }
+    }
+}
+
+fn is_transient_network(error: &reqwest::Error) -> bool {
+    if error.is_redirect() || error.is_builder() {
+        return false;
+    }
+    if let Some(status) = error.status() {
+        return status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS;
+    }
+    // `is_request` cubre una conexión cortada o reiniciada antes de la respuesta.
+    error.is_timeout()
+        || error.is_connect()
+        || error.is_request()
+        || error.is_body()
+        || error.is_decode()
+}
 
 /// Motivo de un fallo de red en español, con el host cuando se conoce. Lo que no se reconoce
 /// queda con el texto de reqwest.
@@ -458,30 +602,80 @@ pub async fn install_client(
     install_client_with(progress, &ReleaseEndpoints::riot(), request, tuning, cancel).await
 }
 
-/// Estado local de la compilación de una repetición en la carpeta de clientes.
-pub fn local_client_status(
+/// Estado local de las compilaciones de las repeticiones, por versión, leído sin red y sin crear
+/// nada. Si la compilación exacta no tiene un cliente listo, vale el más nuevo listo del mismo
+/// parche (`exact_build: false`), que es lo que instala un plan no exacto. Una versión mal escrita
+/// se omite; solo una unidad inexistente rechaza la consulta entera.
+pub fn local_client_statuses(
     clients_root: &str,
-    game_version: &str,
-) -> Result<LocalClientStatus, ClientInstallError> {
-    let root = settings::normalize_clients_root(clients_root)
-        .map_err(ClientInstallError::InvalidClientsRoot)?;
-    let game_build = normalize_game_version(game_version)
-        .and_then(|version| client_folder_name(&version))
-        .ok_or_else(|| ClientInstallError::InvalidReleaseVersion(game_version.to_string()))?;
-    let destination = root.join(&game_build).join(GAME_FOLDER);
-    Ok(status_for_destination(destination, game_build))
+    versions: &[String],
+) -> Result<HashMap<String, LocalClientStatus>, ClientInstallError> {
+    let root = match clients_root_path(clients_root) {
+        Ok(root) => root,
+        Err(error @ ClientInstallError::ClientsRootUnavailable(_)) => return Err(error),
+        // Sin carpeta válida no hay clientes que mostrar.
+        Err(_) => return Ok(HashMap::new()),
+    };
+    // Los clientes listos de la carpeta se leen una sola vez, y solo si hace falta un respaldo.
+    let mut ready: Option<Vec<LocalClientStatus>> = None;
+    let mut statuses = HashMap::new();
+    for version in versions {
+        let Some(game_build) =
+            normalize_game_version(version).and_then(|artifact| client_folder_name(&artifact))
+        else {
+            continue;
+        };
+        let exact = status_for_destination(root.join(&game_build).join(GAME_FOLDER), game_build);
+        let status = if exact.state == LocalClientState::Ready {
+            exact
+        } else {
+            let patch = version_patch(&exact.game_build);
+            ready
+                .get_or_insert_with(|| {
+                    scan_clients(&root)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|status| status.state == LocalClientState::Ready)
+                        .collect()
+                })
+                .iter()
+                // Ya vienen de la más nueva a la más vieja.
+                .find(|status| version_patch(&status.game_build) == patch)
+                .map(|status| LocalClientStatus {
+                    exact_build: false,
+                    ..status.clone()
+                })
+                .unwrap_or(exact)
+        };
+        statuses.insert(version.clone(), status);
+    }
+    Ok(statuses)
 }
 
 /// Compilaciones con archivos en la carpeta de clientes, de la más nueva a la más vieja.
 pub fn list_local_clients(
     clients_root: &str,
 ) -> Result<Vec<LocalClientStatus>, ClientInstallError> {
-    let root = settings::normalize_clients_root(clients_root)
-        .map_err(ClientInstallError::InvalidClientsRoot)?;
-    let entries = match fs::read_dir(&root) {
+    let root = clients_root_path(clients_root)?;
+    scan_clients(&root).map_err(ClientInstallError::Io)
+}
+
+/// Carpeta de clientes validada; una unidad o un recurso compartido que no existe tiene su propio
+/// error. Una carpeta que falta en una unidad existente es válida: todavía no hay nada instalado.
+fn clients_root_path(clients_root: &str) -> Result<PathBuf, ClientInstallError> {
+    settings::normalize_clients_root(clients_root).map_err(|error| match error {
+        settings::SettingsError::MissingVolume(path) => {
+            ClientInstallError::ClientsRootUnavailable(path)
+        }
+        other => ClientInstallError::InvalidClientsRoot(other),
+    })
+}
+
+fn scan_clients(root: &Path) -> io::Result<Vec<LocalClientStatus>> {
+    let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
     };
     let mut clients = entries
         .filter_map(Result::ok)
@@ -495,14 +689,15 @@ pub fn list_local_clients(
     Ok(clients)
 }
 
+fn read_stored(metadata_dir: &Path, name: &str) -> Option<StoredInstall> {
+    let bytes = fs::read(metadata_dir.join(name)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 fn status_for_destination(destination: PathBuf, game_build: String) -> LocalClientStatus {
     let metadata_dir = destination.join(METADATA_DIR);
-    let read = |name: &str| -> Option<StoredInstall> {
-        let bytes = fs::read(metadata_dir.join(name)).ok()?;
-        serde_json::from_slice(&bytes).ok()
-    };
-    let installed = read(INSTALL_METADATA);
-    let planned = read(PLAN_METADATA);
+    let installed = read_stored(&metadata_dir, INSTALL_METADATA);
+    let planned = read_stored(&metadata_dir, PLAN_METADATA);
     let executable = destination.join(GAME_EXE);
     let installed_bytes = game_file_bytes(&destination, &metadata_dir);
     let state = if installed.is_some() && executable.is_file() {
@@ -522,6 +717,7 @@ fn status_for_destination(destination: PathBuf, game_build: String) -> LocalClie
         locale: stored.locale,
         installed_bytes,
         total_install_bytes: stored.total_install_bytes,
+        exact_build: true,
     }
 }
 
@@ -567,22 +763,30 @@ async fn install_client_with(
     tuning: DownloadTuning,
     cancel: &CancelSignal,
 ) -> Result<ClientInstallResult, ClientInstallError> {
-    let client = http_client()?;
-    let planned = build_install_plan(&client, progress, endpoints, &request).await?;
+    // Una instalación por proceso; también limpia una parada que haya quedado de la anterior.
+    let _running = cancel.begin()?;
+    let client = http_client_with(tuning.read_timeout)?;
+    // Detener también corta el plan recalculado (Sieve, índice y manifiesto).
+    let planned = until_cancelled(
+        cancel,
+        build_install_plan(&client, progress, endpoints, &request),
+    )
+    .await?;
     validate_confirmation(&planned.plan, request.confirmed.as_ref())?;
     if cancel.is_cancelled() {
         return Err(ClientInstallError::Cancelled);
     }
+    let bundle_base = bundle_base_from_manifest_url(&planned.plan.manifest_url)?;
+    // Candado entre procesos antes de tocar el destino: la limpieza de temporales nunca alcanza
+    // los archivos de otra instalación en curso.
+    let _lock = InstallLock::acquire(&planned.destination)?;
     // Recién con el plan confirmado, y también si ya está listo: un `.backup` de una reparación
     // cortada puede quedar aunque el archivo ya esté completo.
     remove_stale_temp_files(&planned.destination.join(METADATA_DIR).join(TEMP_DIR))?;
-    let bundle_base = bundle_base_from_manifest_url(&planned.plan.manifest_url)?;
-    fs::create_dir_all(&planned.destination)?;
     if planned.plan.mode != ClientWorkMode::Ready {
-        // El plan confirmado da el total si la descarga queda a medias; `install.json` vuelve
-        // a escribirse solo cuando el cliente está completo.
+        // El plan confirmado da el total si la descarga queda a medias. `install.json` sigue
+        // hasta que se confirma el primer archivo y vuelve a escribirse con el cliente completo.
         write_metadata(&planned.destination, PLAN_METADATA, &planned.plan)?;
-        remove_metadata(&planned.destination, INSTALL_METADATA)?;
     }
 
     let mut downloader = Downloader {
@@ -593,7 +797,9 @@ async fn install_client_with(
         tuning,
         cancel,
         total_bytes: planned.plan.download_bytes,
-        downloaded_bytes: 0,
+        received: Arc::default(),
+        reported_bytes: 0,
+        last_report: None,
     };
     let started = Instant::now();
     download_files(
@@ -614,7 +820,13 @@ async fn install_client_with(
         plan: planned.plan,
         download_seconds,
     };
-    write_metadata(&planned.destination, INSTALL_METADATA, &result)?;
+    // Un plan listo no descargó nada: el `install.json` que ya había conserva los datos de la
+    // descarga que armó el cliente.
+    let keep_previous = result.plan.mode == ClientWorkMode::Ready
+        && read_stored(&planned.destination.join(METADATA_DIR), INSTALL_METADATA).is_some();
+    if !keep_previous {
+        write_metadata(&planned.destination, INSTALL_METADATA, &result)?;
+    }
     remove_metadata(&planned.destination, PLAN_METADATA)?;
     publish(
         progress,
@@ -629,13 +841,104 @@ async fn install_client_with(
 }
 
 fn http_client() -> Result<reqwest::Client, ClientInstallError> {
+    http_client_with(READ_TIMEOUT)
+}
+
+/// Sin tope total: una descarga lenta pero viva nunca se corta. `read_timeout` limita la espera
+/// de los encabezados y cada pausa entre bytes del cuerpo.
+fn http_client_with(read_timeout: Duration) -> Result<reqwest::Client, ClientInstallError> {
     reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .redirect(same_origin_redirects())
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(300))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(read_timeout)
         .build()
         .map_err(ClientInstallError::HttpClient)
+}
+
+/// Candado entre procesos (otra instancia de la app): `install.lock` abierto sin compartir mientras
+/// dura la instalación, y borrado al terminar. Recargar la ventana no cambia de proceso: a esa
+/// segunda llamada la frena la guardia compartida de `CancelSignal`.
+struct InstallLock {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl InstallLock {
+    fn acquire(destination: &Path) -> Result<Self, ClientInstallError> {
+        let metadata_dir = destination.join(METADATA_DIR);
+        fs::create_dir_all(&metadata_dir)?;
+        let path = metadata_dir.join(LOCK_FILE);
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+        }
+        match options.open(&path) {
+            Ok(file) => Ok(Self {
+                path,
+                file: Some(file),
+            }),
+            // ERROR_SHARING_VIOLATION: otro proceso lo tiene abierto.
+            Err(error) if cfg!(windows) && error.raw_os_error() == Some(32) => {
+                Err(ClientInstallError::AlreadyRunning)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for InstallLock {
+    fn drop(&mut self) {
+        // Se cierra antes de borrarlo. Si otra instalación ya lo abrió, el borrado falla y su
+        // candado sigue en pie.
+        self.file = None;
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+enum Waited<T> {
+    Ready(T),
+    Tick,
+}
+
+/// Espera `future` hasta el próximo tic de `ticker`, lo que llegue primero; así el que espera
+/// puede revisar la parada y publicar progreso sin `tokio::select!` (sin la feature `macros`).
+async fn wait_or_tick<F: Future + Unpin>(
+    future: &mut F,
+    ticker: &mut Interval,
+) -> Waited<F::Output> {
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(output) = Pin::new(&mut *future).poll(cx) {
+            return Poll::Ready(Waited::Ready(output));
+        }
+        ticker.poll_tick(cx).map(|_| Waited::Tick)
+    })
+    .await
+}
+
+fn ticker() -> Interval {
+    let mut ticker = tokio::time::interval(TICK);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ticker
+}
+
+/// Corta `future` (y con él sus peticiones) si se pide detener la instalación.
+async fn until_cancelled<T>(
+    cancel: &CancelSignal,
+    future: impl Future<Output = Result<T, ClientInstallError>>,
+) -> Result<T, ClientInstallError> {
+    let mut future = pin!(future);
+    let mut ticker = ticker();
+    loop {
+        match wait_or_tick(&mut future, &mut ticker).await {
+            Waited::Ready(result) => return result,
+            Waited::Tick if cancel.is_cancelled() => return Err(ClientInstallError::Cancelled),
+            Waited::Tick => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -704,8 +1007,7 @@ async fn build_install_plan(
     let locale = normalize_locale(&request.locale)
         .ok_or_else(|| ClientInstallError::InvalidLocale(request.locale.clone()))?;
     let region = normalize_region(request.region.as_deref());
-    let clients_root = settings::normalize_clients_root(&request.clients_root)
-        .map_err(ClientInstallError::InvalidClientsRoot)?;
+    let clients_root = clients_root_path(&request.clients_root)?;
     let target_version = request
         .game_version
         .as_deref()
@@ -773,23 +1075,35 @@ async fn build_install_plan(
     })
 }
 
+/// El plan recalculado debe ser el que el usuario revisó: modo, versión, destino, idioma y
+/// manifiesto.
 fn validate_confirmation(
     plan: &ClientInstallPlan,
     confirmed: Option<&ConfirmedPlan>,
 ) -> Result<(), ClientInstallError> {
-    let matches = confirmed.is_some_and(|confirmed| {
+    let Some(confirmed) = confirmed.filter(|confirmed| {
         confirmed.mode == plan.mode
             && confirmed.resolved_version == plan.resolved_version
             && confirmed.destination_path == plan.destination_path
-    });
-    if matches {
-        return Ok(());
+    }) else {
+        return Err(ClientInstallError::ConfirmationRequired {
+            planned: plan.mode,
+            version: plan.game_build.clone(),
+            destination: plan.destination_path.clone(),
+        });
+    };
+    if normalize_locale(&confirmed.locale).as_deref() != Some(plan.locale.as_str()) {
+        return Err(ClientInstallError::LocaleChanged {
+            confirmed: confirmed.locale.clone(),
+            planned: plan.locale.clone(),
+        });
     }
-    Err(ClientInstallError::ConfirmationRequired {
-        planned: plan.mode,
-        version: plan.game_build.clone(),
-        destination: plan.destination_path.clone(),
-    })
+    if confirmed.manifest_url != plan.manifest_url {
+        return Err(ClientInstallError::ManifestChanged(
+            plan.manifest_url.clone(),
+        ));
+    }
+    Ok(())
 }
 
 /// Bytes a descargar (cada fragmento de bundle una sola vez, aunque lo usen varios archivos)
@@ -810,7 +1124,8 @@ fn install_totals(files: &[InstallFile]) -> (u64, u64) {
 }
 
 /// Sieve primero; si no tiene la compilación exacta, el índice público; si tampoco, la
-/// compilación más reciente del mismo parche que liste Sieve, marcada como no exacta.
+/// compilación más reciente del mismo parche que liste Sieve, marcada como no exacta. Solo un
+/// "no está" del índice lleva a esa compilación no exacta: cualquier otro fallo se informa.
 async fn resolve_game_release(
     client: &reqwest::Client,
     endpoints: &ReleaseEndpoints,
@@ -824,7 +1139,6 @@ async fn resolve_game_release(
         Err(error) => (Vec::new(), Some(error)),
     };
 
-    let mut index_error = None;
     if let Some(target) = target_version {
         if let Some(release) = select_sieve_release(&sieve_releases, patch, Some(target))
             .filter(|release| release.exact_build)
@@ -841,7 +1155,15 @@ async fn resolve_game_release(
                 })
             }
             Ok(None) => {}
-            Err(error) => index_error = Some(error),
+            Err(index) => {
+                return Err(match sieve_error {
+                    Some(sieve) => ClientInstallError::ResolveFailed {
+                        sieve: Box::new(sieve),
+                        index: Box::new(index),
+                    },
+                    None => index,
+                })
+            }
         }
     }
 
@@ -849,13 +1171,13 @@ async fn resolve_game_release(
         return with_trusted_manifest(release, endpoints);
     }
 
-    Err(sieve_error
-        .or(index_error)
-        .unwrap_or_else(|| ClientInstallError::ReleaseNotFound {
+    Err(
+        sieve_error.unwrap_or_else(|| ClientInstallError::ReleaseNotFound {
             region: region.to_string(),
             patch: patch.to_string(),
             version: target_version.map(ToOwned::to_owned),
-        }))
+        }),
+    )
 }
 
 async fn fetch_sieve_releases(
@@ -867,19 +1189,50 @@ async fn fetch_sieve_releases(
         "{}/api/v1/products/{PRODUCT}/version-sets/{region}?q[platform]={PLATFORM}",
         endpoints.sieve_base
     );
-    let text = client
+    let mut response = client
         .get(&url)
         .send()
         .await
         .map_err(ClientInstallError::Resolve)?
         .error_for_status()
-        .map_err(ClientInstallError::Resolve)?
-        .text()
-        .await
         .map_err(ClientInstallError::Resolve)?;
+    let body = read_capped(
+        &mut response,
+        MAX_LISTING_BYTES,
+        ClientInstallError::Resolve,
+        |_| Ok(()),
+    )
+    .await?;
     let response: SieveResponse =
-        serde_json::from_str(&text).map_err(ClientInstallError::InvalidResolveResponse)?;
+        serde_json::from_slice(&body).map_err(ClientInstallError::InvalidResolveResponse)?;
     Ok(response.releases)
+}
+
+/// Lee el cuerpo por partes y corta en cuanto pasa de `limit`, con o sin `Content-Length`.
+/// `on_chunk` recibe los bytes leídos hasta el momento.
+async fn read_capped(
+    response: &mut reqwest::Response,
+    limit: u64,
+    network: fn(reqwest::Error) -> ClientInstallError,
+    mut on_chunk: impl FnMut(u64) -> Result<(), ClientInstallError>,
+) -> Result<Vec<u8>, ClientInstallError> {
+    let too_large = |response: &reqwest::Response| ClientInstallError::ResponseTooLarge {
+        host: response.url().host_str().unwrap_or_default().to_string(),
+        limit,
+    };
+    let declared = response.content_length();
+    if declared.is_some_and(|length| length > limit) {
+        return Err(too_large(response));
+    }
+    let mut bytes = Vec::with_capacity(declared.unwrap_or(0) as usize);
+    while let Some(chunk) = response.chunk().await.map_err(network)? {
+        if (bytes.len() + chunk.len()) as u64 > limit {
+            return Err(too_large(response));
+        }
+        bytes.extend_from_slice(&chunk);
+        on_chunk(bytes.len() as u64)?;
+    }
+    Ok(bytes)
 }
 
 fn select_sieve_release(
@@ -933,7 +1286,9 @@ fn with_trusted_manifest(
 }
 
 /// Consulta `LoL/<región>/windows/lol-game-client/<versión>.txt`, que contiene la URL del
-/// manifiesto en el CDN de Riot. Devuelve `None` si ninguna región la tiene.
+/// manifiesto en el CDN de Riot, en la región de la repetición y luego en las de respaldo; un fallo
+/// (red, 5xx, 429, URL no confiable) no detiene la búsqueda en las demás. Devuelve `None` si
+/// ninguna la tiene (404) y el primer fallo si ninguna respondió con una URL.
 async fn lookup_manifest_index(
     client: &reqwest::Client,
     endpoints: &ReleaseEndpoints,
@@ -947,28 +1302,49 @@ async fn lookup_manifest_index(
         }
     }
 
+    let mut first_error = None;
     for candidate in regions {
-        let url = format!(
-            "{}/LoL/{candidate}/{PLATFORM}/{GAME_ARTIFACT}/{version}.txt",
-            endpoints.index_base
-        );
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(ClientInstallError::ManifestIndex)?;
-        if response.status() == StatusCode::NOT_FOUND {
-            continue;
+        match index_entry(client, endpoints, candidate, version).await {
+            Ok(Some(manifest_url)) => return Ok(Some(manifest_url)),
+            Ok(None) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
-        let body = response
-            .error_for_status()
-            .map_err(ClientInstallError::ManifestIndex)?
-            .text()
-            .await
-            .map_err(ClientInstallError::ManifestIndex)?;
-        return validate_manifest_url(body.trim(), endpoints).map(Some);
     }
-    Ok(None)
+    first_error.map_or(Ok(None), Err)
+}
+
+/// Entrada del índice para una región; `None` si no existe (404).
+async fn index_entry(
+    client: &reqwest::Client,
+    endpoints: &ReleaseEndpoints,
+    region: &str,
+    version: &str,
+) -> Result<Option<String>, ClientInstallError> {
+    let url = format!(
+        "{}/LoL/{region}/{PLATFORM}/{GAME_ARTIFACT}/{version}.txt",
+        endpoints.index_base
+    );
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(ClientInstallError::ManifestIndex)?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let mut response = response
+        .error_for_status()
+        .map_err(ClientInstallError::ManifestIndex)?;
+    let body = read_capped(
+        &mut response,
+        MAX_LISTING_BYTES,
+        ClientInstallError::ManifestIndex,
+        |_| Ok(()),
+    )
+    .await?;
+    validate_manifest_url(String::from_utf8_lossy(&body).trim(), endpoints).map(Some)
 }
 
 fn validate_manifest_url(
@@ -1010,35 +1386,33 @@ async fn download_manifest(
         .error_for_status()
         .map_err(ClientInstallError::Download)?;
     let total = response.content_length();
-    let mut bytes = Vec::new();
-
-    publish(
-        progress,
-        destination,
-        "manifest",
-        "Descargando el manifiesto de Riot",
-        0,
-        total,
-        false,
-    )?;
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(ClientInstallError::Download)?
-    {
-        bytes.extend_from_slice(&chunk);
+    let report = |read: u64| {
         publish(
             progress,
             destination,
             "manifest",
             "Descargando el manifiesto de Riot",
-            bytes.len() as u64,
+            read,
             total,
             false,
-        )?;
-    }
+        )
+    };
 
-    Ok(bytes)
+    report(0)?;
+    let mut last_report = Instant::now();
+    read_capped(
+        &mut response,
+        MAX_MANIFEST_BYTES,
+        ClientInstallError::Download,
+        |read| {
+            if last_report.elapsed() < PROGRESS_INTERVAL {
+                return Ok(());
+            }
+            last_report = Instant::now();
+            report(read)
+        },
+    )
+    .await
 }
 
 fn read_rman_manifest(mut manifest: Vec<u8>) -> Result<Rman, ClientInstallError> {
@@ -1184,11 +1558,18 @@ fn classify_install_files(
     })
 }
 
-/// Cuántas peticiones de rango van en paralelo y el tamaño máximo de cada una.
+/// Cuántas peticiones de rango van en paralelo, el tamaño máximo de cada una, cómo se reintentan y
+/// cada cuánto se publica el progreso. Las pruebas usan esperas de milisegundos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownloadTuning {
     pub connections: usize,
     pub max_window: u32,
+    /// Espera antes de cada reintento de una ventana; su largo es la cantidad de reintentos.
+    pub retry_delays: &'static [Duration],
+    /// Sin bytes durante este lapso, la petición se da por colgada.
+    pub read_timeout: Duration,
+    /// Intervalo mínimo entre eventos de progreso de la descarga.
+    pub progress_interval: Duration,
 }
 
 impl DownloadTuning {
@@ -1199,11 +1580,14 @@ impl DownloadTuning {
                 .map_or(DEFAULT_CONNECTIONS, usize::from)
                 .clamp(1, MAX_CONNECTIONS),
             max_window: MAX_WINDOW_BYTES,
+            retry_delays: &RETRY_DELAYS,
+            read_timeout: READ_TIMEOUT,
+            progress_interval: PROGRESS_INTERVAL,
         }
     }
 }
 
-/// Estado compartido de una descarga: cliente HTTP, progreso acumulado y destino.
+/// Estado compartido de una descarga: cliente HTTP, progreso y destino.
 struct Downloader<'a> {
     client: &'a reqwest::Client,
     progress: &'a dyn ProgressSink,
@@ -1212,7 +1596,12 @@ struct Downloader<'a> {
     tuning: DownloadTuning,
     cancel: &'a CancelSignal,
     total_bytes: u64,
-    downloaded_bytes: u64,
+    /// Bytes de bundle recibidos por las peticiones en curso o terminadas; un intento fallido
+    /// descuenta los suyos.
+    received: Arc<AtomicU64>,
+    /// Último valor publicado: nunca retrocede, aunque un reintento descarte bytes.
+    reported_bytes: u64,
+    last_report: Option<Instant>,
 }
 
 /// Posición de un archivo pendiente donde se escribe un fragmento descomprimido.
@@ -1335,6 +1724,7 @@ impl PendingFile {
                 .write(true)
                 .create_new(true)
                 .open(&self.temp_path)?;
+            mark_sparse(&handle);
             self.handle = Some(handle);
         }
         let handle = self.handle.as_mut().expect("temp file is open");
@@ -1352,12 +1742,52 @@ impl PendingFile {
     }
 }
 
+/// Marca el `.part` como disperso antes de su primera escritura. Los fragmentos llegan en orden de
+/// bundle y, en un archivo normal, NTFS rellena con ceros de forma síncrona todo lo que queda antes
+/// de una escritura lejana. Medido en NTFS, 1 MiB escrito a 2 GiB tarda unos 2 s y reserva 2 GiB;
+/// en un archivo disperso es inmediato y reserva 1 MiB. Ese relleno frenaba al único escritor y,
+/// con él, a todas las ventanas en vuelo. La marca queda al confirmar el archivo: quitarla obliga a
+/// volcar en el acto los tramos que se llenaron tarde. Si el sistema de archivos no la admite, se
+/// sigue sin ella.
+#[cfg(windows)]
+fn mark_sparse(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::{
+        Ioctl::{FILE_SET_SPARSE_BUFFER, FSCTL_SET_SPARSE},
+        IO::DeviceIoControl,
+    };
+
+    let request = FILE_SET_SPARSE_BUFFER { SetSparse: true };
+    let mut returned = 0;
+    // SAFETY: el identificador es válido mientras `file` viva, el búfer de entrada es un
+    // `FILE_SET_SPARSE_BUFFER` que vive durante la llamada, no hay búfer de salida y la E/S no es
+    // superpuesta.
+    unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_SET_SPARSE,
+            (&request as *const FILE_SET_SPARSE_BUFFER).cast(),
+            std::mem::size_of::<FILE_SET_SPARSE_BUFFER>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn mark_sparse(_file: &File) {}
+
 /// Descomprime y escribe las ventanas en orden. Es dueño de los archivos temporales para
 /// poder trabajar en un hilo bloqueante sin frenar las descargas en curso.
 struct FileWriter {
     files: Vec<PendingFile>,
     temp_dir: PathBuf,
     allow_replace: bool,
+    /// `install.json` del cliente anterior: deja de describirlo con el primer archivo que se
+    /// agrega o reemplaza, así que se quita justo antes.
+    stale_install_metadata: Option<PathBuf>,
 }
 
 impl FileWriter {
@@ -1383,6 +1813,7 @@ impl FileWriter {
             files: pending,
             temp_dir: temp_dir.to_path_buf(),
             allow_replace,
+            stale_install_metadata: Some(destination.join(METADATA_DIR).join(INSTALL_METADATA)),
         })
     }
 
@@ -1403,13 +1834,7 @@ impl FileWriter {
             for placement in &chunk.placements {
                 let file = &mut self.files[placement.file_index];
                 if file.write_at(placement.target_offset, &decompressed)? {
-                    commit_downloaded_file(
-                        &file.temp_path,
-                        &file.target,
-                        &self.temp_dir,
-                        self.allow_replace,
-                    )?;
-                    file.committed = true;
+                    self.commit(placement.file_index)?;
                 }
             }
         }
@@ -1418,7 +1843,11 @@ impl FileWriter {
 
     /// Confirma los archivos vacíos (sin fragmentos) y comprueba que ninguno quedó incompleto.
     fn finish(&mut self) -> Result<(), ClientInstallError> {
-        for file in self.files.iter_mut().filter(|file| !file.committed) {
+        for index in 0..self.files.len() {
+            let file = &mut self.files[index];
+            if file.committed {
+                continue;
+            }
             if file.remaining != 0 {
                 return Err(ClientInstallError::ChunkLayoutMismatch(
                     file.manifest_path.clone(),
@@ -1428,14 +1857,26 @@ impl FileWriter {
             if !file.temp_path.exists() {
                 File::create(&file.temp_path)?;
             }
-            commit_downloaded_file(
-                &file.temp_path,
-                &file.target,
-                &self.temp_dir,
-                self.allow_replace,
-            )?;
-            file.committed = true;
+            self.commit(index)?;
         }
+        Ok(())
+    }
+
+    fn commit(&mut self, index: usize) -> Result<(), ClientInstallError> {
+        if let Some(stale) = self.stale_install_metadata.take() {
+            match fs::remove_file(stale) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+                _ => {}
+            }
+        }
+        let file = &mut self.files[index];
+        commit_downloaded_file(
+            &file.temp_path,
+            &file.target,
+            &self.temp_dir,
+            self.allow_replace,
+        )?;
+        file.committed = true;
         Ok(())
     }
 
@@ -1448,62 +1889,70 @@ impl FileWriter {
     }
 }
 
+/// Cuándo se publica el progreso de la descarga.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Report {
+    /// Al empezar y al terminar: siempre.
+    Always,
+    /// Tras aplicar una ventana, si pasó el intervalo.
+    AfterApply,
+    /// En un tic de espera, si pasó el intervalo y llegaron bytes nuevos.
+    IfChanged,
+}
+
 impl Downloader<'_> {
-    /// Mantiene hasta `connections` peticiones en curso como tareas independientes y aplica
-    /// cada ventana en orden en un hilo bloqueante. La memoria queda acotada a unas
-    /// `connections + 1` ventanas.
+    /// Mantiene hasta `connections` peticiones en curso como tareas independientes, cada una con
+    /// sus reintentos, y aplica cada ventana en orden en un hilo bloqueante. Mientras espera a la
+    /// red o al disco revisa la parada y publica los bytes recibidos. La memoria queda acotada a
+    /// unas `connections + 1` ventanas.
     async fn run(
         &mut self,
         windows: Arc<Vec<DownloadWindow>>,
+        files: &[InstallFile],
         writer: FileWriter,
     ) -> (Option<FileWriter>, Result<(), ClientInstallError>) {
+        // El detalle del progreso es el archivo que arma la ventana que se espera.
+        let detail = |index: usize| {
+            windows
+                .get(index.min(windows.len().saturating_sub(1)))
+                .and_then(DownloadWindow::first_placement)
+                .and_then(|placement| files.get(placement.file_index))
+                .map_or("", |file| file.path.as_str())
+        };
         let mut writer = Some(writer);
         let mut in_flight = VecDeque::new();
         let mut next = 0;
+        let mut ticker = ticker();
         let failure = 'windows: {
+            if let Err(error) = self.report(detail(0), Report::Always) {
+                break 'windows Some(error);
+            }
             for index in 0..windows.len() {
-                // Se revisa entre ventanas: lo ya aplicado queda y lo pendiente se descarta.
-                if self.cancel.is_cancelled() {
-                    break 'windows Some(ClientInstallError::Cancelled);
-                }
                 while next < windows.len() && in_flight.len() < self.tuning.connections {
-                    let window = &windows[next];
-                    let expected = window.end - window.start;
-                    let request = self
-                        .client
-                        .get(format!(
-                            "{}/{:016X}.bundle",
-                            self.bundle_base, window.bundle_id
-                        ))
-                        .header(
-                            header::RANGE,
-                            format!("bytes={}-{}", window.start, window.end - 1),
-                        );
-                    in_flight.push_back(tauri::async_runtime::spawn(async move {
-                        let data = request
-                            .send()
-                            .await
-                            .map_err(ClientInstallError::Download)?
-                            .error_for_status()
-                            .map_err(ClientInstallError::Download)?
-                            .bytes()
-                            .await
-                            .map_err(ClientInstallError::Download)?;
-                        if data.len() != expected as usize {
-                            return Err(ClientInstallError::InvalidChunkSize {
-                                expected,
-                                actual: data.len(),
-                            });
-                        }
-                        Ok::<_, ClientInstallError>(data)
-                    }));
+                    in_flight.push_back(self.spawn_fetch(&windows[next]));
                     next += 1;
                 }
-
-                let Some(fetch) = in_flight.pop_front() else {
+                let Some(mut fetch) = in_flight.pop_front() else {
                     break;
                 };
-                let data = match fetch.await {
+                // Detener no espera a la red: la petición se aborta en el próximo tic.
+                let fetched = loop {
+                    match wait_or_tick(&mut fetch, &mut ticker).await {
+                        Waited::Ready(fetched) => break fetched,
+                        Waited::Tick => {
+                            let checked = if self.cancel.is_cancelled() {
+                                Err(ClientInstallError::Cancelled)
+                            } else {
+                                self.report(detail(index), Report::IfChanged)
+                            };
+                            if let Err(error) = checked {
+                                fetch.abort();
+                                break 'windows Some(error);
+                            }
+                        }
+                    }
+                };
+                let data = match fetched {
                     Ok(Ok(data)) => data,
                     Ok(Err(error)) => break 'windows Some(error),
                     Err(error) => break 'windows Some(ClientInstallError::Worker(error)),
@@ -1511,11 +1960,22 @@ impl Downloader<'_> {
 
                 let mut owned = writer.take().expect("writer is available between windows");
                 let shared = Arc::clone(&windows);
-                let applied = tauri::async_runtime::spawn_blocking(move || {
+                let mut applying = tauri::async_runtime::spawn_blocking(move || {
                     let outcome = owned.apply(&shared[index], &data);
                     (owned, outcome)
-                })
-                .await;
+                });
+                // El disco no se interrumpe a mitad de ventana: la parada espera a que termine
+                // esta, y mientras tanto el progreso de la red se sigue publicando.
+                let mut report_error = None;
+                let applied = loop {
+                    match wait_or_tick(&mut applying, &mut ticker).await {
+                        Waited::Ready(applied) => break applied,
+                        Waited::Tick if report_error.is_none() => {
+                            report_error = self.report(detail(index), Report::IfChanged).err();
+                        }
+                        Waited::Tick => {}
+                    }
+                };
                 match applied {
                     Ok((returned, outcome)) => {
                         writer = Some(returned);
@@ -1525,27 +1985,18 @@ impl Downloader<'_> {
                     }
                     Err(error) => break 'windows Some(ClientInstallError::Worker(error)),
                 }
-
-                let window = &windows[index];
-                self.downloaded_bytes += u64::from(window.end - window.start);
-                let detail = window
-                    .first_placement()
-                    .and_then(|placement| writer.as_ref()?.files.get(placement.file_index))
-                    .map(|file| file.manifest_path.clone())
-                    .unwrap_or_default();
-                if let Err(error) = publish(
-                    self.progress,
-                    self.destination,
-                    "download",
-                    &detail,
-                    self.downloaded_bytes,
-                    Some(self.total_bytes),
-                    false,
-                ) {
+                if let Some(error) = report_error {
+                    break 'windows Some(error);
+                }
+                if self.cancel.is_cancelled() {
+                    break 'windows Some(ClientInstallError::Cancelled);
+                }
+                if let Err(error) = self.report(detail(index + 1), Report::AfterApply) {
                     break 'windows Some(error);
                 }
             }
-            None
+            // Todo aplicado: el último evento de la descarga muestra el total.
+            self.report(detail(windows.len()), Report::Always).err()
         };
 
         for fetch in &in_flight {
@@ -1556,6 +2007,126 @@ impl Downloader<'_> {
             None => (writer, Ok(())),
         }
     }
+
+    fn spawn_fetch(
+        &self,
+        window: &DownloadWindow,
+    ) -> tauri::async_runtime::JoinHandle<Result<Vec<u8>, ClientInstallError>> {
+        tauri::async_runtime::spawn(fetch_window(
+            self.client.clone(),
+            format!("{}/{:016X}.bundle", self.bundle_base, window.bundle_id),
+            (window.start, window.end),
+            self.tuning.retry_delays,
+            Arc::clone(&self.received),
+        ))
+    }
+
+    /// Publica los bytes recibidos hasta ahora. El valor nunca retrocede: si un reintento
+    /// descarta bytes, el progreso espera a que el nuevo intento lo alcance.
+    fn report(&mut self, detail: &str, when: Report) -> Result<(), ClientInstallError> {
+        let received = self.received.load(Ordering::SeqCst).min(self.total_bytes);
+        let bytes = self.reported_bytes.max(received);
+        let due = self
+            .last_report
+            .is_none_or(|last| last.elapsed() >= self.tuning.progress_interval);
+        let now = match when {
+            Report::Always => true,
+            Report::AfterApply => due,
+            Report::IfChanged => due && bytes != self.reported_bytes,
+        };
+        if !now {
+            return Ok(());
+        }
+        self.reported_bytes = bytes;
+        self.last_report = Some(Instant::now());
+        publish(
+            self.progress,
+            self.destination,
+            "download",
+            detail,
+            bytes,
+            Some(self.total_bytes),
+            false,
+        )
+    }
+}
+
+/// Pide un rango de bundle y reintenta en silencio los fallos pasajeros, con las esperas de
+/// `retry_delays`; solo el error del último intento llega a la instalación.
+async fn fetch_window(
+    client: reqwest::Client,
+    url: String,
+    range: (u32, u32),
+    retry_delays: &'static [Duration],
+    received: Arc<AtomicU64>,
+) -> Result<Vec<u8>, ClientInstallError> {
+    let mut delays = retry_delays.iter();
+    loop {
+        let mut counted = 0;
+        let error = match fetch_range(&client, &url, range, &received, &mut counted).await {
+            Ok(data) => return Ok(data),
+            Err(error) => error,
+        };
+        // Lo que llegó en un intento fallido se vuelve a pedir: no cuenta como progreso.
+        received.fetch_sub(counted, Ordering::SeqCst);
+        match delays.next() {
+            Some(delay) if error.is_transient() => tokio::time::sleep(*delay).await,
+            _ => return Err(error),
+        }
+    }
+}
+
+/// Un intento: exige 206 con el `Content-Length` del rango antes de leer el cuerpo, y cuenta los
+/// bytes a medida que llegan.
+async fn fetch_range(
+    client: &reqwest::Client,
+    url: &str,
+    (start, end): (u32, u32),
+    received: &AtomicU64,
+    counted: &mut u64,
+) -> Result<Vec<u8>, ClientInstallError> {
+    let expected = end - start;
+    let mut response = client
+        .get(url)
+        .header(header::RANGE, format!("bytes={start}-{}", end - 1))
+        .send()
+        .await
+        .map_err(ClientInstallError::Download)?
+        .error_for_status()
+        .map_err(ClientInstallError::Download)?;
+    if response.status() != StatusCode::PARTIAL_CONTENT {
+        return Err(ClientInstallError::RangeIgnored(response.status().as_u16()));
+    }
+    let declared = response.content_length();
+    if declared != Some(u64::from(expected)) {
+        return Err(ClientInstallError::InvalidChunkSize {
+            expected,
+            actual: declared,
+        });
+    }
+    let mut data = Vec::with_capacity(expected as usize);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(ClientInstallError::Download)?
+    {
+        if data.len() + chunk.len() > expected as usize {
+            return Err(ClientInstallError::InvalidChunkSize {
+                expected,
+                actual: Some((data.len() + chunk.len()) as u64),
+            });
+        }
+        data.extend_from_slice(&chunk);
+        received.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+        *counted += chunk.len() as u64;
+    }
+    if data.len() != expected as usize {
+        return Err(ClientInstallError::IncompleteRange {
+            expected,
+            actual: data.len(),
+        });
+    }
+    Ok(data)
 }
 
 async fn download_files(
@@ -1572,7 +2143,7 @@ async fn download_files(
     fs::create_dir_all(&temp_dir)?;
     let writer = FileWriter::new(downloader.destination, &temp_dir, files, allow_replace)?;
 
-    let (writer, outcome) = downloader.run(windows, writer).await;
+    let (writer, outcome) = downloader.run(windows, files, writer).await;
     let Some(mut writer) = writer else {
         // Solo ocurre si falló el hilo de escritura; los `.part` se limpian en el próximo intento.
         return outcome;
@@ -1826,16 +2397,52 @@ fn temp_name_for_manifest_path(manifest_path: &str) -> String {
 mod tests {
     use super::*;
     use std::{
-        future::Future,
-        io::{BufRead, BufReader},
+        io::{BufRead, BufReader, Read},
         net::{TcpListener, TcpStream},
         sync::{
             atomic::{AtomicUsize, Ordering},
-            Arc, Mutex,
+            Arc, Condvar, Mutex,
         },
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    /// Reintentos de milisegundos: el mismo camino que en la app, sin esperar un minuto.
+    const FAST_RETRIES: [Duration; 5] = [
+        Duration::from_millis(1),
+        Duration::from_millis(2),
+        Duration::from_millis(4),
+        Duration::from_millis(8),
+        Duration::from_millis(16),
+    ];
+
+    /// Ajustes de las pruebas: reintentos rápidos, sin estancamientos previstos (el tiempo de
+    /// espera no se agota mientras el CDN retiene una petición) y un evento de progreso tras cada
+    /// ventana aplicada.
+    fn test_tuning(connections: usize, max_window: u32) -> DownloadTuning {
+        DownloadTuning {
+            connections,
+            max_window,
+            retry_delays: &FAST_RETRIES,
+            read_timeout: Duration::from_secs(10),
+            progress_interval: Duration::ZERO,
+        }
+    }
+
+    /// Estado local de una sola versión.
+    fn status_of(root: &str, version: &str) -> LocalClientStatus {
+        local_client_statuses(root, &[version.to_string()]).unwrap()[version].clone()
+    }
+
+    fn confirm(plan: &ClientInstallPlan) -> ConfirmedPlan {
+        ConfirmedPlan {
+            mode: plan.mode,
+            resolved_version: plan.resolved_version.clone(),
+            destination_path: plan.destination_path.clone(),
+            locale: plan.locale.clone(),
+            manifest_url: plan.manifest_url.clone(),
+        }
+    }
 
     #[test]
     fn normalizes_versions_regions_and_client_folders() {
@@ -2034,9 +2641,10 @@ mod tests {
         ));
     }
 
-    /// Flujo completo contra un CDN local: plan → instalación interrumpida → reanudación →
-    /// reparación confirmada → listo, sin tocar archivos ajenos al manifiesto y quitando al
-    /// confirmar los temporales que dejó un corte.
+    /// Flujo completo contra un CDN local: plan → confirmaciones que no coinciden → instalación
+    /// interrumpida tras agotar los reintentos → reanudación por el camino predeterminado mientras
+    /// una segunda instalación se rechaza → reparación que sobrevive a fallos pasajeros → listo,
+    /// sin tocar archivos ajenos al manifiesto y quitando al confirmar los temporales de un corte.
     #[test]
     fn e2e_installs_resumes_repairs_and_reuses_a_client_from_a_local_cdn() {
         let fixture = build_fixture();
@@ -2050,15 +2658,13 @@ mod tests {
             );
         }
         // Sieve solo conoce el parche vigente; la compilación de la repetición sale del índice.
+        let live_manifest = format!(
+            "{}/channels/public/releases/000000000000AAAA.manifest",
+            cdn.base
+        );
         cdn.route(
             "/api/v1/products/lol/version-sets/LA2",
-            sieve_json(&[(
-                "16.19.8217343",
-                format!(
-                    "{}/channels/public/releases/000000000000AAAA.manifest",
-                    cdn.base
-                ),
-            )]),
+            sieve_json(&[("16.19.8217343", live_manifest.clone())]),
         );
         cdn.route(
             "/index/LoL/LA2/windows/lol-game-client/16.18.8175716.txt",
@@ -2076,25 +2682,19 @@ mod tests {
             region: Some("la2".to_string()),
             locale: "es_MX".to_string(),
             clients_root: root.display().to_string(),
-            confirmed: confirmed.map(|plan| ConfirmedPlan {
-                mode: plan.mode,
-                resolved_version: plan.resolved_version.clone(),
-                destination_path: plan.destination_path.clone(),
-            }),
+            confirmed: confirmed.map(confirm),
         };
-        let plan = |request: ClientInstallRequest| {
+        let planned_with = |sink: &dyn ProgressSink, request: ClientInstallRequest| {
             run(async {
                 let client = http_client().unwrap();
-                build_install_plan(&client, &progress, &endpoints, &request)
-                    .await
-                    .map(|planned| planned.plan)
+                build_install_plan(&client, sink, &endpoints, &request).await
             })
         };
-        // Ventanas de un solo fragmento y 3 conexiones: varias peticiones en vuelo a la vez.
-        let tuning = DownloadTuning {
-            connections: 3,
-            max_window: 1,
+        let plan = |request: ClientInstallRequest| {
+            planned_with(&progress, request).map(|planned| planned.plan)
         };
+        // Ventanas de un solo fragmento y 3 conexiones: varias peticiones en vuelo a la vez.
+        let tuning = test_tuning(3, 1);
         let never = CancelSignal::default();
         let install = |request: ClientInstallRequest| {
             run(install_client_with(
@@ -2103,7 +2703,10 @@ mod tests {
         };
         let root_text = root.display().to_string();
         let destination = root.join("16.18.817.5716").join(GAME_FOLDER);
-        let temp_dir = destination.join(METADATA_DIR).join("tmp");
+        let metadata_dir = destination.join(METADATA_DIR);
+        let temp_dir = metadata_dir.join("tmp");
+        let (bundle_a1, bundle_b2) = ("00000000000000A1.bundle", "00000000000000B2.bundle");
+        let attempts = 1 + FAST_RETRIES.len();
 
         // 1. Plan inicial: fuente visible, destino por compilación y nada escrito en disco.
         let first = plan(request(None)).unwrap();
@@ -2120,24 +2723,77 @@ mod tests {
         assert_eq!(first.download_bytes, fixture.download_bytes);
         assert!(!root.join("16.18.817.5716").exists());
 
-        // 2. Sin confirmación no se escribe nada.
+        // 2. Sin confirmación, o con otro idioma u otro manifiesto que los del plan revisado, no
+        //    se escribe nada.
         assert!(matches!(
             install(request(None)),
             Err(ClientInstallError::ConfirmationRequired { .. })
         ));
+        let other_locale = ClientInstallRequest {
+            confirmed: Some(ConfirmedPlan {
+                locale: "fr_FR".to_string(),
+                ..confirm(&first)
+            }),
+            ..request(None)
+        };
+        assert_eq!(
+            install(other_locale).unwrap_err().to_string(),
+            "El plan cambió de idioma: es_MX en lugar de fr_FR"
+        );
+        let other_manifest = ClientInstallRequest {
+            confirmed: Some(ConfirmedPlan {
+                manifest_url: live_manifest.clone(),
+                ..confirm(&first)
+            }),
+            ..request(None)
+        };
+        assert!(matches!(
+            install(other_manifest),
+            Err(ClientInstallError::ManifestChanged(_))
+        ));
         assert!(!destination.exists());
 
-        // 3. Interrupción: el bundle B2 falla. Las ventanas se aplican en orden, así que el
-        //    ejecutable y el archivo que comparte su primer fragmento quedan confirmados y el
-        //    resto no, aunque otras peticiones estuvieran en vuelo.
-        cdn.fail_paths_containing(Some("00000000000000B2.bundle"));
-        let failed = install(request(Some(&first))).unwrap_err();
+        // 3. Interrupción: el bundle B2 falla siempre. Cada ventana hace 1 intento y 5 reintentos
+        //    antes de rendirse. Las ventanas se aplican en orden, así que el ejecutable y el
+        //    archivo que comparte su primer fragmento quedan confirmados y el resto no, aunque
+        //    otras peticiones estuvieran en vuelo. Mientras el ejecutable está a medio armar, su
+        //    `.part` es disperso.
+        cdn.fail_paths_containing(Some(bundle_b2));
+        let probe = PartProbe {
+            temp_dir: temp_dir.clone(),
+            seen: Mutex::default(),
+        };
+        let failed = run(install_client_with(
+            &probe,
+            &endpoints,
+            request(Some(&first)),
+            tuning,
+            &never,
+        ))
+        .unwrap_err();
         assert!(matches!(failed, ClientInstallError::Download(_)));
-        // El motivo de red llega en español, con el host.
+        // Tras los reintentos llega el motivo de red en español, con el host.
         assert_eq!(
             failed.to_string(),
             "Falló la descarga: HTTP 500 (127.0.0.1)"
         );
+        cdn.wait_until_idle();
+        let log = cdn.take_bundle_log();
+        // La ventana que se esperaba es la primera de B2 (desde el byte 0).
+        assert_eq!(range_requests(&log, bundle_b2, 0), attempts);
+        assert!(log
+            .iter()
+            .all(|(path, start)| range_requests(&log, path, *start) <= attempts));
+        #[cfg(windows)]
+        {
+            let seen = probe.seen.lock().unwrap();
+            assert!(
+                seen.iter()
+                    .any(|(name, _)| name.ends_with("League_of_Legends.exe.part")),
+                "{seen:?}"
+            );
+            assert!(seen.iter().all(|(_, sparse)| *sparse), "{seen:?}");
+        }
         for path in [GAME_EXE, "DATA/FINAL/Shared.wad.client"] {
             assert_eq!(
                 fs::read(destination.join(path)).unwrap(),
@@ -2153,7 +2809,7 @@ mod tests {
         }
         assert!(eventually_empty(&temp_dir));
         // El estado local ve la instalación a medias, con el total del plan confirmado.
-        let partial = local_client_status(&root_text, "16.18.817.5716").unwrap();
+        let partial = status_of(&root_text, "16.18.817.5716");
         assert_eq!(partial.state, LocalClientState::Partial);
         assert_eq!(partial.total_install_bytes, Some(first.total_install_bytes));
         assert_eq!(
@@ -2164,28 +2820,88 @@ mod tests {
         assert!(partial.executable_path.is_none());
         fs::write(destination.join("user-notes.txt"), b"mine").unwrap();
 
-        // 4. Reanudación: reutiliza lo confirmado y pide solo los rangos que faltan, en paralelo.
+        // 4. Reanudación por el camino predeterminado (8 conexiones, ventanas de hasta 8 MiB):
+        //    reutiliza lo confirmado y pide solo lo que falta, con los fragmentos contiguos
+        //    fusionados y en paralelo. Mientras el CDN retiene esas peticiones, una segunda
+        //    instalación se rechaza en este proceso y también desde otro (el candado del destino),
+        //    sin que la limpieza de temporales llegue a correr.
         cdn.fail_paths_containing(None);
-        let resume = plan(request(None)).unwrap();
+        let resume_planned = planned_with(&progress, request(None)).unwrap();
+        let resume = resume_planned.plan.clone();
         assert_eq!(resume.mode, ClientWorkMode::Resume);
         assert_eq!(
             (resume.reused_file_count, resume.affected_file_count),
             (2, 2)
         );
+        let merged = DownloadTuning {
+            retry_delays: &FAST_RETRIES,
+            read_timeout: Duration::from_secs(10),
+            progress_interval: Duration::ZERO,
+            ..DownloadTuning::with_connections(None)
+        };
+        let windows = plan_download_windows(&resume_planned.pending_files, merged.max_window)
+            .unwrap()
+            .len();
+        let chunks = resume_planned
+            .pending_files
+            .iter()
+            .map(|file| file.chunks.len())
+            .sum::<usize>();
+        assert!(windows < chunks, "{windows} windows for {chunks} chunks");
         progress.take();
         // Lo que el paso 3 dejó en vuelo no debe contarse como tráfico de la reanudación.
         cdn.wait_until_idle();
         cdn.reset_peak();
         let (requests_before, bytes_before) = cdn.bundle_traffic();
-        let installed = install(request(Some(&resume))).unwrap();
+        let lock = metadata_dir.join(LOCK_FILE);
+        let installed = thread::scope(|scope| {
+            let held = cdn.hold("/bundles/");
+            let running = scope.spawn(|| {
+                run(install_client_with(
+                    &progress,
+                    &endpoints,
+                    request(Some(&resume)),
+                    merged,
+                    &never,
+                ))
+            });
+            // Todas las ventanas de la primera quedan retenidas: no hace más peticiones.
+            cdn.wait_for_held(windows);
+            // En el mismo proceso se rechaza al instante, sin consultar la red ni tocar la señal
+            // de parada de la primera.
+            let requests = cdn.requests();
+            let same_process = install(request(Some(&resume))).unwrap_err();
+            assert!(matches!(same_process, ClientInstallError::AlreadyRunning));
+            assert_eq!(same_process.to_string(), "Ya hay una descarga en curso.");
+            assert_eq!(cdn.requests(), requests);
+            // Otra instancia confirma un plan recién revisado: el candado la frena antes de
+            // limpiar temporales, así que un `.part` ajeno sigue en su lugar.
+            assert!(lock.is_file());
+            let foreign = temp_dir.join("99999-other-install.part");
+            fs::create_dir_all(&temp_dir).unwrap();
+            fs::write(&foreign, b"in use").unwrap();
+            let quiet = ProgressLog::default();
+            let fresh = planned_with(&quiet, request(None)).unwrap().plan;
+            let other_process = run(install_client_with(
+                &quiet,
+                &endpoints,
+                request(Some(&fresh)),
+                merged,
+                &CancelSignal::default(),
+            ))
+            .unwrap_err();
+            assert_eq!(other_process.to_string(), "Ya hay una descarga en curso.");
+            assert!(foreign.is_file());
+            fs::remove_file(&foreign).unwrap();
+            drop(held);
+            running.join().unwrap()
+        })
+        .unwrap();
+        assert!(!lock.exists());
         let (requests_after, bytes_after) = cdn.bundle_traffic();
-        assert_eq!(requests_after - requests_before, 3);
+        assert_eq!(requests_after - requests_before, windows);
         assert_eq!((bytes_after - bytes_before) as u64, resume.download_bytes);
-        let peak = cdn.peak_bundle_requests();
-        assert!(
-            (2..=3).contains(&peak),
-            "concurrent bundle requests: {peak}"
-        );
+        assert_eq!(cdn.peak_bundle_requests(), windows);
         assert_eq!(
             installed.executable_path,
             destination.join(GAME_EXE).display().to_string()
@@ -2204,21 +2920,48 @@ mod tests {
             .join("DATA/FINAL/Bootstrap.macos.wad.client")
             .exists());
         assert!(!temp_dir.exists() || eventually_empty(&temp_dir));
-        let metadata: serde_json::Value = serde_json::from_slice(
-            &fs::read(destination.join(METADATA_DIR).join(INSTALL_METADATA)).unwrap(),
-        )
-        .unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(metadata_dir.join(INSTALL_METADATA)).unwrap())
+                .unwrap();
         assert_eq!(metadata["gameBuild"], "16.18.817.5716");
         assert_eq!(metadata["source"], "manifestIndex");
-        assert!(!destination.join(METADATA_DIR).join(PLAN_METADATA).exists());
-        let ready = local_client_status(&root_text, "16.18.817.5716").unwrap();
-        assert_eq!(ready.state, LocalClientState::Ready);
+        assert!(!metadata_dir.join(PLAN_METADATA).exists());
+        // Estado local: el cliente listo; otra compilación del mismo parche sin cliente propio usa
+        // este (no exacto); otro parche sigue ausente y una versión ilegible se omite.
+        let statuses = local_client_statuses(
+            &root_text,
+            &[
+                "16.18.817.5716".to_string(),
+                "16.18.820.1234".to_string(),
+                "16.17.810.4348".to_string(),
+                "not-a-version".to_string(),
+            ],
+        )
+        .unwrap();
+        let ready = statuses["16.18.817.5716"].clone();
+        assert_eq!(
+            (ready.state, ready.exact_build),
+            (LocalClientState::Ready, true)
+        );
         assert_eq!(
             ready.executable_path.as_deref(),
             Some(installed.executable_path.as_str())
         );
         assert_eq!(ready.locale.as_deref(), Some("es_MX"));
         assert_eq!(ready.total_install_bytes, Some(fixture.selected_bytes()));
+        assert_eq!(
+            statuses["16.18.820.1234"],
+            LocalClientStatus {
+                exact_build: false,
+                ..ready.clone()
+            }
+        );
+        let other_patch = &statuses["16.17.810.4348"];
+        assert_eq!(
+            (other_patch.state, other_patch.exact_build),
+            (LocalClientState::Missing, true)
+        );
+        assert!(!statuses.contains_key("not-a-version"));
         assert_eq!(list_local_clients(&root_text).unwrap(), vec![ready]);
 
         let events = progress.take();
@@ -2231,14 +2974,17 @@ mod tests {
             .iter()
             .filter(|event| event.stage == "download")
             .collect::<Vec<_>>();
-        assert_eq!(downloads.len(), 3);
         assert_eq!(
-            downloads[0].detail,
-            "DATA/FINAL/Champions/Aatrox.es_MX.wad.client"
+            (downloads[0].downloaded_bytes, downloads[0].detail.as_str()),
+            (0, "DATA/FINAL/Champions/Aatrox.es_MX.wad.client")
         );
         assert!(downloads
             .windows(2)
-            .all(|pair| pair[0].downloaded_bytes < pair[1].downloaded_bytes));
+            .all(|pair| pair[0].downloaded_bytes <= pair[1].downloaded_bytes));
+        assert_eq!(
+            downloads.last().unwrap().downloaded_bytes,
+            resume.download_bytes
+        );
         assert!(installed.download_seconds >= 0.0);
         let last = events.last().unwrap();
         assert!(last.done && last.stage == "complete");
@@ -2258,18 +3004,64 @@ mod tests {
             Err(ClientInstallError::ConfirmationRequired { .. })
         ));
         assert_eq!(fs::read(destination.join(GAME_EXE)).unwrap(), b"truncated");
+        // Si la red se cae antes de confirmar un archivo, `install.json` sigue: el cliente no
+        // cambió y se sigue viendo listo.
+        let impatient = DownloadTuning {
+            read_timeout: Duration::from_millis(300),
+            ..merged
+        };
+        let repair_with = |sink: &dyn ProgressSink| {
+            run(install_client_with(
+                sink,
+                &endpoints,
+                request(Some(&repair)),
+                impatient,
+                &never,
+            ))
+        };
+        cdn.fail_paths_containing(Some(bundle_a1));
+        assert!(repair_with(&progress).is_err());
+        assert!(metadata_dir.join(INSTALL_METADATA).is_file());
+        assert_eq!(
+            status_of(&root_text, "16.18.817.5716").state,
+            LocalClientState::Ready
+        );
+        // Un 503 y una respuesta que se cuelga a mitad del cuerpo se reintentan en silencio: el
+        // cuelgue se detecta por inactividad (300 ms aquí), sin esperar a que el CDN cierre. El
+        // progreso avanza con los bytes que llegan, antes de aplicar la ventana.
+        cdn.fail_paths_containing(None);
+        cdn.fail_next(bundle_a1, 1, 503);
+        cdn.stall_next(bundle_a1, 1);
+        cdn.wait_until_idle();
+        cdn.take_bundle_log();
+        progress.take();
         let (_, bytes_before) = cdn.bundle_traffic();
-        install(request(Some(&repair))).unwrap();
+        let started = Instant::now();
+        repair_with(&progress).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the stalled window took {:?}",
+            started.elapsed()
+        );
         let (_, bytes_after) = cdn.bundle_traffic();
         assert_eq!((bytes_after - bytes_before) as u64, repair.download_bytes);
+        assert_eq!(range_requests(&cdn.take_bundle_log(), bundle_a1, 0), 3);
+        assert!(progress.take().iter().any(|event| event.stage == "download"
+            && event.downloaded_bytes > 0
+            && event.downloaded_bytes < repair.download_bytes));
         assert_eq!(
             fs::read(destination.join(GAME_EXE)).unwrap(),
             fixture.content(GAME_EXE)
         );
+        let repaired: serde_json::Value =
+            serde_json::from_slice(&fs::read(metadata_dir.join(INSTALL_METADATA)).unwrap())
+                .unwrap();
+        assert_eq!(repaired["mode"], "repair");
 
         // 6. Listo: nada que descargar ni peticiones de bundle. Un corte entre los dos renombres
         //    de una reparación deja un `.backup` huérfano: planificar no lo toca y confirmar el
-        //    plan lo quita junto con los `.part` viejos.
+        //    plan lo quita junto con los `.part` viejos. `install.json` conserva los datos de la
+        //    descarga que armó el cliente.
         fs::create_dir_all(&temp_dir).unwrap();
         let orphans = [
             temp_dir.join("00000-League_of_Legends.exe.part.backup"),
@@ -2278,14 +3070,19 @@ mod tests {
         for orphan in &orphans {
             fs::write(orphan, b"interrupted").unwrap();
         }
-        let ready = plan(request(None)).unwrap();
-        assert_eq!(ready.mode, ClientWorkMode::Ready);
-        assert_eq!(ready.download_bytes, 0);
+        let ready_plan = plan(request(None)).unwrap();
+        assert_eq!(ready_plan.mode, ClientWorkMode::Ready);
+        assert_eq!(ready_plan.download_bytes, 0);
         assert!(orphans.iter().all(|orphan| orphan.is_file()));
+        let stored = fs::read(metadata_dir.join(INSTALL_METADATA)).unwrap();
         let (requests_before, _) = cdn.bundle_traffic();
-        install(request(Some(&ready))).unwrap();
+        install(request(Some(&ready_plan))).unwrap();
         assert_eq!(cdn.bundle_traffic().0, requests_before);
         assert!(!temp_dir.exists() || eventually_empty(&temp_dir));
+        assert_eq!(
+            fs::read(metadata_dir.join(INSTALL_METADATA)).unwrap(),
+            stored
+        );
 
         // Los archivos ajenos al manifiesto siguen intactos.
         assert_eq!(fs::read(root.join("keep-me.txt")).unwrap(), b"unrelated");
@@ -2296,8 +3093,10 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Detener a mitad de la descarga conserva lo confirmado, no deja temporales, deja el estado
-    /// local en "incompleto" con el total del plan y la reanudación termina el cliente.
+    /// Detener mientras el CDN retiene una ventana vuelve enseguida, conserva lo confirmado, no
+    /// deja temporales ni candado, deja el estado local en "incompleto" con el total del plan y la
+    /// reanudación termina el cliente. El estado distingue una carpeta que todavía no existe de una
+    /// unidad que no está.
     #[test]
     fn e2e_stopping_keeps_committed_files_and_resuming_finishes_the_client() {
         let fixture = build_fixture();
@@ -2335,11 +3134,7 @@ mod tests {
             region: Some("LA2".to_string()),
             locale: "es_MX".to_string(),
             clients_root: root_text.clone(),
-            confirmed: confirmed.map(|plan| ConfirmedPlan {
-                mode: plan.mode,
-                resolved_version: plan.resolved_version.clone(),
-                destination_path: plan.destination_path.clone(),
-            }),
+            confirmed: confirmed.map(confirm),
         };
         let plan = |request: ClientInstallRequest| {
             run(async {
@@ -2350,51 +3145,97 @@ mod tests {
             })
         };
         // Una conexión y ventanas de un fragmento: la parada ocurre en un punto conocido.
-        let tuning = DownloadTuning {
-            connections: 1,
-            max_window: 1,
-        };
+        let tuning = test_tuning(1, 1);
         let destination = root.join("16.18.817.5716").join(GAME_FOLDER);
 
-        // Consultar el estado de una compilación ausente no crea carpetas.
-        let missing = local_client_status(&root_text, "16.18.817.5716").unwrap();
-        assert_eq!(missing.state, LocalClientState::Missing);
+        // Consultar el estado de una compilación ausente no crea carpetas, y una carpeta de
+        // clientes que todavía no existe no es un error.
+        let missing = status_of(&root_text, "16.18.817.5716");
+        assert_eq!(
+            (missing.state, missing.exact_build),
+            (LocalClientState::Missing, true)
+        );
         assert!(!root.join("16.18.817.5716").exists());
         assert!(list_local_clients(&root_text).unwrap().is_empty());
+        let not_created = root.join("not-created");
+        let not_created_text = not_created.display().to_string();
+        assert_eq!(
+            status_of(&not_created_text, "16.18.817.5716").state,
+            LocalClientState::Missing
+        );
+        assert!(list_local_clients(&not_created_text).unwrap().is_empty());
+        assert!(!not_created.exists());
+        // Una unidad que no está (un disco USB desconectado) sí lo es, con la ruta.
+        #[cfg(windows)]
+        if let Some(drive) = ('F'..='Z')
+            .rev()
+            .map(|letter| format!("{letter}:\\"))
+            .find(|drive| !Path::new(drive).exists())
+        {
+            let unplugged = format!("{drive}ChronoRift");
+            assert_eq!(
+                local_client_statuses(&unplugged, &["16.18.817.5716".to_string()])
+                    .unwrap_err()
+                    .to_string(),
+                format!("La carpeta de clientes no está disponible: {unplugged}")
+            );
+            assert!(matches!(
+                list_local_clients(&unplugged),
+                Err(ClientInstallError::ClientsRootUnavailable(_))
+            ));
+        }
 
+        // El CDN retiene el bundle B2: cuando la instalación espera esa ventana, el ejecutable y
+        // el archivo que comparte su primer fragmento ya están confirmados.
         let first = plan(request(None)).unwrap();
         let cancel = CancelSignal::default();
-        let stopped = run(install_client_with(
-            &CancelOnDownload(cancel.clone()),
-            &endpoints,
-            request(Some(&first)),
-            tuning,
-            &cancel,
-        ));
-        assert!(matches!(stopped, Err(ClientInstallError::Cancelled)));
+        let stopped = thread::scope(|scope| {
+            let _held = cdn.hold("00000000000000B2.bundle");
+            let running = scope.spawn(|| {
+                run(install_client_with(
+                    &ProgressLog::default(),
+                    &endpoints,
+                    request(Some(&first)),
+                    tuning,
+                    &cancel,
+                ))
+            });
+            cdn.wait_for_held(1);
+            let asked = Instant::now();
+            cancel.cancel();
+            let stopped = running.join().unwrap();
+            // Detener no espera a la ventana retenida.
+            assert!(
+                asked.elapsed() < Duration::from_secs(1),
+                "stopping took {:?}",
+                asked.elapsed()
+            );
+            stopped
+        });
+        assert_eq!(stopped.unwrap_err().to_string(), "Descarga detenida");
         let temp_dir = destination.join(METADATA_DIR).join("tmp");
         assert!(!temp_dir.exists() || eventually_empty(&temp_dir));
+        assert!(!destination.join(METADATA_DIR).join(LOCK_FILE).exists());
 
         let committed = fixture
             .selected()
             .filter(|(path, _, _)| destination.join(path).is_file())
             .map(|(_, content, _)| content.len() as u64)
             .sum::<u64>();
-        let partial = local_client_status(&root_text, "16.18.817.5716").unwrap();
+        assert_eq!(
+            committed,
+            (fixture.content(GAME_EXE).len()
+                + fixture.content("DATA/FINAL/Shared.wad.client").len()) as u64
+        );
+        let partial = status_of(&root_text, "16.18.817.5716");
         assert_eq!(partial.state, LocalClientState::Partial);
         assert_eq!(partial.total_install_bytes, Some(first.total_install_bytes));
         assert_eq!(partial.installed_bytes, committed);
-        assert!(committed < first.total_install_bytes);
         assert_eq!(list_local_clients(&root_text).unwrap(), vec![partial]);
 
-        cancel.reset();
+        // La señal quedó en "detenida": la próxima instalación la limpia al empezar.
         let resume = plan(request(None)).unwrap();
-        let expected = if committed > 0 {
-            ClientWorkMode::Resume
-        } else {
-            ClientWorkMode::Install
-        };
-        assert_eq!(resume.mode, expected);
+        assert_eq!(resume.mode, ClientWorkMode::Resume);
         run(install_client_with(
             &ProgressLog::default(),
             &endpoints,
@@ -2403,7 +3244,7 @@ mod tests {
             &cancel,
         ))
         .unwrap();
-        let ready = local_client_status(&root_text, "16.18.817.5716").unwrap();
+        let ready = status_of(&root_text, "16.18.817.5716");
         assert_eq!(ready.state, LocalClientState::Ready);
         assert_eq!(ready.installed_bytes, fixture.selected_bytes());
         assert_eq!(ready.total_install_bytes, Some(fixture.selected_bytes()));
@@ -2417,21 +3258,52 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Detiene la instalación en el primer evento de descarga, como el botón Detener.
-    struct CancelOnDownload(CancelSignal);
+    /// Anota, en cada evento de descarga, los `.part` de la carpeta temporal y si son dispersos.
+    struct PartProbe {
+        temp_dir: PathBuf,
+        seen: Mutex<Vec<(String, bool)>>,
+    }
 
-    impl ProgressSink for CancelOnDownload {
+    impl ProgressSink for PartProbe {
         fn publish(&self, progress: ClientInstallProgress) -> Result<(), ClientInstallError> {
-            if progress.stage == "download" {
-                self.0.cancel();
+            if progress.stage != "download" {
+                return Ok(());
             }
+            let parts = fs::read_dir(&self.temp_dir)
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "part")
+                })
+                .map(|path| {
+                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                    (name, is_sparse(&path))
+                })
+                .collect::<Vec<_>>();
+            self.seen.lock().unwrap().extend(parts);
             Ok(())
         }
     }
 
+    #[cfg(windows)]
+    fn is_sparse(path: &Path) -> bool {
+        use std::os::windows::fs::MetadataExt;
+        // FILE_ATTRIBUTE_SPARSE_FILE
+        fs::metadata(path).is_ok_and(|metadata| metadata.file_attributes() & 0x200 != 0)
+    }
+
+    #[cfg(not(windows))]
+    fn is_sparse(_path: &Path) -> bool {
+        false
+    }
+
     /// Resolución de compilaciones: Sieve exacto, índice (con región de respaldo), compilación
-    /// cercana marcada como no exacta, URL fuera del CDN rechazada, redirecciones solo dentro del
-    /// mismo origen (con el motivo en español), idioma mal escrito o ausente y versión inexistente.
+    /// cercana marcada como no exacta solo si el índice no la tiene, fallos del índice y de Sieve
+    /// informados, URL fuera del CDN rechazada, redirecciones solo dentro del mismo origen (con el
+    /// motivo en español), idioma mal escrito o ausente y versión inexistente.
     #[test]
     fn e2e_resolves_sieve_then_index_and_rejects_untrusted_manifests() {
         let fixture = build_fixture();
@@ -2510,6 +3382,37 @@ mod tests {
                 closest.resolved_version.as_str()
             ),
             (ReleaseSource::Sieve, false, "16.19.8217343")
+        );
+
+        // Solo un "no está" del índice lleva a esa compilación no exacta. Un fallo en la región
+        // de la repetición no impide probar las de respaldo…
+        cdn.fail_paths_containing(Some("/LA2/windows/lol-game-client/16.19.8201111.txt"));
+        cdn.route(
+            "/index/LoL/NA1/windows/lol-game-client/16.19.8201111.txt",
+            format!("{}{index_manifest}", cdn.base),
+        );
+        let other_region = plan_for("16.19", "16.19.820.1111").unwrap();
+        assert_eq!(
+            (other_region.source, other_region.exact_build),
+            (ReleaseSource::ManifestIndex, true)
+        );
+        // …y si ninguna da la URL, ese fallo se informa en lugar de ofrecer otra compilación.
+        cdn.fault(
+            "/LA2/windows/lol-game-client/16.19.8222222.txt",
+            None,
+            FaultKind::Status(429),
+        );
+        assert_eq!(
+            plan_for("16.19", "16.19.822.2222").unwrap_err().to_string(),
+            "No se pudo leer el índice riot-manifests: HTTP 429 (127.0.0.1)"
+        );
+        // Si Sieve también falla, se informan los dos motivos.
+        cdn.fail_next("/api/v1/products/lol/version-sets/LA2", 1, 503);
+        assert_eq!(
+            plan_for("16.19", "16.19.822.2222")
+                .unwrap_err()
+                .to_string(),
+            "No se pudo consultar Riot Sieve: HTTP 503 (127.0.0.1). No se pudo leer el índice riot-manifests: HTTP 429 (127.0.0.1)"
         );
 
         assert!(matches!(
@@ -2699,11 +3602,7 @@ mod tests {
         assert!(Path::new(&plan.destination_path)
             .starts_with(settings::normalize_clients_root(&root).unwrap()));
 
-        let confirmed = ConfirmedPlan {
-            mode: plan.mode,
-            resolved_version: plan.resolved_version.clone(),
-            destination_path: plan.destination_path.clone(),
-        };
+        let confirmed = confirm(&plan);
         let started = Instant::now();
         let result = run(install_client_with(
             &sink,
@@ -2826,18 +3725,53 @@ mod tests {
         /// Ruta → `Location` de un 302.
         redirects: Mutex<HashMap<String, String>>,
         requests: AtomicUsize,
-        failing_path: Mutex<Option<String>>,
+        /// Fallos inducidos: vale el primero cuyo fragmento aparece en la ruta y aún tiene usos.
+        faults: Mutex<Vec<Fault>>,
+        /// Mientras tiene un fragmento, las peticiones cuya ruta lo contiene esperan.
+        hold: Mutex<Option<String>>,
+        hold_changed: Condvar,
+        held_requests: AtomicUsize,
+        /// Peticiones de bundle recibidas: ruta e inicio del rango.
+        bundle_log: Mutex<Vec<(String, usize)>>,
         bundle_requests: AtomicUsize,
+        /// Bytes de las respuestas 206 servidas completas.
         bundle_bytes: AtomicUsize,
         active_bundle_requests: AtomicUsize,
         peak_bundle_requests: AtomicUsize,
         open_connections: AtomicUsize,
     }
 
-    /// CDN HTTP mínimo sobre `TcpListener`: rutas fijas, peticiones Range y fallos inducidos.
+    struct Fault {
+        fragment: String,
+        /// Usos que quedan; `None`, siempre.
+        remaining: Option<usize>,
+        kind: FaultKind,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FaultKind {
+        /// Responde este estado sin cuerpo.
+        Status(u16),
+        /// Envía los encabezados y la mitad del cuerpo, y deja de enviar sin cerrar.
+        Stall,
+    }
+
+    /// CDN HTTP mínimo sobre `TcpListener`: rutas fijas, peticiones Range, fallos inducidos y
+    /// peticiones retenidas.
     struct TestCdn {
         base: String,
         state: Arc<CdnState>,
+    }
+
+    /// Suelta las peticiones retenidas al salir, también si una aserción falla: así ningún hilo
+    /// queda esperando al servidor.
+    struct Held<'a>(&'a CdnState);
+
+    impl Drop for Held<'_> {
+        fn drop(&mut self) {
+            *self.0.hold.lock().unwrap() = None;
+            self.0.hold_changed.notify_all();
+        }
     }
 
     impl TestCdn {
@@ -2882,8 +3816,51 @@ mod tests {
             self.state.requests.load(Ordering::SeqCst)
         }
 
+        fn fault(&self, fragment: &str, remaining: Option<usize>, kind: FaultKind) {
+            self.state.faults.lock().unwrap().push(Fault {
+                fragment: fragment.to_string(),
+                remaining,
+                kind,
+            });
+        }
+
+        /// Con un fragmento, esas rutas responden 500 siempre; con `None`, se quitan todos los
+        /// fallos inducidos.
         fn fail_paths_containing(&self, fragment: Option<&str>) {
-            *self.state.failing_path.lock().unwrap() = fragment.map(str::to_string);
+            match fragment {
+                Some(fragment) => self.fault(fragment, None, FaultKind::Status(500)),
+                None => self.state.faults.lock().unwrap().clear(),
+            }
+        }
+
+        /// Las próximas `times` peticiones a esas rutas responden `status`.
+        fn fail_next(&self, fragment: &str, times: usize, status: u16) {
+            self.fault(fragment, Some(times), FaultKind::Status(status));
+        }
+
+        /// Las próximas `times` peticiones a esas rutas se cuelgan a mitad del cuerpo.
+        fn stall_next(&self, fragment: &str, times: usize) {
+            self.fault(fragment, Some(times), FaultKind::Stall);
+        }
+
+        /// Retiene las peticiones cuya ruta contiene `fragment` hasta soltar el guardia.
+        fn hold(&self, fragment: &str) -> Held<'_> {
+            *self.state.hold.lock().unwrap() = Some(fragment.to_string());
+            Held(&self.state)
+        }
+
+        /// Espera a que el servidor retenga `count` peticiones.
+        fn wait_for_held(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.state.held_requests.load(Ordering::SeqCst) < count {
+                assert!(Instant::now() < deadline, "no request reached the hold");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// Peticiones de bundle desde la última llamada: ruta e inicio del rango.
+        fn take_bundle_log(&self) -> Vec<(String, usize)> {
+            std::mem::take(&mut *self.state.bundle_log.lock().unwrap())
         }
 
         fn reset_peak(&self) {
@@ -2929,6 +3906,13 @@ mod tests {
                 manifest_hosts: ManifestHosts::Origin(self.base.clone()),
             }
         }
+    }
+
+    /// Veces que se pidió el rango que empieza en `start` de un bundle.
+    fn range_requests(log: &[(String, usize)], bundle: &str, start: usize) -> usize {
+        log.iter()
+            .filter(|(path, from)| path.contains(bundle) && *from == start)
+            .count()
     }
 
     fn serve_request(stream: TcpStream, state: &CdnState) {
@@ -2978,38 +3962,67 @@ mod tests {
             return;
         }
 
+        {
+            let retained = |hold: &Option<String>| {
+                hold.as_deref()
+                    .is_some_and(|fragment| path.contains(fragment))
+            };
+            let mut hold = state.hold.lock().unwrap();
+            if retained(&hold) {
+                state.held_requests.fetch_add(1, Ordering::SeqCst);
+                while retained(&hold) {
+                    hold = state.hold_changed.wait(hold).unwrap();
+                }
+                state.held_requests.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
         let is_bundle = path.contains("/bundles/");
         if is_bundle {
+            state
+                .bundle_log
+                .lock()
+                .unwrap()
+                .push((path.clone(), range.map_or(0, |(from, _)| from)));
             // Respuesta lenta a propósito para que las peticiones concurrentes se solapen.
             let active = state.active_bundle_requests.fetch_add(1, Ordering::SeqCst) + 1;
             state
                 .peak_bundle_requests
                 .fetch_max(active, Ordering::SeqCst);
-            thread::sleep(std::time::Duration::from_millis(40));
+            thread::sleep(Duration::from_millis(40));
         }
-        let body = state.routes.lock().unwrap().get(&path).cloned();
-        let failing = state
-            .failing_path
-            .lock()
-            .unwrap()
-            .as_deref()
-            .is_some_and(|fragment| path.contains(fragment));
-        let (status, payload) = match body {
-            Some(_) if failing => ("500 Internal Server Error", Vec::new()),
-            Some(bytes) => match range {
-                Some((from, to)) if from <= to && to < bytes.len() => {
-                    ("206 Partial Content", bytes[from..=to].to_vec())
-                }
-                Some(_) => ("416 Range Not Satisfiable", Vec::new()),
-                None => ("200 OK", bytes),
-            },
-            None => ("404 Not Found", Vec::new()),
+        let fault = {
+            let mut faults = state.faults.lock().unwrap();
+            faults
+                .iter_mut()
+                .find(|fault| path.contains(&fault.fragment) && fault.remaining != Some(0))
+                .map(|fault| {
+                    if let Some(remaining) = &mut fault.remaining {
+                        *remaining -= 1;
+                    }
+                    fault.kind
+                })
         };
+        let body = state.routes.lock().unwrap().get(&path).cloned();
+        let (status, payload) = match (fault, body) {
+            (Some(FaultKind::Status(code)), _) => (format!("{code} Fault"), Vec::new()),
+            (_, Some(bytes)) => match range {
+                Some((from, to)) if from <= to && to < bytes.len() => {
+                    ("206 Partial Content".to_string(), bytes[from..=to].to_vec())
+                }
+                Some(_) => ("416 Range Not Satisfiable".to_string(), Vec::new()),
+                None => ("200 OK".to_string(), bytes),
+            },
+            (_, None) => ("404 Not Found".to_string(), Vec::new()),
+        };
+        let stall = matches!(fault, Some(FaultKind::Stall));
         if is_bundle {
             state.bundle_requests.fetch_add(1, Ordering::SeqCst);
-            state
-                .bundle_bytes
-                .fetch_add(payload.len(), Ordering::SeqCst);
+            if !stall && status.starts_with("206") {
+                state
+                    .bundle_bytes
+                    .fetch_add(payload.len(), Ordering::SeqCst);
+            }
             state.active_bundle_requests.fetch_sub(1, Ordering::SeqCst);
         }
         let mut stream = stream;
@@ -3018,6 +4031,15 @@ mod tests {
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             payload.len()
         );
+        if stall {
+            // Media respuesta y silencio: la conexión sigue abierta hasta que el cliente se
+            // rinde y la cierra (o 30 s).
+            let _ = stream.write_all(&payload[..payload.len() / 2]);
+            let _ = stream.flush();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+            let _ = stream.read(&mut [0_u8; 1]);
+            return;
+        }
         let _ = stream.write_all(&payload);
         let _ = stream.flush();
     }

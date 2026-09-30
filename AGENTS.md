@@ -12,13 +12,17 @@
 
 - Install deps: `bun install`
 - Frontend build: `bun run build`
+- Frontend tests: `bun test`
 - Desktop dev: `bun run tauri dev`
 - Rust tests: `cargo test --manifest-path src-tauri/Cargo.toml`
 - Rust format check: `cargo fmt --manifest-path src-tauri/Cargo.toml --check`
+- Rust lint: `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets`
 
 ## Definition Of Done
 
 - Rust behavior has a small `cargo test` check.
+- `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets` reports no warnings.
 - Frontend compiles with `bun run build`.
+- Frontend tests pass with `bun test`.
 - Docs are updated when product flow or architecture changes.
 - No generated build output is committed.

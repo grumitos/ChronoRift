@@ -1,30 +1,38 @@
 // Flujo completo de la UI real (index.html + src/main.ts) sobre happy-dom, con el IPC de Tauri
 // simulado por @tauri-apps/api/mocks y los datos estáticos servidos por un fetch local.
-// Los datos son sintéticos: no se usan Riot IDs reales.
+// Los datos son sintéticos: no se usan Riot IDs reales. Los errores son los textos del backend.
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 const REPLAY_DIR = "C:\\Replays";
+const OTHER_DIR = "D:\\Otras";
+const USB_DIR = "F:\\Repeticiones";
 const REPLAY_A = `${REPLAY_DIR}\\LA2-1625354615.rofl`;
 const REPLAY_B = `${REPLAY_DIR}\\LA2-1621247134.rofl`;
 const CLIENTS_ROOT = "E:\\ChronoRift";
 const BUILD_A = "16.18.817.5716";
 const BUILD_B = "16.17.810.4348";
+// Compilación más nueva del parche 16.17, instalada en lugar de la exacta de la repetición B.
+const BUILD_B_NEWER = "16.17.811.2000";
 const DESTINATION = `${CLIENTS_ROOT}\\${BUILD_A}\\Game`;
 const EXECUTABLE = `${DESTINATION}\\League of Legends.exe`;
 const DD = "https://ddragon.leagueoflegends.com";
 const CD = "https://raw.communitydragon.org/16.18/plugins/rcp-be-lol-game-data/global";
-// La app pide DataDragon y CommunityDragon a la caché en disco del backend (esquema lolasset).
-const CACHE = "lolasset://localhost";
+// WebView2 (Windows) expone el esquema propio como http://lolasset.localhost: con el agente de
+// usuario de Edge en Windows, la app pide DataDragon y CommunityDragon a la caché en disco así.
+const EDGE_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 Edg/140.0.0.0";
+const CACHE = "http://lolasset.localhost";
 const ORIGINS: Record<string, string> = { ddragon: DD, cdragon: "https://raw.communitydragon.org" };
 const viaCache = (url: string) =>
   url.startsWith(`${DD}/`) ? `${CACHE}/ddragon${url.slice(DD.length)}` : `${CACHE}/cdragon${url.slice(ORIGINS.cdragon.length)}`;
 const fromCache = (url: string) => {
-  const match = url.match(/^lolasset:\/\/localhost\/(ddragon|cdragon)(\/.*)$/);
+  const match = url.match(/^http:\/\/lolasset\.localhost\/(ddragon|cdragon)(\/.*)$/);
   return match ? `${ORIGINS[match[1]]}${match[2]}` : null;
 };
 const GIB = 1024 ** 3;
 const OWNER = "Yo#LAS";
+const NETWORK_FAILURE = "Falló la descarga: tiempo de espera agotado (lol.dyn.riotcdn.net)";
 
 const champions = ["Urgot", "MonkeyKing", "Veigar", "Caitlyn", "Pyke", "Sett", "Quinn", "Hwei", "Smolder", "Nautilus"];
 const positions = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"];
@@ -118,7 +126,6 @@ function inspection(path: string, version: string, patch: string, durationMs: nu
     redKills: 40,
     players: list,
     teams: teams(list),
-    metadata: {},
     notes: [],
   };
 }
@@ -153,7 +160,7 @@ const library = {
       })),
     };
   }),
-  failures: [{ path: `${REPLAY_DIR}\\broken.rofl`, message: "Invalid ROFL header: missing RIOT classic magic" }],
+  failures: [{ path: `${REPLAY_DIR}\\broken.rofl`, message: "Cabecera ROFL no válida: falta la firma RIOT clásica" }],
 };
 
 function plan(mode: string, locale: string) {
@@ -212,20 +219,30 @@ let settings: { clientsRoot: string | null } = { clientsRoot: CLIENTS_ROOT };
 let planFailure: string | null = null;
 let launchFailure: string | null = null;
 let revealFailure: string | null = null;
+let folderFailure: string | null = null;
+// Carpeta de clientes en una unidad desconectada: los comandos que la leen fallan como en Rust.
+let unavailableRoot: string | null = null;
 let vanguard = "stopped";
 let pendingInstall: { resolve: (value: unknown) => void; reject: (reason: unknown) => void } | null = null;
-// Estado en disco que devuelve el backend simulado para cada compilación.
-const disk: Record<string, { state: string; installedBytes: number; totalInstallBytes: number | null }> = {
+// Lecturas de repeticiones retenidas hasta que la prueba las suelta.
+let holdInspect = false;
+const heldInspects: Array<() => void> = [];
+// Estado en disco que devuelve el backend simulado para cada versión de repetición; `build` es otra
+// compilación del mismo parche instalada en su lugar.
+type Disk = { state: string; installedBytes: number; totalInstallBytes: number | null; build?: string };
+const disk: Record<string, Disk> = {
   [BUILD_A]: { state: "missing", installedBytes: 0, totalInstallBytes: null },
   [BUILD_B]: { state: "missing", installedBytes: 0, totalInstallBytes: null },
 };
 const realFetch = globalThis.fetch;
 
-function localStatus(build: string) {
-  const current = disk[build];
+function localStatus(version: string) {
+  const current = disk[version];
+  const build = current.build ?? version;
   const destinationPath = `${settings.clientsRoot}\\${build}\\Game`;
   return {
     gameBuild: build,
+    exactBuild: build === version,
     destinationPath,
     state: current.state,
     executablePath: current.state === "ready" ? `${destinationPath}\\League of Legends.exe` : null,
@@ -233,6 +250,10 @@ function localStatus(build: string) {
     installedBytes: current.installedBytes,
     totalInstallBytes: current.totalInstallBytes,
   };
+}
+
+function unavailable(root: string) {
+  if (root === unavailableRoot) throw `La carpeta de clientes no está disponible: ${root}`;
 }
 
 // Backend simulado: responde como los comandos de Rust y registra cada llamada.
@@ -254,13 +275,17 @@ async function backend(cmd: string, args: any) {
     case "plugin:opener|open_url":
       return null;
     case "inspect_replay_folder":
-      return library;
+      if (folderFailure) throw folderFailure;
+      return args.path === REPLAY_DIR ? library : { folderPath: args.path, entries: [], failures: [] };
     case "inspect_replay":
+      if (holdInspect) return new Promise((resolve) => heldInspects.push(() => resolve(replays[args.path])));
       return replays[args.path];
     case "client_statuses":
+      unavailable(args.clientsRoot);
       return Object.fromEntries(args.versions.map((version: string) => [version, localStatus(version)]));
     case "list_clients":
-      return Object.keys(disk).filter((build) => disk[build].state !== "missing").map(localStatus);
+      unavailable(args.clientsRoot);
+      return Object.keys(disk).filter((version) => disk[version].state !== "missing").map(localStatus);
     case "plan_client_install":
       if (planFailure) throw planFailure;
       return plan(disk[BUILD_A].state === "partial" ? "resume" : "install", args.request.locale);
@@ -270,7 +295,7 @@ async function backend(cmd: string, args: any) {
       });
     case "cancel_client_install":
       disk[BUILD_A] = { state: "partial", installedBytes: 6 * GIB, totalInstallBytes: 29.3 * GIB };
-      pendingInstall?.reject("Client work stopped; completed files are kept for resuming");
+      pendingInstall?.reject("Descarga detenida");
       return null;
     case "launch_replay":
       if (launchFailure) throw launchFailure;
@@ -291,6 +316,7 @@ function el<T extends Element = HTMLElement>(selector: string): T {
 const text = (selector: string) => el(selector).textContent?.replace(/\s+/g, " ").trim() ?? "";
 const called = (cmd: string) => calls.filter((call) => call.cmd === cmd);
 const click = (selector: string) => el<HTMLButtonElement>(selector).click();
+const disabled = (selector: string) => el<HTMLButtonElement>(selector).disabled;
 
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 3_000) {
   const start = Date.now();
@@ -306,9 +332,13 @@ function typeInto(selector: string, value: string, events: string[] = ["input"])
   for (const type of events) field.dispatchEvent(new Event(type, { bubbles: true }));
 }
 
-async function emitProgress(stage: string, downloadedBytes: number, totalBytes: number | null, detail = "") {
+async function emitEvent(name: string, payload: unknown) {
   const { emit } = await import("@tauri-apps/api/event");
-  await emit("download-progress", {
+  await emit(name, payload);
+}
+
+async function emitProgress(stage: string, downloadedBytes: number, totalBytes: number | null, detail = "") {
+  await emitEvent("download-progress", {
     destinationPath: DESTINATION,
     downloadedBytes,
     totalBytes,
@@ -319,8 +349,21 @@ async function emitProgress(stage: string, downloadedBytes: number, totalBytes: 
   });
 }
 
+/** Directivas de una CSP de Tauri, escrita como texto o como objeto. */
+function cspDirectives(policy: string | Record<string, string | string[]>) {
+  const pairs = typeof policy === "string"
+    ? policy.split(";").map((part) => part.trim().split(/\s+/)).filter(([name]) => name).map(([name, ...sources]) => [name, sources])
+    : Object.entries(policy).map(([name, sources]) => [name, Array.isArray(sources) ? sources : sources.split(/\s+/)]);
+  return Object.fromEntries(pairs) as Record<string, string[]>;
+}
+
 beforeAll(async () => {
-  GlobalRegistrator.register({ url: "http://localhost:1420/", width: 1360, height: 840 });
+  GlobalRegistrator.register({
+    url: "http://localhost:1420/",
+    width: 1360,
+    height: 840,
+    settings: { navigator: { userAgent: EDGE_UA } },
+  });
   const html = await Bun.file(new URL("../index.html", import.meta.url)).text();
   document.body.innerHTML = html
     .slice(html.indexOf("<body>") + "<body>".length, html.indexOf("</body>"))
@@ -357,13 +400,43 @@ describe("library → match → client → launch", () => {
     expect(el("#replay-count").hidden).toBe(true);
     expect(el("#folder-path").hidden).toBe(true);
 
+    // Cambiar de carpeta con una lectura pendiente: al llegar, la repetición anterior no reaparece.
+    holdInspect = true;
+    dialogAnswers.push(REPLAY_DIR);
+    click("#open-library");
+    await waitFor(() => heldInspects.length === 3, "held replay reads");
+    expect(el("#replay-workspace").hidden).toBe(true);
+    dialogAnswers.push(OTHER_DIR);
+    click("#open-library");
+    await waitFor(() => text("#library-empty-text") === "Sin repeticiones", "empty folder");
+    // El diálogo se abre en la carpeta actual.
+    expect(called("plugin:dialog|open").at(-1)?.args.options).toMatchObject({ directory: true, defaultPath: REPLAY_DIR });
+    holdInspect = false;
+    for (const release of heldInspects.splice(0)) release();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(el("#replay-workspace").hidden).toBe(true);
+    expect(text("#empty-title")).toBe("Sin repetición seleccionada");
+
+    // Una carpeta que no se puede leer (un USB desconectado) no reemplaza la recordada y se reintenta.
+    folderFailure = "La ruta de repeticiones no es una carpeta";
+    dialogAnswers.push(USB_DIR);
+    click("#open-library");
+    await waitFor(() => text("#library-empty-text").startsWith("No se pudo cargar la carpeta."), "folder error");
+    expect(localStorage.getItem("chronorift.lastReplayLibrary")).toBe(OTHER_DIR);
+    expect(text("#folder-path")).toBe(USB_DIR);
+    folderFailure = null;
+    click("#refresh-library");
+    await waitFor(() => text("#library-empty-text") === "Sin repeticiones", "retried folder");
+    expect(called("inspect_replay_folder").at(-1)?.args.path).toBe(USB_DIR);
+
+    const reads = called("inspect_replay").length;
     dialogAnswers.push(REPLAY_DIR);
     click("#open-library");
     await waitFor(() => document.querySelectorAll(".replay-row").length === 2, "replay rows");
     await waitFor(() => text("#file-name") === "LA2-1625354615.rofl", "first replay");
     // Cada repetición de la lista se lee de antemano: elegir otra no espera al backend.
     await waitFor(
-      () => new Set(called("inspect_replay").map((call) => call.args.path)).size === 2,
+      () => new Set(called("inspect_replay").slice(reads).map((call) => call.args.path)).size === 2,
       "prefetched replays",
     );
 
@@ -373,8 +446,6 @@ describe("library → match → client → launch", () => {
     expect(rows.map((row) => row.querySelector(".result-badge")?.textContent)).toEqual(["V", "D"]);
     expect(rows[0].getAttribute("aria-current")).toBe("true");
     expect(rows[0].getAttribute("aria-label")).toContain("9/2/3");
-    expect(rows[0].getAttribute("aria-label")).toContain("cliente no instalado");
-    expect(text("#library-summary")).toBe("0/2 builds · 1 con error");
     // El archivo que no se pudo leer queda al final: fila gris con el motivo, sin selección.
     const failed = el("#library-list .failed-row");
     expect(el("#library-list").lastElementChild).toBe(failed);
@@ -406,7 +477,10 @@ describe("library → match → client → launch", () => {
     expect(el("#client-location").classList.contains("is-muted")).toBe(true);
     expect(el("#reveal-client").hidden).toBe(true);
     expect(text("#client-action-label")).toBe("Preparar cliente");
-    expect(el<HTMLButtonElement>("#play-replay").disabled).toBe(true);
+    expect(disabled("#play-replay")).toBe(true);
+    // Con el estado leído del disco, la fila y el pie dicen si el cliente está instalado.
+    expect(rows[0].getAttribute("aria-label")).toContain("cliente no instalado");
+    expect(text("#library-summary")).toBe("0/2 builds · 1 con error");
 
     // Marcador: dos equipos, el dueño resaltado y objetivos por equipo.
     const teamBlocks = document.querySelectorAll("#teams .sb-team");
@@ -446,9 +520,16 @@ describe("library → match → client → launch", () => {
     const images = [...document.querySelectorAll<HTMLImageElement>("img")].map((image) => image.getAttribute("src") ?? "");
     expect(images.length).toBeGreaterThan(0);
     expect(images.every((src) => src.startsWith(`${CACHE}/`))).toBe(true);
+    // Y la CSP de la app (también la de desarrollo) deja pasar ese origen para imágenes y fetch.
+    const security = (await Bun.file(new URL("../src-tauri/tauri.conf.json", import.meta.url)).json()).app.security;
+    for (const policy of [security.csp, security.devCsp]) {
+      const directives = cspDirectives(policy);
+      expect(directives["img-src"]).toContain(CACHE);
+      expect(directives["connect-src"]).toContain(CACHE);
+    }
   });
 
-  test("search and result filters narrow the library", () => {
+  test("search, filters and keyboard selection narrow and keep the library", () => {
     typeInto("#replay-search", "16.17");
     expect(document.querySelectorAll(".replay-row")).toHaveLength(1);
     expect(document.querySelectorAll(".failed-row")).toHaveLength(0);
@@ -472,6 +553,21 @@ describe("library → match → client → launch", () => {
     click("#result-filter [data-filter='all']");
     expect(document.querySelectorAll(".replay-row")).toHaveLength(2);
     expect(document.querySelectorAll(".failed-row")).toHaveLength(1);
+
+    // Elegir con Enter (activa el botón con el foco) deja el foco en esa fila: el siguiente Tab no
+    // vuelve al principio de la lista.
+    const focusedPath = () => (document.activeElement as HTMLElement | null)?.dataset?.path;
+    const [first, second] = [...document.querySelectorAll<HTMLButtonElement>(".replay-row")];
+    second.focus();
+    second.click();
+    expect(text("#file-name")).toBe("LA2-1621247134.rofl");
+    expect(focusedPath()).toBe(REPLAY_B);
+    expect(el(`.replay-row[aria-current='true']`).dataset.path).toBe(REPLAY_B);
+    first.focus();
+    first.click();
+    expect(text("#file-name")).toBe("LA2-1625354615.rofl");
+    expect(focusedPath()).toBe(REPLAY_A);
+    expect(el(`.replay-row[aria-current='true']`).dataset.path).toBe(REPLAY_A);
   });
 
   test("stats and file tabs show team totals, damage by type and the replay path", () => {
@@ -487,6 +583,8 @@ describe("library → match → client → launch", () => {
     click(".tab[data-tab='file']");
     expect(text("#file-facts")).toContain(REPLAY_A);
     expect(text("#file-facts")).toContain("ROFL2");
+    // La fecha del archivo se llama igual que en el resumen: es cuando se descargó.
+    expect(text("#file-facts")).toContain("Descargada");
     click(".tab[data-tab='board']");
     expect(el("#panel-board").hidden).toBe(false);
   });
@@ -494,8 +592,10 @@ describe("library → match → client → launch", () => {
   test("the plan shows destination, locale, sizes and source before anything is downloaded", async () => {
     click("#client-action");
     await waitFor(() => !el("#client-drawer").hidden, "drawer");
-    // El foco entra al panel al abrirlo.
+    // El foco entra al panel, un diálogo; la partida de detrás queda inerte.
     expect(document.activeElement?.id).toBe("drawer-close");
+    expect(el("#client-drawer").getAttribute("role")).toBe("dialog");
+    expect(el("#replay-workspace").inert).toBe(true);
     await waitFor(() => text("#plan-download-size") !== "…", "plan values");
 
     expect(called("plan_client_install")[0].args.request).toEqual({
@@ -516,21 +616,25 @@ describe("library → match → client → launch", () => {
     expect(text("#confirm-label")).toBe("Descargar");
     expect(called("install_client")).toHaveLength(0);
 
-    // Cambiar el idioma vuelve a planificar antes de poder confirmar.
+    // Cambiar el idioma vuelve a planificar: hasta tener el plan nuevo no se puede confirmar el viejo.
     typeInto("#locale", "en_US", ["change"]);
+    expect(disabled("#confirm-client-action")).toBe(true);
     await waitFor(() => called("plan_client_install").length === 2, "re-plan");
     expect(called("plan_client_install")[1].args.request.locale).toBe("en_US");
     typeInto("#locale", "es_MX", ["change"]);
-    await waitFor(() => called("plan_client_install").length === 3 && !el<HTMLButtonElement>("#confirm-client-action").disabled, "plan ready");
+    await waitFor(() => called("plan_client_install").length === 3 && !disabled("#confirm-client-action"), "plan ready");
   });
 
   test("confirming shows real progress and stopping keeps a resumable client", async () => {
     click("#confirm-client-action");
     await waitFor(() => pendingInstall !== null, "install_client call");
+    // Se confirma exactamente el plan que se vio, con su idioma y su manifiesto.
     expect(called("install_client")[0].args.request.confirmed).toEqual({
       mode: "install",
       resolvedVersion: "16.18.8175716",
       destinationPath: DESTINATION,
+      locale: "es_MX",
+      manifestUrl: plan("install", "es_MX").manifestUrl,
     });
     expect(el("#progress-view").hidden).toBe(false);
     expect(el("#activity").hidden).toBe(false);
@@ -548,54 +652,90 @@ describe("library → match → client → launch", () => {
     expect(el("#client-progress-bar").style.width).toBe("20%");
     expect(text("#client-location")).toBe(DESTINATION);
 
+    // Detener se ve en el acto, antes de que el backend termine.
     click("#stop-client-action");
+    expect(text("#stop-client-action")).toBe("Deteniendo…");
+    expect(text("#client-status-text")).toBe("Deteniendo…");
+    expect(text("#activity-label")).toBe("Deteniendo…");
     await waitFor(() => called("cancel_client_install").length === 1, "cancel command");
     await waitFor(() => el("#client-drawer").hidden, "drawer closed after stop");
     await waitFor(() => text("#client-status-text") === "Incompleto · 20 %", "partial status");
+    // Una parada pedida no es un error.
+    expect(el("#client-error").hidden).toBe(true);
     expect(text("#client-action-label")).toBe("Reanudar");
     expect(el("#client-progress").hidden).toBe(true);
     expect(el("#activity").hidden).toBe(true);
-    expect(el<HTMLButtonElement>("#play-replay").disabled).toBe(true);
+    expect(disabled("#play-replay")).toBe(true);
     pendingInstall = null;
   });
 
-  test("resuming finishes the client; Vanguard is shown until it stops, then the replay launches", async () => {
+  test("a failed download stays visible with Reanudar ready; resuming finishes the client, which launches", async () => {
     click("#client-action");
     await waitFor(() => text("#plan-mode") === "Reanudar", "resume plan");
     expect(text("#drawer-title")).toBe("Reanudar");
     expect(text("#confirm-label")).toBe("Reanudar");
     expect(el<HTMLSelectElement>("#locale").value).toBe("es_MX");
 
+    // La descarga falla (tras sus reintentos) con el panel cerrado: el motivo queda bajo la barra del
+    // cliente y el plan se rehace solo, así Reanudar abre un plan ya listo.
+    click("#confirm-client-action");
+    await waitFor(() => pendingInstall !== null, "resume install call");
+    click("#drawer-close");
+    expect(el("#client-drawer").hidden).toBe(true);
+    const plans = called("plan_client_install").length;
+    pendingInstall!.reject(NETWORK_FAILURE);
+    pendingInstall = null;
+    await waitFor(() => text("#client-error") === NETWORK_FAILURE, "visible download error");
+    expect(el("#client-drawer").hidden).toBe(true);
+    expect(el("#activity").hidden).toBe(true);
+    await waitFor(() => called("plan_client_install").length === plans + 1, "automatic re-plan");
+    expect(text("#client-status-text")).toBe("Incompleto · 20 %");
+    expect(text("#client-action-label")).toBe("Reanudar");
+
+    click("#client-action");
+    expect(el("#client-drawer").hidden).toBe(false);
+    await waitFor(() => !disabled("#confirm-client-action"), "resume plan ready");
+    expect(called("plan_client_install")).toHaveLength(plans + 1);
+    expect(text("#confirm-label")).toBe("Reanudar");
+    // El fallo sigue a la vista hasta el próximo intento, también en el panel.
+    expect(text("#plan-error")).toBe(NETWORK_FAILURE);
+    expect(text("#client-error")).toBe(NETWORK_FAILURE);
+
     // Otro idioma en el plan: el backend simulado deja el cliente en es_MX (su install.json), y la
     // barra y el inicio deben usar ese idioma instalado, no el elegido en el plan.
-    const plans = called("plan_client_install").length;
     typeInto("#locale", "en_US", ["change"]);
     await waitFor(
-      () => called("plan_client_install").length === plans + 1 && !el<HTMLButtonElement>("#confirm-client-action").disabled,
+      () => called("plan_client_install").length === plans + 2 && !disabled("#confirm-client-action"),
       "en_US plan",
     );
 
     click("#confirm-client-action");
-    await waitFor(() => pendingInstall !== null, "resume install call");
-    expect(called("install_client")[1].args.request.confirmed.mode).toBe("resume");
+    await waitFor(() => pendingInstall !== null, "second resume install call");
+    // Un intento nuevo quita el fallo anterior.
+    expect(el("#client-error").hidden).toBe(true);
+    const retry = called("install_client").at(-1)!.args.request;
+    expect(retry.locale).toBe("en_US");
+    expect(retry.confirmed).toMatchObject({ mode: "resume", locale: "en_US" });
     disk[BUILD_A] = { state: "ready", installedBytes: 29.3 * GIB, totalInstallBytes: 29.3 * GIB };
     pendingInstall!.resolve({ ...plan("resume", "es_MX"), executablePath: EXECUTABLE, downloadSeconds: 1470 });
+    pendingInstall = null;
     await waitFor(() => text("#client-status-text") === "Listo", "ready status");
     expect(text("#client-location")).toBe(DESTINATION);
     expect(text("#client-locale")).toBe("es_MX");
     expect(el("#client-action").hidden).toBe(true);
     expect(el("#reveal-client").hidden).toBe(false);
     expect(el("#client-drawer").hidden).toBe(true);
-    expect(el<HTMLButtonElement>("#play-replay").disabled).toBe(false);
+    expect(el("#version-inexact").hidden).toBe(true);
+    expect(disabled("#play-replay")).toBe(false);
 
     // Con Vanguard cargado el estado lo indica, pero Reproducir sigue disponible.
     vanguard = "running";
     window.dispatchEvent(new Event("focus"));
     await waitFor(() => text("#client-status-text") === "Vanguard activo", "vanguard state");
     expect(el("#client-glyph").dataset.state).toBe("blocked");
-    expect(el<HTMLButtonElement>("#play-replay").disabled).toBe(false);
+    expect(disabled("#play-replay")).toBe(false);
 
-    launchFailure = "Could not launch League executable: Access is denied. (os error 5)";
+    launchFailure = "No se pudo iniciar League of Legends: Acceso denegado. (os error 5)";
     click("#play-replay");
     await waitFor(() => text("#client-error").includes("os error 5"), "blocked launch");
     expect(text("#client-status-text")).toBe("Vanguard activo");
@@ -618,9 +758,18 @@ describe("library → match → client → launch", () => {
       locale: "es_MX",
     });
     await waitFor(() => text("#client-status-text") === "Reproduciendo", "launched");
+    // "Reproduciendo" no tapa a Vanguard, y al cerrarse el juego la barra vuelve a la normalidad.
+    vanguard = "running";
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => text("#client-status-text") === "Vanguard activo", "vanguard while playing");
+    vanguard = "stopped";
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => text("#client-status-text") === "Reproduciendo", "still playing");
+    await emitEvent("replay-exited", { replayPath: REPLAY_A, exitCode: 0 });
+    await waitFor(() => text("#client-status-text") === "Listo", "game exited");
 
     // Sin Vanguard, cualquier otro error se muestra tal cual.
-    launchFailure = "League executable does not exist: E:\\ChronoRift\\gone.exe";
+    launchFailure = "El ejecutable no existe: E:\\ChronoRift\\gone.exe";
     click("#play-replay");
     await waitFor(() => text("#client-status-text") === "No se pudo reproducir", "launch error");
     expect(text("#client-error")).toContain("gone.exe");
@@ -631,7 +780,7 @@ describe("library → match → client → launch", () => {
     expect(called("plugin:opener|reveal_item_in_dir")[0].args).toEqual({ paths: [EXECUTABLE] });
 
     // Un "Mostrar en carpeta" fallido se ve en la partida, no solo en la vista Clientes.
-    revealFailure = "The system cannot find the file specified. (os error 2)";
+    revealFailure = "El sistema no puede encontrar el archivo especificado. (os error 2)";
     click(".replay-caption [data-action='reveal-replay']");
     await waitFor(() => text("#client-error").includes("os error 2"), "reveal error");
     expect(text("#client-error")).toStartWith("No se pudo abrir la carpeta.");
@@ -640,8 +789,8 @@ describe("library → match → client → launch", () => {
     revealFailure = null;
   });
 
-  test("a build that cannot be resolved is reported without starting client work", async () => {
-    planFailure = "No lol-game-client manifest found for LA2 16.17.8104348 (16.17) in Riot Sieve or the riot-manifests index";
+  test("a build that cannot be resolved is reported; a newer build of its patch is used when installed", async () => {
+    planFailure = "Sin manifiesto de lol-game-client para LA2 16.17.8104348 (16.17) en Riot Sieve ni en riot-manifests";
     // Ya precargada: se muestra en el mismo clic, sin estado de carga ni otra lectura.
     const reads = called("inspect_replay").length;
     document.querySelectorAll<HTMLButtonElement>(".replay-row")[1].click();
@@ -653,20 +802,47 @@ describe("library → match → client → launch", () => {
     expect(el("#teams .sb-player .items").querySelectorAll(".slot")).toHaveLength(7);
     expect(document.querySelector("#teams .slot--role")).toBeNull();
 
+    // Un ejecutable que no es el juego se rechaza al elegirlo, con el texto del backend.
+    dialogAnswers.push("C:\\Juegos\\Otro\\Juego.exe");
+    click("#choose-executable");
+    await waitFor(() => !el("#client-error").hidden, "wrong executable");
+    expect(text("#client-error")).toBe("No es League of Legends.exe: C:\\Juegos\\Otro\\Juego.exe");
+    expect(text("#client-status-text")).toBe("No instalado");
+    expect(disabled("#play-replay")).toBe(true);
+
     click("#client-action");
     await waitFor(() => !el("#plan-error").hidden, "plan error");
     expect(text("#plan-error")).toContain("16.17.8104348");
-    expect(el<HTMLButtonElement>("#confirm-client-action").disabled).toBe(true);
-    expect(called("install_client")).toHaveLength(2);
+    expect(disabled("#confirm-client-action")).toBe(true);
+    expect(called("install_client")).toHaveLength(3);
     click("#drawer-close");
     // Sin transición en curso el panel se oculta en el acto y el foco vuelve a la barra del cliente.
     expect(el("#client-drawer").hidden).toBe(true);
     expect(el("#drawer-scrim").hidden).toBe(true);
+    expect(el("#replay-workspace").inert).toBe(false);
     expect(document.activeElement?.id).toBe("client-action");
     planFailure = null;
+
+    // Con una compilación más nueva del mismo parche instalada, se usa esa y se marca "no exacta".
+    disk[BUILD_B] = { state: "ready", installedBytes: 29 * GIB, totalInstallBytes: 29 * GIB, build: BUILD_B_NEWER };
+    click("#refresh-library");
+    await waitFor(() => text("#client-status-text") === "Listo", "newer build of the patch");
+    expect(text("#version")).toBe(BUILD_B_NEWER);
+    expect(el("#version-inexact").hidden).toBe(false);
+    expect(text("#version-inexact")).toBe("no exacta");
+    click("#play-replay");
+    await waitFor(() => called("launch_replay").at(-1)?.args.request.replayPath === REPLAY_B, "launch with the newer build");
+    expect(called("launch_replay").at(-1)?.args.request.executablePath).toBe(
+      `${CLIENTS_ROOT}\\${BUILD_B_NEWER}\\Game\\League of Legends.exe`,
+    );
+    await emitEvent("replay-exited", { replayPath: REPLAY_B, exitCode: 0 });
+    disk[BUILD_B] = { state: "missing", installedBytes: 0, totalInstallBytes: null };
+    click("#refresh-library");
+    await waitFor(() => text("#client-status-text") === "No instalado", "newer build removed");
+    expect(el("#version-inexact").hidden).toBe(true);
   });
 
-  test("the clients view lists builds and saves the downloads folder through the backend", async () => {
+  test("the clients view lists builds, saves the downloads folder and reports an unavailable drive", async () => {
     click(".nav-item[data-view='clients']");
     await waitFor(() => called("list_clients").length > 0, "list_clients call");
     await waitFor(() => document.querySelectorAll("#builds-list .builds__row").length === 2, "build rows");
@@ -681,12 +857,29 @@ describe("library → match → client → launch", () => {
     expect(called("set_clients_root").at(-1)?.args).toEqual({ path: "E:\\" });
     await waitFor(() => el<HTMLInputElement>("#install-folder").value === "E:\\ChronoRift", "field value");
 
+    // La carpeta elegida está en un USB desconectado: la lectura falla con el texto del backend.
+    unavailableRoot = "D:\\Clientes LoL";
     dialogAnswers.push("D:\\Clientes LoL");
     click("#choose-install-folder");
     await waitFor(() => el<HTMLInputElement>("#install-folder").value === "D:\\Clientes LoL", "picked folder");
+    expect(called("plugin:dialog|open").at(-1)?.args.options).toMatchObject({ directory: true, defaultPath: "E:\\ChronoRift" });
     expect(text("#storage-root")).toBe("D:\\Clientes LoL");
+    const drive = "La carpeta de clientes no está disponible: D:\\Clientes LoL";
+    await waitFor(() => text("#clients-root-error") === drive, "unavailable drive");
+    expect(text("#clients-installed")).toBe("—");
 
+    // En la partida: sin "No instalado" ni un "Listo" viejo, y sin poder reproducir.
     click(".nav-item[data-view='library']");
     expect(el("#library-view").hidden).toBe(false);
+    expect(text("#client-error")).toBe(drive);
+    expect(text("#client-status-text")).toBe("No disponible");
+    expect(el("#client-action").hidden).toBe(true);
+    expect(disabled("#play-replay")).toBe(true);
+
+    // La unidad vuelve: al regresar a la ventana se relee y el aviso desaparece.
+    unavailableRoot = null;
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => el("#client-error").hidden, "drive back");
+    expect(text("#client-status-text")).toBe("No instalado");
   });
 });

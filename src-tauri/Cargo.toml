@@ -32,9 +32,10 @@ zstd = "0.13"
 # Ya está en el árbol por Tauri: el candado por archivo y el límite de descargas de la caché.
 tokio = { version = "1", features = ["sync"] }
 
-# Ya está en el árbol por Tauri; solo se habilitan las API de consulta de servicios.
+# Ya está en el árbol por Tauri; solo se habilitan las API de consulta de servicios y la marca
+# de archivo disperso (`FSCTL_SET_SPARSE`) de los temporales de descarga.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Services"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Services"] }
 
 # Solo las dependencias se optimizan en desarrollo: zstd, TLS y hashing sin optimizar limitan
 # el throughput de descarga en `tauri dev`. El crate de la app sigue en debug.

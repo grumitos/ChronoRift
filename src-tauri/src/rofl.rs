@@ -1,6 +1,10 @@
-use serde::Serialize;
+use serde::{
+    de::{self, SeqAccess, Visitor},
+    Deserializer as _, Serialize,
+};
 use serde_json::Value;
 use std::{
+    cell::Cell,
     error::Error,
     fmt::{self, Display},
     fs::File,
@@ -11,8 +15,14 @@ use std::{
 const CLASSIC_MAGIC: &[u8; 6] = b"RIOT\0\0";
 const ROFL2_MAGIC: &[u8; 6] = b"RIOT\x02\0";
 const CLASSIC_HEADER_LEN: usize = 288;
-/// Los metadatos reales ocupan ~120 KiB; un valor mayor indica un archivo dañado.
-const MAX_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+/// Los metadatos reales ocupan ~120 KiB con 10 jugadores. 4 MiB deja lugar para Arena y para
+/// estadísticas nuevas, y acota la memoria que ocupa leer un archivo dañado o armado a propósito.
+const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
+/// Jugadores de `statsJson`: Arena usa 16. Una lista más larga no es una partida real.
+const MAX_PLAYERS: usize = 32;
+/// Largo de la versión en la cabecera ROFL2, después de la firma (6 bytes) y de 8 bytes más; la
+/// versión sigue a ese byte.
+const ROFL2_VERSION_OFFSET: usize = 14;
 /// El id de la partida ocupa los primeros 8 bytes de la cabecera de la carga útil clásica.
 const MATCH_ID_BYTES: u32 = 8;
 const POSITIONS: [&str; 5] = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"];
@@ -29,8 +39,6 @@ pub enum ReplayFormat {
 #[serde(rename_all = "camelCase")]
 pub enum ReplayStatus {
     Parsed,
-    #[allow(dead_code)]
-    Unsupported,
     Invalid,
 }
 
@@ -53,7 +61,6 @@ pub struct ReplayInspection {
     pub red_kills: u32,
     pub players: Vec<PlayerStats>,
     pub teams: Vec<TeamSummary>,
-    pub metadata: Value,
     pub notes: Vec<String>,
 }
 
@@ -230,7 +237,9 @@ pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, Inspec
         &metadata,
         &["gameLength", "GameLength", "game_length", "gameDuration"],
     );
-    let (players, teams) = match_from_metadata(&metadata, data_dragon_version.as_deref());
+    let mut notes = Vec::new();
+    let (players, teams) =
+        match_from_metadata(&metadata, data_dragon_version.as_deref(), &mut notes);
     let (blue_kills, red_kills, winning_team) = team_summary(&players);
     let match_id = payload_match_id
         .or_else(|| get_string(&metadata, &["gameId", "GameId", "matchId", "MatchId"]));
@@ -252,8 +261,7 @@ pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, Inspec
         red_kills,
         players,
         teams,
-        metadata,
-        notes: Vec::new(),
+        notes,
     })
 }
 
@@ -266,7 +274,7 @@ fn inspect_rofl2(
     head: &[u8],
 ) -> Result<ReplayInspection, InspectError> {
     let metadata = read_rofl2_metadata(file, file_len)?;
-    let game_version = find_ascii_version(&head[..head.len().min(128)]);
+    let game_version = rofl2_version(head);
     let patch = game_version.as_deref().and_then(patch_from_version);
     let data_dragon_version = patch.as_deref().map(data_dragon_version_from_patch);
     let (region, file_match_id) = region_and_match_from_file_name(&file_name);
@@ -275,7 +283,9 @@ fn inspect_rofl2(
         &metadata,
         &["gameLength", "GameLength", "game_length", "gameDuration"],
     );
-    let (players, teams) = match_from_metadata(&metadata, data_dragon_version.as_deref());
+    let mut notes = vec!["Metadatos ROFL2 leídos del bloque final".to_string()];
+    let (players, teams) =
+        match_from_metadata(&metadata, data_dragon_version.as_deref(), &mut notes);
     let (blue_kills, red_kills, winning_team) = team_summary(&players);
 
     Ok(ReplayInspection {
@@ -296,8 +306,7 @@ fn inspect_rofl2(
         red_kills,
         players,
         teams,
-        metadata,
-        notes: vec!["Metadatos ROFL2 leídos del bloque final".to_string()],
+        notes,
     })
 }
 
@@ -325,7 +334,6 @@ fn base_inspection(
         red_kills: 0,
         players: Vec::new(),
         teams: Vec::new(),
-        metadata: Value::Null,
         notes: vec![note.into()],
     }
 }
@@ -456,20 +464,83 @@ fn get_u64(value: &Value, keys: &[&str]) -> Option<u64> {
         })
 }
 
+/// Jugadores y equipos de `statsJson`. Con más de `MAX_PLAYERS` las estadísticas no sirven: no
+/// hay jugadores y `notes` explica por qué.
 fn match_from_metadata(
     metadata: &Value,
     data_dragon_version: Option<&str>,
+    notes: &mut Vec<String>,
 ) -> (Vec<PlayerStats>, Vec<TeamSummary>) {
-    let stats = get_string(metadata, &["statsJson", "statsJSON"])
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default();
+    let Ok(stats) = stats_players(metadata) else {
+        notes.push(format!(
+            "Estadísticas omitidas: la repetición tiene más de {MAX_PLAYERS} jugadores"
+        ));
+        return (Vec::new(), Vec::new());
+    };
     let players = stats
         .iter()
         .map(|player| player_from_stats(player, data_dragon_version))
         .collect::<Vec<_>>();
     let teams = team_summaries(&stats, &players);
     (players, teams)
+}
+
+/// `statsJson` trae más de `MAX_PLAYERS` jugadores.
+struct TooManyPlayers;
+
+/// Lee `statsJson` jugador por jugador, sin copiar el texto ni la lista. Pasado `MAX_PLAYERS` se
+/// detiene sin leer el resto: una lista enorme nunca se carga entera. Sin `statsJson`, o si no es
+/// una lista JSON, no hay jugadores.
+fn stats_players(metadata: &Value) -> Result<Vec<Value>, TooManyPlayers> {
+    let raw = metadata
+        .as_object()
+        .and_then(|object| {
+            ["statsJson", "statsJSON"]
+                .iter()
+                .find_map(|key| object.get(*key))
+        })
+        .and_then(Value::as_str);
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let too_many = Cell::new(false);
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let players = deserializer
+        .deserialize_seq(PlayerList {
+            too_many: &too_many,
+        })
+        .and_then(|players| deserializer.end().map(|()| players));
+    match players {
+        Ok(players) => Ok(players),
+        Err(_) if too_many.get() => Err(TooManyPlayers),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Lista de `statsJson`. serde_json solo corta la lectura si el visitante devuelve un error, así
+/// que `too_many` distingue ese corte de un JSON dañado.
+struct PlayerList<'a> {
+    too_many: &'a Cell<bool>,
+}
+
+impl<'de> Visitor<'de> for PlayerList<'_> {
+    type Value = Vec<Value>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a list of players")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut players = Vec::new();
+        while let Some(player) = seq.next_element::<Value>()? {
+            if players.len() == MAX_PLAYERS {
+                self.too_many.set(true);
+                return Err(de::Error::custom("too many players"));
+            }
+            players.push(player);
+        }
+        Ok(players)
+    }
 }
 
 fn player_from_stats(player: &Value, data_dragon_version: Option<&str>) -> PlayerStats {
@@ -674,6 +745,26 @@ fn item_image_url(version: &str, item: &str) -> String {
     format!("https://ddragon.leagueoflegends.com/cdn/{version}/img/item/{item}.png")
 }
 
+/// Versión de una cabecera ROFL2: el texto con prefijo de longitud del byte 14. Si ese texto no es
+/// una versión, se usa el primer número con puntos de los primeros 128 bytes.
+fn rofl2_version(head: &[u8]) -> Option<String> {
+    let start = ROFL2_VERSION_OFFSET + 1;
+    head.get(ROFL2_VERSION_OFFSET)
+        .and_then(|&length| head.get(start..start + usize::from(length)))
+        .and_then(|raw| std::str::from_utf8(raw).ok())
+        .filter(|text| is_game_version(text))
+        .map(str::to_string)
+        .or_else(|| find_ascii_version(&head[..head.len().min(128)]))
+}
+
+/// Al menos tres números separados por puntos, como `16.18.817.5716`.
+fn is_game_version(text: &str) -> bool {
+    text.split('.').count() >= 3
+        && text
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn find_ascii_version(bytes: &[u8]) -> Option<String> {
     for start in 0..bytes.len() {
         if !bytes[start].is_ascii_digit() {
@@ -687,7 +778,7 @@ fn find_ascii_version(bytes: &[u8]) -> Option<String> {
             })
             .unwrap_or(bytes.len());
         let candidate = std::str::from_utf8(&bytes[start..end]).ok()?;
-        if candidate.matches('.').count() >= 2 {
+        if is_game_version(candidate) {
             return Some(candidate.to_string());
         }
     }
@@ -917,7 +1008,11 @@ mod tests {
         assert_eq!(replay.match_id.as_deref(), Some("1604952545"));
         assert_eq!(replay.suggested_locale.as_deref(), Some("es_MX"));
         assert_eq!(replay.game_duration_ms, Some(2_698_573));
-        assert_eq!(replay.metadata["lastGameChunkId"], 92);
+        // Contrato con la interfaz: sin los metadatos crudos (el 87 % de cada respuesta) y con
+        // el estado en camelCase.
+        let contract = serde_json::to_value(&replay).unwrap();
+        assert_eq!(contract["status"], "parsed");
+        assert!(contract.get("metadata").is_none());
         assert_eq!((replay.blue_kills, replay.red_kills), (30, 2));
         assert_eq!(replay.winning_team.as_deref(), Some("Blue"));
 
@@ -1039,6 +1134,43 @@ mod tests {
             (saturated.blue_kills, saturated.teams[0].kills),
             (u32::MAX, u32::MAX)
         );
+
+        // La versión sale del texto con prefijo de longitud del byte 14: un número con puntos
+        // antes no la reemplaza. Con el prefijo roto se usa el primer número con puntos.
+        let original = fs::read(&path).unwrap();
+        let mut decoy = original.clone();
+        decoy[6..11].copy_from_slice(b"9.9.9");
+        let mut broken_prefix = original;
+        broken_prefix[ROFL2_VERSION_OFFSET] = 0xFF;
+        for bytes in [decoy, broken_prefix] {
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(
+                inspect_file(&path).unwrap().game_version.as_deref(),
+                Some("16.17.810.4348")
+            );
+        }
+
+        // Un `statsJson` armado a propósito, casi del tamaño del tope de metadatos: pasado
+        // `MAX_PLAYERS` se descarta con una nota, y el resto de la repetición se lee igual. El final
+        // ni siquiera es JSON válido, así que llegar a verlo significaría haber cargado la lista
+        // entera en memoria: se corta rápido y con memoria acotada.
+        let filler = "{},".repeat((MAX_METADATA_BYTES as usize - 4096) / 3);
+        let crowded = json!({
+            "gameLength": 1_000,
+            "statsJson": format!("[{filler}oops"),
+        });
+        write_rofl2(&path, "16.17.810.4348", &crowded);
+        let crowded = inspect_file(&path).unwrap();
+        assert_eq!(crowded.status, ReplayStatus::Parsed);
+        assert_eq!(
+            (crowded.game_version.as_deref(), crowded.game_duration_ms),
+            (Some("16.17.810.4348"), Some(1_000))
+        );
+        assert!(crowded.players.is_empty() && crowded.teams.is_empty());
+        assert_eq!(crowded.winning_team, None);
+        assert!(crowded.notes.contains(&format!(
+            "Estadísticas omitidas: la repetición tiene más de {MAX_PLAYERS} jugadores"
+        )));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1092,7 +1224,7 @@ mod tests {
         fs::write(&tiny, b"bad").unwrap();
         let tiny = inspect_file(&tiny).unwrap();
         assert_eq!(tiny.format, ReplayFormat::Unknown);
-        assert_eq!(tiny.status, ReplayStatus::Invalid);
+        assert_eq!(serde_json::to_value(&tiny).unwrap()["status"], "invalid");
 
         let foreign = root.join("foreign.rofl");
         fs::write(&foreign, vec![0x42; 400]).unwrap();

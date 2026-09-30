@@ -23,7 +23,7 @@
         <div class="appbar__end">
           <button type="button" class="activity" id="activity" data-action="show-progress" hidden>
             <span data-icon="download" class="icon icon--sm"></span>
-            <span class="activity__label">Descargando</span>
+            <span class="activity__label" id="activity-label">Descargando</span>
             <span class="mono" id="activity-build">—</span>
             <span class="meter meter--mini" aria-hidden="true"><span class="meter__fill" id="activity-bar"></span></span>
             <span class="mono" id="activity-percent">—</span>
@@ -115,7 +115,7 @@
                 </div>
 
                 <dl class="facts">
-                  <div><dt>Fecha</dt><dd class="mono" id="match-date">—</dd></div>
+                  <div><dt>Descargada</dt><dd class="mono" id="match-date">—</dd></div>
                   <div><dt>Duración</dt><dd class="mono" id="duration">—</dd></div>
                   <div><dt>Parche</dt><dd class="mono" id="patch">—</dd></div>
                   <div><dt>Región</dt><dd class="mono" id="region">—</dd></div>
@@ -142,7 +142,10 @@
                 </div>
                 <div class="client-strip__item">
                   <span class="client-strip__label">Build</span>
-                  <span class="client-strip__value mono" id="version">—</span>
+                  <span class="client-strip__build">
+                    <span class="client-strip__value mono" id="version">—</span>
+                    <span class="chip chip--outline chip--sm" id="version-inexact" hidden>no exacta</span>
+                  </span>
                 </div>
                 <div class="client-strip__item client-strip__item--location">
                   <span class="client-strip__label">Ubicación</span>
@@ -249,7 +252,7 @@
           </div>
 
           <div class="drawer-scrim" id="drawer-scrim" hidden></div>
-          <aside class="drawer" id="client-drawer" aria-labelledby="drawer-title" tabindex="-1" hidden>
+          <div class="drawer" id="client-drawer" role="dialog" aria-labelledby="drawer-title" tabindex="-1" hidden>
             <header class="drawer__head">
               <div class="drawer__heading">
                 <h2 id="drawer-title">Preparar cliente</h2>
@@ -289,13 +292,12 @@
                   <div class="kv__row"><dt>En disco</dt><dd class="mono" id="plan-install-size">—</dd></div>
                   <div class="kv__row"><dt>Fuente</dt><dd class="mono" id="plan-source">—</dd></div>
                 </dl>
-                <p class="drawer__error" id="plan-error" role="alert" hidden></p>
               </div>
 
               <div id="progress-view" hidden>
-                <div class="progress" role="status">
+                <div class="progress">
                   <div class="progress__line">
-                    <span class="progress__percent" id="progress-percent">—</span>
+                    <span class="progress__percent" id="progress-percent" role="status">—</span>
                     <span class="mono muted" id="progress-bytes"></span>
                   </div>
                   <div class="meter" role="progressbar" aria-label="Progreso de la descarga" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-track">
@@ -315,6 +317,7 @@
                   <div class="kv__row"><dt>Idioma</dt><dd class="mono" id="progress-locale">—</dd></div>
                 </dl>
               </div>
+              <p class="drawer__error" id="plan-error" role="alert" hidden></p>
             </div>
             <footer class="drawer__foot">
               <button type="button" class="button" id="cancel-client-action">Cancelar</button>
@@ -324,15 +327,15 @@
               </button>
               <button type="button" class="button" id="stop-client-action" hidden>
                 <span data-icon="stop" class="icon icon--sm"></span>
-                Detener
+                <span id="stop-label">Detener</span>
               </button>
             </footer>
-          </aside>
+          </div>
         </main>
       </div>
 
       <div class="view view--clients" id="clients-view" hidden>
-        <main class="clients">
+        <main class="clients" id="clients-content" tabindex="-1">
           <h1>Clientes</h1>
           <section class="card storage" aria-labelledby="clients-root-label">
             <div class="storage__main">

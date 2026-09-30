@@ -10,11 +10,36 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tauri::http::{header, Response, StatusCode};
+use tauri::http::{header, HeaderValue, Response, StatusCode};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
 /// En Windows la interfaz lo usa como `http://lolasset.localhost/<origen>/<ruta>`.
 pub const SCHEME: &str = "lolasset";
+
+/// Política de cada respuesta del esquema. `lolasset.localhost` cuenta como origen local y sirve
+/// SVG de terceros: abierto como documento, uno de ellos no ejecuta código y `sandbox` le da un
+/// origen opaco. En `fetch` e `<img>` la cabecera no cambia nada.
+const ASSET_CSP: &str =
+    "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox";
+
+/// Orígenes de la interfaz, los únicos que pueden leer la caché con `fetch`: la app empaquetada en
+/// Windows (`http`, o `https` con `useHttpsScheme`), en macOS y Linux, y Vite en desarrollo.
+const APP_ORIGINS: [&str; 4] = [
+    "http://tauri.localhost",
+    "https://tauri.localhost",
+    "tauri://localhost",
+    "http://localhost:1420",
+];
+
+/// Origen de la propia interfaz, para una petición sin `Origin`: Vite en desarrollo y, si no, la
+/// app empaquetada. Tauri elige entre `devUrl` y los archivos empaquetados con el mismo criterio.
+const OWN_ORIGIN: &str = if tauri::is_dev() {
+    "http://localhost:1420"
+} else if cfg!(windows) {
+    "http://tauri.localhost"
+} else {
+    "tauri://localhost"
+};
 
 /// Orígenes permitidos: el primer segmento de la ruta elige uno y nunca se acepta otro host.
 const SOURCES: [(&str, &str); 2] = [
@@ -82,7 +107,9 @@ struct AssetRequest {
 pub struct AssetCache {
     root: PathBuf,
     origins: HashMap<String, String>,
-    client: reqwest::Client,
+    /// `None` si no se pudo armar el cliente con la política de la caché: entonces no se descarga
+    /// nada y solo se sirve lo que ya está en disco.
+    client: Option<reqwest::Client>,
     downloads: Semaphore,
     /// Un candado por archivo: las peticiones simultáneas esperan a la primera descarga.
     locks: Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
@@ -98,13 +125,15 @@ impl AssetCache {
     }
 
     fn with_origins(root: PathBuf, origins: HashMap<String, String>) -> Self {
+        // Sin esta política no se descarga: `Client::new()` no tiene tiempos límite y sigue
+        // redirecciones hacia cualquier host.
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .redirect(same_origin_redirects())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(60))
             .build()
-            .unwrap_or_default();
+            .ok();
         Self {
             root,
             origins,
@@ -168,8 +197,13 @@ impl AssetCache {
     }
 
     async fn download(&self, url: &str, forbidden_is_missing: bool) -> Result<Vec<u8>, AssetError> {
+        // Sin cliente, lo que falta en disco es un error de red: no se recuerda como faltante.
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| AssetError::Upstream("HTTP client unavailable".to_string()))?;
         let upstream = |error: reqwest::Error| AssetError::Upstream(error.to_string());
-        let mut response = self.client.get(url).send().await.map_err(upstream)?;
+        let mut response = client.get(url).send().await.map_err(upstream)?;
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND
             || (forbidden_is_missing && status == reqwest::StatusCode::FORBIDDEN)
@@ -244,9 +278,19 @@ impl AssetCache {
     }
 }
 
-/// Respuesta del esquema. Lleva CORS abierto porque la interfaz (`tauri.localhost`) lee los JSON
-/// con `fetch` desde otro origen.
-pub fn http_response(result: Result<CachedAsset, AssetError>) -> Response<Vec<u8>> {
+/// Respuesta del esquema. La interfaz (`http://tauri.localhost`) lee los JSON con `fetch` desde
+/// otro origen: `origin` (la cabecera `Origin` de la petición) se refleja en CORS solo si es uno de
+/// `APP_ORIGINS`, también en los errores, para que la interfaz vea el 404 y pruebe el idioma
+/// siguiente. Otro origen, incluido el opaco (`null`) de un documento aislado, no puede leerla.
+///
+/// Sin `Origin` el permiso es para `OWN_ORIGIN`. Un `<img>` no la manda, y en un `fetch` GET
+/// Chromium la agrega recién en su servicio de red: no está confirmado que WebView2 la entregue al
+/// esquema. El visor compara ese valor fijo con el origen de quien pide, así que ningún otro origen
+/// gana acceso.
+pub fn http_response(
+    result: Result<CachedAsset, AssetError>,
+    origin: Option<&str>,
+) -> Response<Vec<u8>> {
     let (status, content_type, cache_control, body) = match result {
         Ok(asset) => (
             StatusCode::OK,
@@ -269,20 +313,37 @@ pub fn http_response(result: Result<CachedAsset, AssetError>) -> Response<Vec<u8
             error.to_string().into_bytes(),
         ),
     };
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, cache_control)
-        // El tipo sale de la extensión; el visor no debe adivinar otro por el contenido.
-        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(body)
-        .unwrap_or_else(|_| {
-            // Con cabeceras fijas no ocurre; aun así, nunca un 200 vacío que parezca válido.
-            let mut response = Response::new(Vec::new());
-            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-            response
-        })
+    // Solo valores fijos: armar la respuesta no puede fallar.
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    // El tipo sale de la extensión; el visor no debe adivinar otro por el contenido.
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(ASSET_CSP),
+    );
+    headers.insert(header::VARY, HeaderValue::from_static("Origin"));
+    // Se responde con una constante, nunca con los bytes que mandó la petición.
+    let allowed = match origin {
+        None => Some(OWN_ORIGIN),
+        Some(origin) => APP_ORIGINS.into_iter().find(|allowed| *allowed == origin),
+    };
+    if let Some(allowed) = allowed {
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static(allowed),
+        );
+    }
+    response
 }
 
 fn asset(request: &AssetRequest, bytes: Vec<u8>) -> CachedAsset {
@@ -639,9 +700,11 @@ mod tests {
 
     /// Cada archivo se descarga una vez: las peticiones simultáneas esperan a la primera y las
     /// siguientes, también en otra sesión, salen del disco. Un 404 versionado (o el 403 con que
-    /// DataDragon avisa que falta un archivo) se recuerda solo para ese nombre exacto, lo que no lleva versión se revalida y sin red se sirve la copia
-    /// vieja. Las redirecciones solo se siguen dentro del mismo origen, las rutas inválidas no
-    /// tocan ni el disco ni la red y los temporales viejos se borran al iniciar.
+    /// DataDragon avisa que falta un archivo) se recuerda solo para ese nombre exacto, lo que no
+    /// lleva versión se revalida y sin red se sirve la copia vieja. Las respuestas llevan una CSP
+    /// que aísla y CORS solo para la interfaz. Las redirecciones solo se siguen dentro del mismo
+    /// origen, las rutas inválidas no tocan ni el disco ni la red y los temporales viejos se borran
+    /// al iniciar.
     #[test]
     fn downloads_each_asset_once_and_serves_it_from_disk() {
         let (origin, base) = Origin::start();
@@ -684,19 +747,76 @@ mod tests {
         );
         assert_eq!(origin.hits(item), 1);
 
+        // Sin cliente HTTP (si no se pudo armar con la política de la caché) solo se sirve lo que
+        // está en disco: lo demás es un error de red, sin pedirlo al origen ni recordarlo como
+        // faltante, que ocultaría el archivo 24 horas.
+        let offline = AssetCache {
+            client: None,
+            ..cache_over(&root, &base)
+        };
+        let before = origin.total_hits();
+        assert_eq!(
+            run(offline.get(&format!("/ddragon{item}"))).unwrap().bytes,
+            b"item-png"
+        );
+        let absent = "/cdn/16.18.1/img/item/9999.png";
+        assert!(matches!(
+            run(offline.get(&format!("/ddragon{absent}"))),
+            Err(AssetError::Upstream(_))
+        ));
+        assert_eq!(origin.total_hits(), before);
+        assert!(!missing_marker(&root.join(format!("ddragon{absent}"))).exists());
+
         // Lo que recibe el visor: tipo por extensión y sin adivinar, caché larga solo con versión,
-        // errores sin guardar y CORS abierto para `fetch`.
-        let response = http_response(run(reopened.get(&format!("/ddragon{item}"))));
+        // una CSP que aísla cualquier documento (un SVG de terceros abierto solo) y CORS solo para
+        // la interfaz, que en la app empaquetada es `http://tauri.localhost`.
+        let respond = |origin| http_response(run(reopened.get(&format!("/ddragon{item}"))), origin);
+        let response = respond(Some("http://tauri.localhost"));
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.body(), b"item-png");
         for (name, value) in [
             (header::CONTENT_TYPE, "image/png"),
             (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox",
+            ),
+            (
+                header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                "http://tauri.localhost",
+            ),
+            (header::VARY, "Origin"),
         ] {
             assert_eq!(response.headers()[&name], value, "{name}");
         }
+        // Sin `Origin` (un `<img>`, o un GET si WebView2 no la entrega) el permiso es solo para el
+        // origen propio de la interfaz, nunca `*`.
+        assert_eq!(
+            respond(None).headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+            OWN_ORIGIN
+        );
+        // El origen opaco de un documento aislado, uno parecido o cualquier otro no reciben permiso.
+        for origin in [
+            "null",
+            "http://tauri.localhost.evil.example",
+            "https://evil.example",
+        ] {
+            let response = respond(Some(origin));
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                !response
+                    .headers()
+                    .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                "{origin}"
+            );
+            assert_eq!(
+                response.headers()[header::CONTENT_SECURITY_POLICY],
+                ASSET_CSP
+            );
+        }
+        // Los errores también llevan CORS para la interfaz: sin él `fetch` falla en lugar de dar
+        // el 404, y la interfaz no prueba el idioma siguiente.
         for (error, status) in [
             (AssetError::InvalidPath, StatusCode::BAD_REQUEST),
             (AssetError::NotFound, StatusCode::NOT_FOUND),
@@ -705,13 +825,16 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
             ),
         ] {
-            let response = http_response(Err(error));
+            let response = http_response(Err(error), Some("http://localhost:1420"));
             assert_eq!(response.status(), status);
-            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
-            assert_eq!(
-                response.headers()[header::X_CONTENT_TYPE_OPTIONS],
-                "nosniff"
-            );
+            for (name, value) in [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                (header::CONTENT_SECURITY_POLICY, ASSET_CSP),
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "http://localhost:1420"),
+            ] {
+                assert_eq!(response.headers()[&name], value, "{name}");
+            }
         }
 
         // El respaldo de idioma (es_mx → default) no vuelve a la red en cada sesión.

@@ -1,6 +1,6 @@
 // Contratos con los comandos de Rust (serde en camelCase).
 
-export type ReplayStatus = "parsed" | "unsupported" | "invalid";
+export type ReplayStatus = "parsed" | "invalid";
 export type ReplayFormat = "classicRofl" | "rofl2" | "unknown";
 export type ClientWorkMode = "install" | "resume" | "repair" | "ready";
 export type ReleaseSource = "sieve" | "manifestIndex";
@@ -114,14 +114,16 @@ export type ReplayInspection = {
   redKills: number;
   players: PlayerStats[];
   teams: TeamSummary[];
-  metadata: unknown;
   notes: string[];
 };
 
+/** Lo que el usuario vio y confirmó: el backend rehace el plan y exige que coincida. */
 export type ConfirmedPlan = {
   mode: ClientWorkMode;
   resolvedVersion: string;
   destinationPath: string;
+  locale: string;
+  manifestUrl: string;
 };
 
 export type ClientRequest = {
@@ -171,6 +173,8 @@ export type DownloadProgress = {
 
 export type LocalClientStatus = {
   gameBuild: string;
+  /** `false` si se usa una compilación más nueva del mismo parche en lugar de la exacta. */
+  exactBuild: boolean;
   destinationPath: string;
   state: LocalClientState;
   executablePath: string | null;

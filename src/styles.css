@@ -15,6 +15,11 @@
   --line-field: #2a2a30;
   --line-strong: #33333a;
   --line-chip: #55555d;
+  /* Borde de lo apagado (botón desactivado, ranura vacía) y pista de lo pendiente (etapas, giro). */
+  --line-dim: #26262b;
+  --line-track: #3a3a42;
+  --scrim: rgba(8, 8, 9, 0.62);
+  --shadow-drawer: rgba(0, 0, 0, 0.45);
   --ink: #ededef;
   --ink-hover: #d9d9dc;
   --ink-2: #adadb4;
@@ -361,7 +366,7 @@ button:disabled {
 }
 
 .button:disabled {
-  border-color: #26262b;
+  border-color: var(--line-dim);
   background: var(--bg-2);
   color: var(--ink-4);
 }
@@ -491,8 +496,13 @@ button:disabled {
 
 .glyph[data-state="busy"] {
   border: 2px solid var(--ink);
-  border-right-color: #3a3a42;
+  border-right-color: var(--line-track);
   animation: spin 1s linear infinite;
+}
+
+/* Estado en disco todavía sin leer: un punto tenue, ni listo ni "no instalado". */
+.glyph[data-state="unknown"] {
+  background: var(--line-strong);
 }
 
 @keyframes spin {
@@ -650,6 +660,11 @@ button:disabled {
   background: var(--bg-4);
 }
 
+/* Sobre el fondo del filtro activo --ink-3 no llega a 4,5:1. */
+.segmented button[aria-pressed="true"] span {
+  color: var(--ink-2);
+}
+
 .library__list {
   display: flex;
   flex: 1;
@@ -687,7 +702,9 @@ button:disabled {
   background: var(--bg-3);
 }
 
-.replay-row.is-invalid {
+.replay-row.is-invalid,
+.replay-row.is-invalid .replay-row__sub,
+.replay-row.is-invalid .replay-row__meta {
   color: var(--ink-3);
 }
 
@@ -957,6 +974,13 @@ button:disabled {
   line-height: 44px;
 }
 
+/* Repetición sin analizar: un solo "—", sin equipos ni guion entre ellos. */
+.score--empty .score__dash,
+.score--empty .score__team:last-child,
+.score--empty .score__label {
+  display: none;
+}
+
 /* Una sola fila que se parte en dos cuando falta ancho. */
 .facts {
   display: flex;
@@ -1053,12 +1077,18 @@ button:disabled {
 
 .client-strip__status,
 .client-strip__value,
+.client-strip__build,
 .client-strip__path {
   display: flex;
   align-items: center;
   height: 18px;
   line-height: 18px;
   white-space: nowrap;
+}
+
+/* Otra compilación del mismo parche: el valor lleva "no exacta" al lado. */
+.client-strip__build {
+  gap: 6px;
 }
 
 .client-strip__status {
@@ -1423,7 +1453,7 @@ button:disabled {
 }
 
 .slot--empty {
-  border-color: #26262b;
+  border-color: var(--line-dim);
   background: transparent;
 }
 
@@ -1849,7 +1879,7 @@ button:disabled {
   position: absolute;
   z-index: 5;
   inset: 0;
-  background: rgba(8, 8, 9, 0.62);
+  background: var(--scrim);
   opacity: 0;
   transition: opacity 160ms ease-in;
 }
@@ -1870,7 +1900,7 @@ button:disabled {
   width: min(440px, 100%);
   border-left: 1px solid var(--line-field);
   background: var(--bg-1);
-  box-shadow: -24px 0 48px rgba(0, 0, 0, 0.45);
+  box-shadow: -24px 0 48px var(--shadow-drawer);
   outline: none;
   transform: translateX(100%);
   transition: transform 180ms cubic-bezier(0.4, 0, 1, 1);
@@ -2049,13 +2079,16 @@ button:disabled {
   color: var(--ink-4);
 }
 
+/* Debajo del plan o del progreso; el fallo del plan y el de la descarga anterior van en líneas aparte. */
 .drawer__error {
-  margin: 12px 0 0;
+  margin: 0;
   padding: 10px 12px;
   border: 1px solid var(--line-strong);
   border-radius: 8px;
   font-size: 12.5px;
   line-height: 1.45;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
 }
 
 .progress {
@@ -2099,7 +2132,7 @@ button:disabled {
   flex-shrink: 0;
   width: 16px;
   height: 16px;
-  border: 1.5px solid #3a3a42;
+  border: 1.5px solid var(--line-track);
   border-radius: 50%;
   box-sizing: border-box;
 }
@@ -2136,6 +2169,7 @@ button:disabled {
   overflow-y: auto;
 }
 
+/* Recibe el foco del enlace "Ir al contenido" sin dibujar un anillo alrededor de toda la vista. */
 .clients {
   display: flex;
   flex-direction: column;
@@ -2143,6 +2177,7 @@ button:disabled {
   width: min(1040px, calc(100% - 48px));
   margin: 0 auto;
   padding: 32px 0;
+  outline: none;
 }
 
 .clients h1 {

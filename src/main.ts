@@ -15,6 +15,7 @@ import {
   formatPercent,
   formatThousands,
   kdaRatio,
+  progressPercent,
 } from "./format";
 import {
   cachedAssetUrl,
@@ -46,18 +47,25 @@ import type {
 type View = "library" | "clients";
 type Tab = "board" | "stats" | "file";
 type Filter = "all" | "win" | "loss";
-type GlyphState = "ready" | "partial" | "missing" | "busy" | "blocked";
+// "unknown": el estado en disco todavía no se leyó (o la carpeta de clientes no está disponible).
+type GlyphState = "ready" | "partial" | "missing" | "busy" | "blocked" | "unknown";
 
 type InstallRun = {
   gameVersion: string;
   build: string;
+  exactBuild: boolean;
   destination: string;
   locale: string;
+  /** Repetición desde la que se confirmó y cuántas de la biblioteca usan esa compilación. */
+  replayPath: string;
+  replayName: string;
+  replays: number;
   stage: string;
   detail: string;
   downloaded: number;
   total: number | null;
   percent: number | null;
+  done: boolean;
   stopping: boolean;
 };
 
@@ -65,13 +73,16 @@ type InstallRun = {
 type ClientView = {
   glyph: GlyphState;
   text: string;
+  /** Compilación que se usa; `inexact` si es otra del mismo parche. */
+  build: string;
+  inexact: boolean;
   /** Carpeta del cliente o ejecutable elegido; atenuada si todavía no existe. */
   location: string;
   locationMuted: boolean;
   /** Ruta que abre "Abrir carpeta", si hay algo que mostrar. */
   reveal: string | null;
   /** Acción secundaria (Preparar cliente, Reanudar, Progreso, Elegir carpeta). */
-  action: { label: string; icon: IconName; run: () => void } | null;
+  action: { label: string; icon: IconName; run: () => void; disabled?: boolean } | null;
   executable: string | null;
   /** Porcentaje de la descarga en curso, para la barra junto al estado. */
   progress: number | null;
@@ -80,7 +91,14 @@ type ClientView = {
   error: string | null;
 };
 
+type ReplayExited = { replayPath: string; exitCode: number | null };
+
 const LAST_LIBRARY_KEY = "chronorift.lastReplayLibrary";
+const GAME_EXE = "League of Legends.exe";
+// Texto del backend al terminar una descarga que el usuario detuvo.
+const STOPPED_MESSAGE = "Descarga detenida";
+// Nota que el backend pone en toda repetición ROFL2: informa, no explica una partida sin datos.
+const INFORMATIONAL_NOTES = new Set(["Metadatos ROFL2 leídos del bloque final"]);
 const DATA_DRAGON = "https://ddragon.leagueoflegends.com";
 // Plataforma de Riot (del nombre del archivo) → región en las URL de League of Graphs.
 const LEAGUE_OF_GRAPHS_REGIONS: Record<string, string> = {
@@ -115,6 +133,8 @@ const state = {
   view: "library" as View,
   settings: { clientsRoot: null } as AppSettings,
   library: null as ReplayLibrary | null,
+  // Carpeta abierta o, si falló, la que se intentó abrir: Actualizar vuelve a leerla.
+  libraryPath: null as string | null,
   libraryBusy: false,
   libraryError: null as string | null,
   owner: null as string | null,
@@ -130,6 +150,10 @@ const state = {
   libraryRun: 0,
   tab: "board" as Tab,
   statuses: new Map<string, LocalClientStatus>(),
+  // Versiones cuyo estado ya se leyó en la carpeta de clientes actual; las demás son desconocidas.
+  statusVersions: new Set<string>(),
+  // `client_statuses` falló (por ejemplo, una unidad USB desconectada): ningún estado es fiable.
+  statusesError: null as string | null,
   installed: [] as LocalClientStatus[],
   manualExecutables: new Map<string, string>(),
   locale: "en_US",
@@ -137,15 +161,21 @@ const state = {
   drawerMode: "plan" as "plan" | "progress",
   planKind: "install" as "install" | "resume",
   plan: null as ClientInstallPlan | null,
+  // Repetición, idioma y carpeta del plan pedido: solo se reutiliza si coinciden.
+  planKey: null as string | null,
   planning: false,
   planStage: null as string | null,
   planError: null as string | null,
   planRun: 0,
   install: null as InstallRun | null,
-  launch: null as null | { path: string; state: "launching" | "launched" | "error"; message: string },
+  // Fallo de la última descarga (o de Detener); se ve hasta el próximo intento.
+  installError: null as null | { gameVersion: string; build: string; message: string },
+  launch: null as null | { path: string; state: "launching" | "error"; message: string },
+  // Partidas abiertas por repetición: inicios menos salidas (evento `replay-exited`).
+  playing: new Map<string, number>(),
   vanguard: "unknown" as VanguardState,
-  // "Mostrar en carpeta" o "Abrir carpeta" fallidos en la partida abierta.
-  revealError: null as null | { path: string; message: string },
+  // Última acción fallida sobre la partida abierta: mostrar en carpeta o elegir ejecutable.
+  actionError: null as null | { path: string; message: string },
   clientsError: null as string | null,
   dataDragon: null as DataDragonAssets | null,
   communityDragon: null as CommunityDragonAssets | null,
@@ -160,9 +190,27 @@ const communityDragonCache = new Map<string, Promise<CommunityDragonAssets>>();
 const readyDataDragon = new Map<string, DataDragonAssets>();
 const readyCommunityDragon = new Map<string, CommunityDragonAssets>();
 
+type RowRecord = {
+  element: HTMLButtonElement;
+  glyph: HTMLElement;
+  entry: ReplayLibraryEntry | null;
+  content: string;
+};
+
+// Filas de la biblioteca por ruta: se reutilizan entre renders para que la fila con el foco no se
+// reemplace (elegir con Enter no lo pierde).
+const replayRows = new Map<string, RowRecord>();
+const failureRows = new Map<string, HTMLElement>();
+let rowsLibrary: ReplayLibrary | null = null;
+// Solo la lectura de estados más reciente se aplica.
+let statusRun = 0;
+let installedRun = 0;
+
 const el = {
+  skipLink: must(".skip-link", HTMLAnchorElement),
   navItems: [...document.querySelectorAll<HTMLButtonElement>(".nav-item")],
   activity: must("#activity", HTMLButtonElement),
+  activityLabel: must("#activity-label", HTMLElement),
   activityBuild: must("#activity-build", HTMLElement),
   activityBar: must("#activity-bar", HTMLElement),
   activityPercent: must("#activity-percent", HTMLElement),
@@ -172,6 +220,7 @@ const el = {
   clientsView: must("#clients-view", HTMLElement),
   replayCount: must("#replay-count", HTMLElement),
   refreshLibrary: must("#refresh-library", HTMLButtonElement),
+  openLibrary: must("#open-library", HTMLButtonElement),
   folderPath: must("#folder-path", HTMLElement),
   search: must("#replay-search", HTMLInputElement),
   resultFilter: must("#result-filter", HTMLElement),
@@ -181,6 +230,7 @@ const el = {
   libraryOwner: must("#library-owner", HTMLElement),
   libraryOwnerName: must("#library-owner-name", HTMLElement),
   librarySummary: must("#library-summary", HTMLElement),
+  matchMain: must("#main-content", HTMLElement),
   replayEmpty: must("#replay-empty", HTMLElement),
   emptyTitle: must("#empty-title", HTMLElement),
   emptyDetail: must("#empty-detail", HTMLElement),
@@ -199,6 +249,7 @@ const el = {
   matchId: must("#match-id", HTMLButtonElement),
   copyMatchId: must("#copy-match-id", HTMLButtonElement),
   version: must("#version", HTMLElement),
+  versionInexact: must("#version-inexact", HTMLElement),
   chooseExecutable: must("#choose-executable", HTMLButtonElement),
   clientAction: must("#client-action", HTMLButtonElement),
   clientActionIcon: must("#client-action-icon", HTMLElement),
@@ -255,6 +306,8 @@ const el = {
   confirmIcon: must("#confirm-icon", HTMLElement),
   confirmLabel: must("#confirm-label", HTMLElement),
   stopClient: must("#stop-client-action", HTMLButtonElement),
+  stopLabel: must("#stop-label", HTMLElement),
+  clientsMain: must("#clients-content", HTMLElement),
   installFolder: must("#install-folder", HTMLInputElement),
   revealClientsRoot: must("#reveal-clients-root", HTMLButtonElement),
   clientsRootError: must("#clients-root-error", HTMLElement),
@@ -268,12 +321,41 @@ hydrateIcons();
 initializeLocales();
 bindEvents();
 renderAll();
+if (import.meta.env.PROD) blockReloads();
 if ("__TAURI_INTERNALS__" in window) {
   void listen<DownloadProgress>("download-progress", ({ payload }) => onProgress(payload));
-  // Vanguard se detiene desde su icono de bandeja; al volver a la ventana se relee su estado.
-  window.addEventListener("focus", () => void refreshVanguard());
+  void listen<ReplayExited>("replay-exited", ({ payload }) => onReplayExited(payload));
+  window.addEventListener("focus", onWindowFocus);
   bindWindowControls();
   void boot();
+}
+
+/**
+ * Recargar la vista pierde todo el estado: una descarga en curso seguiría sin interfaz y se podría
+ * confirmar otra. En la app instalada se anulan F5, Ctrl+R y Ctrl+Mayús+R, y el menú contextual
+ * del visor (que ofrece "Actualizar") salvo en los campos de texto, donde sirve para copiar y pegar.
+ */
+function blockReloads() {
+  window.addEventListener(
+    "keydown",
+    (event) => {
+      const key = event.key.toLowerCase();
+      if (key === "f5" || ((event.ctrlKey || event.metaKey) && key === "r")) event.preventDefault();
+    },
+    true,
+  );
+  window.addEventListener("contextmenu", (event) => {
+    const target = event.target;
+    const editable = target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement;
+    if (!editable) event.preventDefault();
+  });
+}
+
+function onWindowFocus() {
+  // Vanguard se detiene desde su icono de bandeja; al volver a la ventana se relee su estado.
+  void refreshVanguard();
+  // Una unidad de clientes desconectada puede haber vuelto mientras la ventana no tenía el foco.
+  if (state.statusesError) void refreshClientStatuses();
 }
 
 // La ventana no tiene barra de título nativa: la barra superior la reemplaza.
@@ -313,6 +395,11 @@ async function boot() {
 // ——— Eventos ———
 
 function bindEvents() {
+  // El contenido principal depende de la vista: la partida o la lista de clientes.
+  el.skipLink.addEventListener("click", (event) => {
+    event.preventDefault();
+    (state.view === "clients" ? el.clientsMain : el.matchMain).focus();
+  });
   for (const button of document.querySelectorAll<HTMLButtonElement>("[data-view]")) {
     button.addEventListener("click", () => setView(button.dataset.view as View));
   }
@@ -320,8 +407,9 @@ function bindEvents() {
   for (const button of document.querySelectorAll<HTMLButtonElement>("#open-library, [data-action='open-library']")) {
     button.addEventListener("click", () => void chooseLibrary());
   }
+  // También reintenta una carpeta que no se pudo leer (una unidad de red dormida, un USB).
   el.refreshLibrary.addEventListener("click", () => {
-    if (state.library) void loadLibrary(state.library.folderPath, state.selectedPath);
+    if (state.libraryPath) void loadLibrary(state.libraryPath);
   });
   el.search.addEventListener("input", () => {
     state.query = el.search.value;
@@ -365,15 +453,17 @@ function bindEvents() {
   el.play.addEventListener("click", () => void playReplay());
   el.scrim.addEventListener("click", closeDrawer);
   el.drawerClose.addEventListener("click", closeDrawer);
-  el.drawer.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeDrawer();
+  // Escape cierra el panel aunque el foco esté en la biblioteca, que sigue disponible al lado.
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !event.defaultPrevented && state.drawerOpen && state.view === "library") {
+      closeDrawer();
+    }
   });
   el.cancelClient.addEventListener("click", closeDrawer);
   el.confirmClient.addEventListener("click", () => void confirmInstall());
   el.stopClient.addEventListener("click", () => void stopInstall());
-  el.planChangeRoot.addEventListener("click", async () => {
-    if (await chooseClientsRoot()) void refreshPlan();
-  });
+  // Guardar otra carpeta vuelve a planificar el panel abierto.
+  el.planChangeRoot.addEventListener("click", () => void chooseClientsRoot());
   el.locale.addEventListener("change", () => {
     state.locale = el.locale.value;
     renderClientStrip();
@@ -397,6 +487,7 @@ function setView(view: View) {
 async function loadSettings() {
   try {
     state.settings = await invoke<AppSettings>("get_settings");
+    state.clientsError = null;
   } catch (error) {
     state.clientsError = errorText(error);
   }
@@ -407,8 +498,18 @@ async function loadSettings() {
 async function saveClientsRoot(path: string) {
   if (!path.trim()) return false;
   try {
+    const previous = state.settings.clientsRoot;
     state.settings = await invoke<AppSettings>("set_clients_root", { path });
     state.clientsError = null;
+    if (state.settings.clientsRoot !== previous) {
+      // Lo leído, lo planificado y el fallo de la última descarga eran de la carpeta anterior.
+      state.statuses = new Map();
+      state.statusVersions = new Set();
+      state.statusesError = null;
+      if (!state.install) state.installError = null;
+      if (state.drawerOpen && state.drawerMode === "plan") void refreshPlan();
+      else dropPlan();
+    }
     await refreshClientStatuses();
     return true;
   } catch (error) {
@@ -420,7 +521,14 @@ async function saveClientsRoot(path: string) {
 }
 
 async function chooseClientsRoot() {
-  const selected = await open({ directory: true, multiple: false });
+  let selected: string | string[] | null;
+  try {
+    selected = await open({ directory: true, multiple: false, defaultPath: state.settings.clientsRoot ?? undefined });
+  } catch (error) {
+    state.clientsError = errorText(error);
+    renderAll();
+    return false;
+  }
   return typeof selected === "string" ? saveClientsRoot(selected) : false;
 }
 
@@ -428,17 +536,24 @@ async function chooseClientsRoot() {
 
 async function chooseLibrary() {
   if (state.libraryBusy) return;
-  const selected = await open({ directory: true, multiple: false });
+  let selected: string | string[] | null;
+  try {
+    selected = await open({ directory: true, multiple: false, defaultPath: state.libraryPath ?? undefined });
+  } catch {
+    return; // Sin diálogo no hay carpeta nueva; la biblioteca actual sigue igual.
+  }
   if (typeof selected === "string") await loadLibrary(selected);
 }
 
-async function loadLibrary(path: string, preferredPath: string | null = null) {
+async function loadLibrary(path: string) {
   if (state.libraryBusy) return;
   state.libraryBusy = true;
   renderLibrary();
   try {
     const library = await invoke<ReplayLibrary>("inspect_replay_folder", { path });
+    library.entries.sort(compareEntries);
     state.library = library;
+    state.libraryPath = library.folderPath;
     state.libraryError = null;
     // Un escaneo nuevo reemplaza lo leído antes: los archivos pudieron cambiar.
     state.inspections.clear();
@@ -448,25 +563,61 @@ async function loadLibrary(path: string, preferredPath: string | null = null) {
     localStorage.setItem(LAST_LIBRARY_KEY, library.folderPath);
     void refreshClientStatuses();
     void loadChampionNames(library);
-    const target = library.entries.find((entry) => entry.path === preferredPath)
+    // La selección vigente al terminar el escaneo, no la del momento del clic: pudo cambiar.
+    const target = library.entries.find((entry) => entry.path === state.selectedPath)
       ?? visibleEntries()[0]
       ?? library.entries[0];
     if (target) void selectReplay(target.path);
-    else {
-      state.selectedPath = null;
-      state.replay = null;
-    }
+    else clearSelection();
   } catch (error) {
     state.library = null;
+    state.libraryPath = path;
     state.owner = null;
     state.libraryError = errorText(error);
-    state.replay = null;
-    state.selectedPath = null;
-    localStorage.removeItem(LAST_LIBRARY_KEY);
+    // La lectura previa de la carpeta anterior deja de servir.
+    state.libraryRun++;
+    state.inspections.clear();
+    clearSelection();
+    // La carpeta recordada se conserva: el backend no distingue una carpeta borrada de una unidad
+    // de red dormida o un USB desconectado, que vuelven. Se reemplaza al abrir otra que funcione.
   } finally {
     state.libraryBusy = false;
     renderAll();
   }
+}
+
+/** Sin repetición elegida: una lectura que siga pendiente ya no se mostrará al llegar. */
+function clearSelection() {
+  state.replayRun++;
+  state.selectedPath = null;
+  state.replay = null;
+  state.replayLoading = false;
+  state.replayError = null;
+  state.launch = null;
+  state.actionError = null;
+  if (!state.install) {
+    state.drawerOpen = false;
+    dropPlan();
+  }
+}
+
+/** La más reciente primero por fecha del archivo; a igual fecha, el ID de partida mayor. */
+function compareEntries(left: ReplayLibraryEntry, right: ReplayLibraryEntry) {
+  const leftTime = left.modifiedAtMs ?? Number.NEGATIVE_INFINITY;
+  const rightTime = right.modifiedAtMs ?? Number.NEGATIVE_INFINITY;
+  if (leftTime !== rightTime) return rightTime > leftTime ? 1 : -1;
+  return compareMatchIds(right.matchId, left.matchId) || left.fileName.localeCompare(right.fileName);
+}
+
+/** Orden ascendente de IDs de partida numéricos; sin ID va primero. */
+function compareMatchIds(left: string | null, right: string | null) {
+  if (left === right) return 0;
+  if (left == null) return -1;
+  if (right == null) return 1;
+  if (/^\d+$/.test(left) && /^\d+$/.test(right) && left.length !== right.length) {
+    return left.length - right.length;
+  }
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 /** El dueño de la biblioteca es el Riot ID presente en todas las repeticiones analizadas. */
@@ -501,7 +652,7 @@ function visibleEntries() {
       entry.region,
       entry.matchId,
       owner?.champion,
-      owner ? championName(owner.champion) : null,
+      owner ? libraryChampionName(owner.champion) : null,
     ].filter(Boolean).join(" ").toLocaleLowerCase();
     return haystack.includes(query);
   });
@@ -517,16 +668,29 @@ function visibleFailures() {
 }
 
 async function refreshClientStatuses() {
+  const run = ++statusRun;
   const root = state.settings.clientsRoot;
   const versions = [...new Set((state.library?.entries ?? []).map((entry) => entry.gameVersion).filter(Boolean))] as string[];
-  if (!root) {
+  if (!root || !versions.length) {
+    // Nada que leer: tampoco queda un error de una lectura anterior.
     state.statuses = new Map();
-  } else if (versions.length) {
+    state.statusVersions = new Set();
+    state.statusesError = null;
+  } else {
     try {
       const statuses = await invoke<Record<string, LocalClientStatus>>("client_statuses", { clientsRoot: root, versions });
+      if (run !== statusRun) return; // Otra lectura más nueva manda.
       state.statuses = new Map(Object.entries(statuses));
+      // Una versión que el backend no devuelve no tiene cliente: se conoce como no instalada.
+      state.statusVersions = new Set(versions);
+      state.statusesError = null;
+      state.clientsError = null;
     } catch (error) {
-      state.clientsError = errorText(error);
+      if (run !== statusRun) return;
+      // Sin lectura (por ejemplo, un USB desconectado) no queda ningún "Listo" ni "No instalado" viejo.
+      state.statuses = new Map();
+      state.statusVersions = new Set();
+      state.statusesError = errorText(error);
     }
   }
   if (state.view === "clients") await refreshInstalledClients();
@@ -534,13 +698,19 @@ async function refreshClientStatuses() {
 }
 
 async function refreshInstalledClients() {
+  const run = ++installedRun;
   const root = state.settings.clientsRoot;
   if (!root) {
     state.installed = [];
   } else {
     try {
-      state.installed = await invoke<LocalClientStatus[]>("list_clients", { clientsRoot: root });
+      const installed = await invoke<LocalClientStatus[]>("list_clients", { clientsRoot: root });
+      if (run !== installedRun) return;
+      state.installed = installed;
+      state.clientsError = null;
     } catch (error) {
+      if (run !== installedRun) return;
+      state.installed = [];
       state.clientsError = errorText(error);
     }
   }
@@ -564,6 +734,7 @@ async function loadChampionNames(library: ReplayLibrary) {
 
 async function selectReplay(path: string) {
   const run = ++state.replayRun;
+  const generation = state.libraryRun;
   state.selectedPath = path;
   const known = state.inspections.get(path);
   if (known) {
@@ -577,12 +748,13 @@ async function selectReplay(path: string) {
   renderMatch();
   try {
     const replay = await invoke<ReplayInspection>("inspect_replay", { path });
-    state.inspections.set(path, replay);
+    // Lo leído antes de otro escaneo no entra en la caché del nuevo.
+    if (generation === state.libraryRun) state.inspections.set(path, replay);
     if (run === state.replayRun) showReplay(replay);
   } catch (error) {
     if (run !== state.replayRun) return;
-    state.replay = null;
-    state.replayLoading = false;
+    clearSelection();
+    state.selectedPath = path;
     state.replayError = errorText(error);
     renderAll();
   }
@@ -590,15 +762,18 @@ async function selectReplay(path: string) {
 
 /** Muestra una repetición ya leída; con los datos de su parche en memoria, todo sale de una vez. */
 function showReplay(replay: ReplayInspection) {
+  // Releer la misma (tras Actualizar) conserva el idioma elegido, el plan y el panel abiertos.
+  const same = state.replay?.path === replay.path;
   state.replay = replay;
   state.replayLoading = false;
   state.replayError = null;
-  state.locale = replay.suggestedLocale ?? "en_US";
-  state.plan = null;
-  state.planError = null;
-  state.launch = null;
-  state.revealError = null;
-  if (!state.install) state.drawerOpen = false;
+  if (!same) {
+    state.locale = replay.suggestedLocale ?? "en_US";
+    state.launch = null;
+    state.actionError = null;
+    if (!state.install) state.drawerOpen = false;
+    dropPlan();
+  }
   const ready = readyAssets(replay);
   state.dataDragon = ready.data;
   state.communityDragon = ready.community;
@@ -710,13 +885,32 @@ async function openClientPlan(kind: "install" | "resume") {
   const replay = state.replay;
   if (!replay?.patch || replay.status !== "parsed" || state.install) return;
   if (!state.settings.clientsRoot && !(await chooseClientsRoot())) return;
+  if (state.replay !== replay || state.install) return;
   // El plan parte del idioma que muestra la barra: el de la instalación, si ya hay una.
   state.locale = clientLocale();
   state.planKind = kind;
   state.drawerOpen = true;
   state.drawerMode = "plan";
+  // Tras un fallo el plan ya se rehízo (o se está rehaciendo) para esta repetición: se usa ese.
+  const request = clientRequest(null);
+  const reusable = !!request && state.planKey === planKey(request) && (state.planning || !!state.plan);
   renderDrawer();
-  await refreshPlan();
+  if (!reusable) await refreshPlan();
+}
+
+/** Repetición, idioma y carpeta de un pedido de plan. */
+function planKey(request: ClientRequest) {
+  return [state.replay?.path ?? "", request.locale, request.clientsRoot].join("\n");
+}
+
+/** Descarta el plan mostrado y cualquier plan que siga en camino. */
+function dropPlan() {
+  state.planRun++;
+  state.plan = null;
+  state.planKey = null;
+  state.planning = false;
+  state.planStage = null;
+  state.planError = null;
 }
 
 async function refreshPlan() {
@@ -724,6 +918,7 @@ async function refreshPlan() {
   if (!request) return;
   const run = ++state.planRun;
   state.plan = null;
+  state.planKey = planKey(request);
   state.planning = true;
   state.planStage = null;
   state.planError = null;
@@ -744,31 +939,45 @@ async function refreshPlan() {
 async function confirmInstall() {
   const plan = state.plan;
   const replay = state.replay;
-  if (!plan || !replay?.gameVersion || state.install) return;
-  const request = clientRequest({
+  const version = replay?.gameVersion;
+  if (!plan || !replay || !version || state.install || state.planning) return;
+  const confirmed = clientRequest({
     mode: plan.mode,
     resolvedVersion: plan.resolvedVersion,
     destinationPath: plan.destinationPath,
+    locale: plan.locale,
+    manifestUrl: plan.manifestUrl,
   });
-  if (!request) return;
+  if (!confirmed) return;
+  // Se pide exactamente el plan que se vio, con su idioma.
+  const request: ClientRequest = { ...confirmed, locale: plan.locale };
+  state.installError = null;
   state.install = {
-    gameVersion: replay.gameVersion,
+    gameVersion: version,
     build: plan.gameBuild,
+    exactBuild: plan.exactBuild,
     destination: plan.destinationPath,
     locale: plan.locale,
+    replayPath: replay.path,
+    replayName: replay.fileName,
+    replays: replaysOf(version),
     stage: "resolve",
     detail: "",
     downloaded: 0,
     total: plan.downloadBytes,
-    percent: plan.downloadBytes === 0 ? 100 : 0,
+    percent: 0,
+    done: false,
     stopping: false,
   };
   state.drawerMode = "progress";
+  dropPlan();
   renderAll();
+  let failed = false;
   try {
     const result = await invoke<ClientInstallResult>("install_client", { request });
-    state.statuses.set(replay.gameVersion, {
+    state.statuses.set(version, {
       gameBuild: result.gameBuild,
+      exactBuild: result.exactBuild,
       destinationPath: result.destinationPath,
       state: "ready",
       executablePath: result.executablePath,
@@ -776,34 +985,51 @@ async function confirmInstall() {
       installedBytes: result.totalInstallBytes,
       totalInstallBytes: result.totalInstallBytes,
     });
+    state.statusVersions.add(version);
     state.install = null;
     state.drawerOpen = false;
+    // Solo pudo quedar el aviso de un Detener que falló durante esta misma descarga.
+    state.installError = null;
   } catch (error) {
-    const stopped = state.install?.stopping ?? false;
+    const message = errorText(error);
+    const run = state.install;
+    // Solo es una parada del usuario si pidió Detener y el backend terminó por eso.
+    const stopped = run?.stopping === true && message === STOPPED_MESSAGE;
     state.install = null;
-    state.plan = null;
+    state.drawerMode = "plan";
     if (stopped) {
       state.drawerOpen = false;
     } else {
-      state.drawerMode = "plan";
-      state.planError = errorText(error);
+      failed = true;
+      state.installError = { gameVersion: version, build: run?.build ?? plan.gameBuild, message };
+      state.planKind = "resume";
+      // El panel abierto seguía esta descarga: la barra pasa a su repetición para mostrar el fallo.
+      if (state.drawerOpen && run && state.replay?.gameVersion !== version && state.inspections.has(run.replayPath)) {
+        void selectReplay(run.replayPath);
+      }
     }
-  } finally {
-    renderAll();
-    await refreshClientStatuses();
+  }
+  renderAll();
+  await refreshClientStatuses();
+  // Tras un fallo el plan se rehace solo, así Reanudar queda listo con un clic.
+  if (failed && !state.install && !state.planning && !state.plan && state.replay?.gameVersion === version) {
+    state.locale = clientLocale();
+    void refreshPlan();
   }
 }
 
 async function stopInstall() {
-  if (!state.install || state.install.stopping) return;
-  state.install.stopping = true;
-  renderDrawer();
+  const install = state.install;
+  if (!install || install.stopping) return;
+  install.stopping = true;
+  renderInstall();
   try {
     await invoke("cancel_client_install");
   } catch (error) {
-    if (state.install) state.install.stopping = false;
-    state.planError = errorText(error);
-    renderDrawer();
+    if (state.install !== install) return;
+    install.stopping = false;
+    state.installError = { gameVersion: install.gameVersion, build: install.build, message: errorText(error) };
+    renderAll();
   }
 }
 
@@ -819,25 +1045,22 @@ function showProgress() {
 
 function closeDrawer() {
   state.drawerOpen = false;
-  if (!state.install) {
-    state.plan = null;
-    state.planRun++;
-    state.planning = false;
-    state.planError = null;
-  }
+  if (!state.install) dropPlan();
   renderDrawer();
 }
 
 let progressFrame = 0;
 
 function onProgress(progress: DownloadProgress) {
-  if (state.install) {
-    state.install.stage = progress.stage;
-    if (progress.stage === "download") state.install.detail = progress.detail;
+  const install = state.install;
+  if (install) {
+    install.stage = progress.stage;
+    if (progress.stage === "download") install.detail = progress.detail;
     if (progress.stage === "download" || progress.done) {
-      state.install.downloaded = progress.downloadedBytes;
-      state.install.total = progress.totalBytes ?? state.install.total;
-      state.install.percent = progress.done ? 100 : progress.percent ?? state.install.percent;
+      install.downloaded = progress.downloadedBytes;
+      install.total = progress.totalBytes ?? install.total;
+      install.percent = progress.percent ?? install.percent;
+      install.done = install.done || progress.done;
     }
   } else if (state.planning) {
     state.planStage = progress.stage;
@@ -848,23 +1071,43 @@ function onProgress(progress: DownloadProgress) {
   if (progressFrame) return;
   progressFrame = requestAnimationFrame(() => {
     progressFrame = 0;
-    renderAppBar();
-    renderDrawer();
-    renderClientStrip();
+    renderInstall();
   });
+}
+
+/** Todo lo que muestra la descarga en curso: barra superior, panel, barra del cliente y Clientes. */
+function renderInstall() {
+  renderAppBar();
+  renderDrawer();
+  renderClientStrip();
+  renderInstallRow();
 }
 
 async function chooseExecutable() {
   const replay = state.replay;
   if (!replay) return;
-  const selected = await open({
-    multiple: false,
-    filters: [{ name: "League of Legends", extensions: ["exe"] }],
-  });
-  if (typeof selected === "string") {
-    state.manualExecutables.set(replay.path, selected);
+  let selected: string | string[] | null;
+  try {
+    selected = await open({
+      multiple: false,
+      filters: [{ name: "League of Legends", extensions: ["exe"] }],
+    });
+  } catch (error) {
+    state.actionError = { path: replay.path, message: errorText(error) };
     renderClientStrip();
+    return;
   }
+  if (typeof selected !== "string") return;
+  // Lo mismo que exige el backend al reproducir, pero dicho al elegir y no al fallar después.
+  if (fileNameOf(selected).toLowerCase() === GAME_EXE.toLowerCase()) {
+    state.manualExecutables.set(replay.path, selected);
+    if (state.actionError?.path === replay.path) state.actionError = null;
+  } else {
+    state.actionError = { path: replay.path, message: `No es ${GAME_EXE}: ${selected}` };
+  }
+  // Se ve el resultado de la última acción: el error de un inicio anterior deja de mostrarse.
+  if (state.launch?.path === replay.path && state.launch.state === "error") state.launch = null;
+  renderClientStrip();
 }
 
 async function playReplay() {
@@ -872,13 +1115,14 @@ async function playReplay() {
   const executable = clientView()?.executable;
   if (!replay || !executable || state.launch?.state === "launching") return;
   state.launch = { path: replay.path, state: "launching", message: "" };
-  state.revealError = null;
+  if (state.actionError?.path === replay.path) state.actionError = null;
   renderClientStrip();
   try {
     await invoke("launch_replay", {
       request: { replayPath: replay.path, executablePath: executable, locale: clientLocale() },
     });
-    state.launch = { path: replay.path, state: "launched", message: "" };
+    if (state.launch?.path === replay.path) state.launch = null;
+    countPlaying(replay.path, 1);
   } catch (error) {
     // Se relee antes de guardar el error para que un cambio de Vanguard no borre este fallo.
     await refreshVanguard();
@@ -886,6 +1130,34 @@ async function playReplay() {
   } finally {
     renderClientStrip();
   }
+}
+
+/** El juego que abrió una repetición se cerró: la barra vuelve a su estado normal. */
+function onReplayExited({ replayPath }: ReplayExited) {
+  countPlaying(replayPath, -1);
+  renderClientStrip();
+}
+
+// Un cierre puede llegar antes que la respuesta del inicio: la cuenta admite valores negativos.
+function countPlaying(path: string, delta: number) {
+  const key = pathKey(path);
+  const count = (state.playing.get(key) ?? 0) + delta;
+  if (count === 0) state.playing.delete(key);
+  else state.playing.set(key, count);
+}
+
+function isPlaying(path: string) {
+  return (state.playing.get(pathKey(path)) ?? 0) > 0;
+}
+
+/** Rutas de Windows: sin distinguir mayúsculas ni el tipo de barra. */
+function pathKey(path: string) {
+  return path.replace(/\//g, "\\").toLowerCase();
+}
+
+/** Repeticiones de la biblioteca con esa versión; al menos la que se está viendo. */
+function replaysOf(version: string) {
+  return Math.max(1, state.library?.entries.filter((entry) => entry.gameVersion === version).length ?? 0);
 }
 
 // Solo lectura: ChronoRift nunca detiene Vanguard ni cambia su configuración.
@@ -910,8 +1182,11 @@ function clientView(): ClientView | null {
   const status = version ? state.statuses.get(version) : undefined;
   const manual = state.manualExecutables.get(replay.path) ?? null;
   const install = state.install;
-  const plan = (kind: "install" | "resume") => () => void openClientPlan(kind);
+  // Mientras se descarga otra compilación no se puede empezar esta.
+  const plan = (kind: "install" | "resume") => ({ run: () => void openClientPlan(kind), disabled: !!install });
   const none: Omit<ClientView, "glyph" | "text" | "location"> = {
+    build: version ?? "—",
+    inexact: false,
     locationMuted: false,
     reveal: null,
     action: null,
@@ -923,14 +1198,17 @@ function clientView(): ClientView | null {
   let view: ClientView;
 
   if (install && install.gameVersion === version) {
+    const percent = progressPercent(install.percent, install.done);
     view = {
       ...none,
       glyph: "busy",
-      text: `Descargando${install.percent == null ? "" : ` · ${formatPercent(install.percent)}`}`,
+      text: installStateText(install),
+      build: install.build,
+      inexact: !install.exactBuild,
       location: install.destination,
       reveal: install.destination,
       action: { label: "Progreso", icon: "download", run: showProgress },
-      progress: install.percent ?? 0,
+      progress: percent,
     };
   } else if (manual) {
     view = { ...none, glyph: "ready", text: "Ejecutable elegido", location: manual, reveal: manual, executable: manual };
@@ -945,20 +1223,37 @@ function clientView(): ClientView | null {
       locationMuted: true,
       action: { label: "Elegir carpeta", icon: "folder", run: () => void chooseClientsRoot() },
     };
+  } else if (state.statusesError) {
+    // Carpeta de clientes inaccesible: no se sabe si hay cliente, así que no se ofrece nada.
+    view = { ...none, glyph: "unknown", text: "No disponible", location: "—", locationMuted: true, error: state.statusesError };
+  } else if (!version || !state.statusVersions.has(version)) {
+    // Estado todavía sin leer: neutro, ni "Listo" ni "No instalado".
+    view = { ...none, glyph: "unknown", text: "—", location: "—", locationMuted: true };
   } else if (status?.state === "ready" && status.executablePath) {
     const executable = status.executablePath;
-    view = { ...none, glyph: "ready", text: "Listo", location: status.destinationPath, reveal: executable, executable };
+    view = {
+      ...none,
+      glyph: "ready",
+      text: "Listo",
+      build: status.gameBuild,
+      inexact: status.exactBuild === false,
+      location: status.destinationPath,
+      reveal: executable,
+      executable,
+    };
   } else if (status?.state === "partial") {
     const percent = status.totalInstallBytes
-      ? (status.installedBytes / status.totalInstallBytes) * 100
+      ? progressPercent((status.installedBytes / status.totalInstallBytes) * 100, false)
       : null;
     view = {
       ...none,
       glyph: "partial",
-      text: `Incompleto${percent == null ? "" : ` · ${formatPercent(Math.min(percent, 99))}`}`,
+      text: `Incompleto${percent == null ? "" : ` · ${formatPercent(percent)}`}`,
+      build: status.gameBuild,
+      inexact: status.exactBuild === false,
       location: status.destinationPath,
       reveal: status.destinationPath,
-      action: { label: "Reanudar", icon: "download", run: plan("resume") },
+      action: { label: "Reanudar", icon: "download", ...plan("resume") },
     };
   } else {
     view = {
@@ -967,22 +1262,30 @@ function clientView(): ClientView | null {
       text: "No instalado",
       location: status?.destinationPath ?? "—",
       locationMuted: true,
-      action: { label: "Preparar cliente", icon: "download", run: plan("install") },
+      action: { label: "Preparar cliente", icon: "download", ...plan("install") },
     };
   }
 
   const launch = state.launch?.path === replay.path ? state.launch : null;
   if (launch?.state === "launching") view.text = "Abriendo…";
-  else if (launch?.state === "launched") view.text = "Reproduciendo";
   else if (view.executable && state.vanguard === "running") {
+    // Con Vanguard activo el juego no abre: eso manda sobre "Reproduciendo".
     view.glyph = "blocked";
     view.text = "Vanguard activo";
-    if (launch?.state === "error") view.error = launch.message;
-  } else if (launch?.state === "error") {
-    view.text = "No se pudo reproducir";
-    view.error = launch.message;
-  }
-  if (!view.error && state.revealError?.path === replay.path) view.error = state.revealError.message;
+  } else if (view.executable && isPlaying(replay.path)) view.text = "Reproduciendo";
+  else if (launch?.state === "error") view.text = "No se pudo reproducir";
+
+  // Una sola línea: el error de la última acción sobre esta partida y, si no hay, el de la carpeta
+  // de clientes o el de la última descarga. Esa descarga pudo ser de otra compilación (se cambió de
+  // partida mientras corría): igual se ve, con su build delante, para que no falle en silencio.
+  const failure = manual ? null : state.installError;
+  const download = failure
+    ? failure.gameVersion === version ? failure.message : `${failure.build} · ${failure.message}`
+    : null;
+  view.error = (launch?.state === "error" ? launch.message : null)
+    ?? (state.actionError?.path === replay.path ? state.actionError.message : null)
+    ?? view.error
+    ?? download;
   return view;
 }
 
@@ -1020,12 +1323,15 @@ function renderAppBar() {
   }
   el.libraryView.hidden = state.view !== "library";
   el.clientsView.hidden = state.view !== "clients";
+  el.skipLink.setAttribute("href", `#${(state.view === "clients" ? el.clientsMain : el.matchMain).id}`);
   const install = state.install;
   el.activity.hidden = !install;
   if (install) {
-    el.activityBuild.textContent = install.build;
-    el.activityBar.style.width = `${install.percent ?? 0}%`;
-    el.activityPercent.textContent = install.percent == null ? "—" : formatPercent(install.percent);
+    const percent = progressPercent(install.percent, install.done);
+    setText(el.activityLabel, install.stopping ? "Deteniendo…" : "Descargando");
+    setText(el.activityBuild, install.build);
+    el.activityBar.style.width = `${percent}%`;
+    setText(el.activityPercent, formatPercent(percent));
   }
   el.storageRoot.textContent = state.settings.clientsRoot ?? "Sin carpeta";
   el.storageChip.title = state.settings.clientsRoot ?? "";
@@ -1039,14 +1345,15 @@ function renderLibrary() {
   const total = (library?.entries.length ?? 0) + (library?.failures.length ?? 0);
   const shown = entries.length + failed.length;
   const filtered = state.query.trim() !== "" || state.filter !== "all";
-  // Sin carpeta abierta no hay cuenta ni ruta que mostrar.
+  // Sin carpeta abierta no hay cuenta; la ruta se ve también si falló, para reintentar.
   el.replayCount.hidden = !library;
   el.replayCount.textContent = filtered ? `${shown}/${total}` : String(total);
-  el.refreshLibrary.disabled = !library || state.libraryBusy;
+  el.refreshLibrary.disabled = !state.libraryPath || state.libraryBusy;
+  el.openLibrary.disabled = state.libraryBusy;
   el.search.disabled = total === 0 || state.libraryBusy;
-  el.folderPath.hidden = !library;
-  el.folderPath.textContent = library ? shortenPath(library.folderPath) : "";
-  el.folderPath.title = library?.folderPath ?? "";
+  el.folderPath.hidden = !state.libraryPath;
+  el.folderPath.textContent = state.libraryPath ? shortenPath(state.libraryPath) : "";
+  el.folderPath.title = state.libraryPath ?? "";
 
   const owned = library?.entries.map(ownerOf).filter((owner): owner is LibraryPlayer => !!owner) ?? [];
   el.resultFilter.hidden = !state.owner;
@@ -1062,7 +1369,7 @@ function renderLibrary() {
     if (count) count.textContent = String(counts[filter]);
   }
 
-  el.libraryList.replaceChildren(...entries.map(createReplayRow), ...failed.map(createFailureRow));
+  renderRows(entries, failed);
   // La lista vacía se oculta para que el estado vacío ocupe todo el alto y quede centrado.
   el.libraryList.hidden = shown === 0;
   el.libraryEmpty.hidden = shown > 0;
@@ -1081,56 +1388,130 @@ function renderLibrary() {
   el.libraryOwner.hidden = !state.owner;
   el.libraryOwnerName.textContent = state.owner ?? "";
   el.libraryOwnerName.title = state.owner ?? "";
-  const versions = new Set(library?.entries.map((entry) => entry.gameVersion).filter(Boolean));
-  const ready = [...versions].filter((version) => state.statuses.get(version as string)?.state === "ready").length;
+  const versions = new Set(library?.entries.map((entry) => entry.gameVersion).filter(Boolean) as string[]);
+  const known = [...versions].every((version) => state.statusVersions.has(version));
+  const ready = [...versions].filter((version) => state.statuses.get(version)?.state === "ready").length;
   const failures = library?.failures.length ? ` · ${library.failures.length} con error` : "";
-  el.librarySummary.textContent = library && state.settings.clientsRoot && versions.size
+  // La cuenta de builds listos espera a que se lean los estados.
+  el.librarySummary.textContent = library && state.settings.clientsRoot && versions.size && known
     ? `${ready}/${versions.size} builds${failures}`
     : failures.replace(/^ · /, "");
 }
 
-/** Archivo que no se pudo leer: fila gris con el nombre y el motivo, sin selección. */
-function createFailureRow(failure: ReplayLibrary["failures"][number]) {
-  return h(
-    "div",
-    { class: "failed-row", title: failure.path },
-    h("span"),
-    h("span", { class: "tile", text: "—" }),
-    h(
-      "span",
-      { class: "replay-row__main" },
-      h("span", { class: "replay-row__name", text: fileNameOf(failure.path) }),
-      h("span", { class: "failed-row__reason", text: failure.message, title: failure.message }),
-    ),
-  );
+function renderRows(entries: ReplayLibraryEntry[], failures: ReplayLibrary["failures"]) {
+  const library = state.library;
+  if (rowsLibrary !== library) {
+    // Otra carpeta u otro escaneo: se olvidan las filas de archivos que ya no están.
+    const paths = new Set(library?.entries.map((entry) => entry.path));
+    for (const path of replayRows.keys()) if (!paths.has(path)) replayRows.delete(path);
+    failureRows.clear();
+    rowsLibrary = library;
+  }
+  const active = document.activeElement;
+  const focused = active instanceof HTMLElement && active.parentElement === el.libraryList ? active.dataset.path : undefined;
+  reconcileChildren(el.libraryList, [...entries.map(replayRow), ...failures.map(failureRow)]);
+  // Si la fila con el foco tuvo que moverse, el foco vuelve a ella.
+  const row = focused ? replayRows.get(focused)?.element : undefined;
+  if (row?.isConnected && document.activeElement !== row) row.focus({ preventScroll: true });
 }
 
-function createReplayRow(entry: ReplayLibraryEntry) {
-  const owner = ownerOf(entry);
-  const current = entry.path === state.selectedPath;
-  const glyph = glyphFor(entry.gameVersion);
-  const name = owner ? championName(owner.champion) : entry.matchId ?? entry.fileName;
-  const kda = owner ? `${owner.kills}/${owner.deaths}/${owner.assists}` : `${entry.blueKills} – ${entry.redKills}`;
-  const row = h(
-    "button",
-    {
-      class: `replay-row${entry.status === "parsed" ? "" : " is-invalid"}`,
+/** Deja en `parent` exactamente `nodes`, en orden, moviendo solo lo que no está en su sitio. */
+function reconcileChildren(parent: HTMLElement, nodes: Node[]) {
+  let cursor = parent.firstChild;
+  for (const node of nodes) {
+    if (node === cursor) {
+      cursor = cursor.nextSibling;
+      continue;
+    }
+    parent.insertBefore(node, cursor);
+  }
+  while (cursor) {
+    const next = cursor.nextSibling;
+    parent.removeChild(cursor);
+    cursor = next;
+  }
+}
+
+/** Archivo que no se pudo leer: fila gris con el nombre y el motivo, sin selección. */
+function failureRow(failure: ReplayLibrary["failures"][number]) {
+  const key = `${failure.path}\n${failure.message}`;
+  let row = failureRows.get(key);
+  if (!row) {
+    row = h(
+      "div",
+      { class: "failed-row", title: failure.path },
+      h("span"),
+      h("span", { class: "tile", text: "—" }),
+      h(
+        "span",
+        { class: "replay-row__main" },
+        h("span", { class: "replay-row__name", text: fileNameOf(failure.path) }),
+        h("span", { class: "failed-row__reason", text: failure.message, title: failure.message }),
+      ),
+    );
+    failureRows.set(key, row);
+  }
+  return row;
+}
+
+/**
+ * Fila de una repetición. El botón se conserva entre renders (el foco no se pierde al elegir con
+ * Enter); su contenido solo se rehace si cambió, y la selección y el estado se actualizan en el sitio.
+ */
+function replayRow(entry: ReplayLibraryEntry) {
+  let record = replayRows.get(entry.path);
+  if (!record) {
+    const element = h("button", {
+      class: "replay-row",
       title: entry.path,
       dataset: { path: entry.path },
-      attrs: {
-        type: "button",
-        "aria-current": String(current),
-        "aria-label": [
-          owner ? (owner.win ? "Victoria" : "Derrota") : null,
-          name,
-          kda,
-          formatDuration(entry.gameDurationMs),
-          entry.patch ? `parche ${entry.patch}` : null,
-          glyphLabel(glyph),
-        ].filter(Boolean).join(", "),
-      },
+      attrs: { type: "button" },
       on: { click: () => void selectReplay(entry.path) },
-    },
+    });
+    record = { element, glyph: glyphElement("unknown"), entry: null, content: "" };
+    replayRows.set(entry.path, record);
+  }
+  const owner = ownerOf(entry);
+  const parsed = entry.status === "parsed";
+  const name = owner ? libraryChampionName(owner.champion) : entry.matchId ?? entry.fileName;
+  // Sin jugadores (no analizada, o estadísticas omitidas) no se inventa un 0 – 0.
+  const scored = parsed && entry.players.length > 0;
+  const kda = owner ? `${owner.kills}/${owner.deaths}/${owner.assists}` : scored ? `${entry.blueKills} – ${entry.redKills}` : "—";
+  const portrait = owner ? libraryChampionIcon(owner.champion, entry.patch) : null;
+  const content = [owner?.name ?? "", name, kda, portrait ?? ""].join("\n");
+  if (record.entry !== entry || record.content !== content) {
+    record.entry = entry;
+    record.content = content;
+    record.element.replaceChildren(...replayRowContent(entry, owner, name, kda, portrait, record.glyph));
+  }
+  const glyph = glyphFor(entry.gameVersion);
+  record.glyph.dataset.state = glyph;
+  record.element.classList.toggle("is-invalid", !parsed);
+  setAttribute(record.element, "aria-current", String(entry.path === state.selectedPath));
+  setAttribute(
+    record.element,
+    "aria-label",
+    [
+      owner ? (owner.win ? "Victoria" : "Derrota") : null,
+      name,
+      parsed ? (scored ? kda : null) : "no válida",
+      entry.gameDurationMs == null ? null : formatDuration(entry.gameDurationMs),
+      entry.patch ? `parche ${entry.patch}` : null,
+      entry.gameVersion ? glyphLabel(glyph) : null,
+    ].filter(Boolean).join(", "),
+  );
+  return record.element;
+}
+
+function replayRowContent(
+  entry: ReplayLibraryEntry,
+  owner: LibraryPlayer | null,
+  name: string,
+  kda: string,
+  portrait: string | null,
+  glyph: HTMLElement,
+) {
+  return [
     h(
       "span",
       {},
@@ -1138,7 +1519,9 @@ function createReplayRow(entry: ReplayLibraryEntry) {
         ? h("span", { class: `result-badge result-badge--${owner.win ? "win" : "loss"}`, text: owner.win ? "V" : "D" })
         : null,
     ),
-    owner ? championTile(owner.champion, entry.patch ? `${entry.patch}.1` : null) : h("span", { class: "tile", text: entry.region?.slice(0, 3) ?? "—" }),
+    owner
+      ? h("span", { class: "tile", title: name }, assetImage(portrait, name, abbreviate(name)))
+      : h("span", { class: "tile", text: entry.region?.slice(0, 3) ?? "—" }),
     h(
       "span",
       { class: "replay-row__main" },
@@ -1163,16 +1546,18 @@ function createReplayRow(entry: ReplayLibraryEntry) {
         "span",
         { class: "replay-row__meta" },
         h("span", { text: formatDuration(entry.gameDurationMs) }),
-        h("span", { class: "replay-row__patch" }, entry.patch ?? "—", glyphElement(glyph)),
+        h("span", { class: "replay-row__patch" }, entry.patch ?? "—", glyph),
       ),
     ),
-  );
-  return row;
+  ];
 }
 
 function glyphFor(version: string | null): GlyphState {
   if (!version) return "missing";
   if (state.install?.gameVersion === version) return "busy";
+  if (!state.settings.clientsRoot) return "missing";
+  // Sin lectura del disco todavía (o con la carpeta inaccesible) el estado es neutro.
+  if (!state.statusVersions.has(version)) return "unknown";
   const status = state.statuses.get(version)?.state;
   return status === "ready" || status === "partial" ? status : "missing";
 }
@@ -1184,6 +1569,7 @@ function glyphLabel(glyph: GlyphState) {
     missing: "cliente no instalado",
     busy: "descargando",
     blocked: "Vanguard activo",
+    unknown: null,
   }[glyph];
 }
 
@@ -1223,18 +1609,21 @@ function renderMatch() {
     setChip(el.resultChip, blueWon ? "Gana azul" : redWon ? "Gana rojo" : "Sin resultado", blueWon || redWon);
     el.resultSide.textContent = "";
   }
-  el.blueScore.textContent = String(replay.blueKills);
-  el.redScore.textContent = String(replay.redKills);
+  // Sin jugadores (no analizada, o estadísticas omitidas) no hay marcador: un solo "—" en lugar de
+  // un 0 – 0 inventado.
+  const scored = replay.status === "parsed" && replay.players.length > 0;
+  el.score.classList.toggle("score--empty", !scored);
+  el.blueScore.textContent = scored ? String(replay.blueKills) : "—";
+  el.redScore.textContent = scored ? String(replay.redKills) : "—";
   el.blueScore.classList.toggle("is-winner", blueWon);
   el.redScore.classList.toggle("is-winner", redWon);
   el.score.setAttribute(
     "aria-label",
-    `${el.resultChip.textContent}. Azul ${replay.blueKills}, rojo ${replay.redKills}`,
+    scored ? `${el.resultChip.textContent}. Azul ${replay.blueKills}, rojo ${replay.redKills}` : el.resultChip.textContent ?? "",
   );
   el.duration.textContent = formatDuration(replay.gameDurationMs);
   el.patch.textContent = replay.patch ?? "—";
   el.region.textContent = replay.region ?? "—";
-  el.version.textContent = replay.gameVersion ?? "—";
   const matchPage = matchPageUrl(replay);
   el.matchId.replaceChildren(replay.matchId ?? "—", matchPage ? icon("external") : "");
   el.matchId.disabled = !matchPage;
@@ -1258,26 +1647,35 @@ function renderMatchBody() {
   if (state.tab === "file") renderFile(replay);
 }
 
+// Solo se escribe lo que cambió: el estado y el error son regiones vivas y se pintan en cada cuadro
+// de una descarga; reescribir el mismo texto los volvería a anunciar.
 function renderClientStrip() {
   const view = clientView();
   if (!view) return;
   el.clientGlyph.dataset.state = view.glyph;
-  el.clientText.textContent = view.text;
-  el.clientLocation.textContent = view.location;
+  setText(el.clientText, view.text);
+  setText(el.version, view.build);
+  el.version.title = view.inexact && state.replay?.gameVersion ? `Repetición: ${state.replay.gameVersion}` : "";
+  el.versionInexact.hidden = !view.inexact;
+  setText(el.clientLocation, view.location);
   el.clientLocation.title = view.location === "—" ? "" : view.location;
   el.clientLocation.classList.toggle("is-muted", view.locationMuted);
   el.revealClient.hidden = !view.reveal;
-  el.clientLocale.textContent = view.locale;
+  setText(el.clientLocale, view.locale);
   el.clientAction.hidden = !view.action;
   if (view.action) {
-    el.clientActionLabel.textContent = view.action.label;
-    el.clientActionIcon.replaceChildren(icon(view.action.icon, "icon icon--sm"));
+    setText(el.clientActionLabel, view.action.label);
+    if (el.clientActionIcon.dataset.iconName !== view.action.icon) {
+      el.clientActionIcon.replaceChildren(icon(view.action.icon, "icon icon--sm"));
+      el.clientActionIcon.dataset.iconName = view.action.icon;
+    }
+    el.clientAction.disabled = !!view.action.disabled;
   }
   el.play.disabled = !view.executable || state.launch?.state === "launching";
   el.clientProgress.hidden = view.progress == null;
   el.clientProgressBar.style.width = `${view.progress ?? 0}%`;
   el.clientError.hidden = !view.error;
-  el.clientError.textContent = view.error ?? "";
+  setText(el.clientError, view.error ?? "");
   el.clientError.title = view.error ?? "";
 }
 
@@ -1285,7 +1683,10 @@ function renderClientStrip() {
 
 /** Sin jugadores: una repetición que no se pudo analizar dice por qué (notas del backend). */
 function emptyMatchText(replay: ReplayInspection) {
-  return replay.status !== "parsed" && replay.notes.length ? replay.notes.join(" ") : "Sin estadísticas";
+  // Las notas explican una lectura fallida o estadísticas omitidas (más de 32 jugadores); la que
+  // solo dice de dónde salieron los metadatos no explica nada.
+  const reasons = replay.notes.filter((note) => !INFORMATIONAL_NOTES.has(note));
+  return reasons.length ? reasons.join(" ") : "Sin estadísticas";
 }
 
 function renderScoreboard(replay: ReplayInspection) {
@@ -1348,7 +1749,11 @@ function playerRow(player: PlayerStats, teamKills: number, maxDamage: number, mi
     "div",
     {
       class: `sb-row sb-player${owner ? " is-owner" : ""}`,
-      attrs: { "aria-label": `${player.name || "Jugador"}, ${champion}, ${player.kills}/${player.deaths}/${player.assists}` },
+      // Un div genérico no admite nombre accesible: como grupo, el resumen se anuncia al entrar.
+      attrs: {
+        role: "group",
+        "aria-label": `${player.name || "Jugador"}, ${champion}, ${player.kills}/${player.deaths}/${player.assists}`,
+      },
     },
     h(
       "div",
@@ -1483,7 +1888,7 @@ function renderTeamCompare(replay: ReplayInspection) {
         const tone = (side: "left" | "right") => (lead === "tie" ? "is-tie" : lead === side ? "is-lead" : "is-trail");
         return h(
           "div",
-          { class: "compare-row", attrs: { "aria-label": `${label}: azul ${format(left)}, rojo ${format(right)}` } },
+          { class: "compare-row", attrs: { role: "group", "aria-label": `${label}: azul ${format(left)}, rojo ${format(right)}` } },
           h("span", { class: "compare-row__label", text: label }),
           h("span", { class: `compare-row__value num${lead === "left" ? " is-lead" : ""}`, text: format(left) }),
           h(
@@ -1518,6 +1923,7 @@ function renderDamage(replay: ReplayInspection) {
             {
               class: `dmg-row${owner ? " is-owner" : ""}`,
               attrs: {
+                role: "group",
                 "aria-label": `${champion}: ${formatInt(player.damageToChampions)}; ${segments
                   .map(([, value, label]) => `${label.toLowerCase()} ${formatInt(value)}`)
                   .join(", ")}`,
@@ -1598,7 +2004,8 @@ function renderFile(replay: ReplayInspection) {
     ["Ruta", replay.path],
     ["Formato", formatLabel(replay.format)],
     ["Tamaño", entry ? formatBytes(entry.fileSize) : "—"],
-    ["Guardada", formatDateLong(entry?.modifiedAtMs ?? null)],
+    // Fecha del archivo (cuando se descargó o guardó), no la de la partida: igual que en el resumen.
+    ["Descargada", formatDateLong(entry?.modifiedAtMs ?? null)],
     ["Build", replay.gameVersion ?? "—"],
     ["Región", replay.region ?? "—"],
     ["ID de partida", replay.matchId ?? "—"],
@@ -1620,6 +2027,8 @@ let drawerExit = 0;
 function setDrawerPresence(open: boolean) {
   const layers = [el.scrim, el.drawer];
   if (open) {
+    // La partida de detrás queda inerte; la biblioteca de al lado sigue disponible a propósito.
+    setBehindInert(true);
     if (el.drawer.classList.contains("is-open")) return;
     // Reabrir durante la salida la invierte desde donde está.
     drawerExit++;
@@ -1634,7 +2043,10 @@ function setDrawerPresence(open: boolean) {
     el.drawerClose.focus({ preventScroll: true });
     return;
   }
-  if (!el.drawer.classList.contains("is-open")) return;
+  if (!el.drawer.classList.contains("is-open")) {
+    setBehindInert(false);
+    return;
+  }
   const focus = document.activeElement;
   const hadFocus = el.drawer.contains(focus) || focus === document.body;
   const exit = ++drawerExit;
@@ -1642,8 +2054,10 @@ function setDrawerPresence(open: boolean) {
     layer.classList.remove("is-open");
     layer.inert = true;
   }
+  // Antes de devolver el foco: un elemento inerte no lo recibe.
+  setBehindInert(false);
   // El foco vuelve a la barra del cliente en vez de perderse con el panel.
-  if (hadFocus) (el.clientAction.hidden ? el.chooseExecutable : el.clientAction).focus();
+  if (hadFocus) (el.clientAction.hidden || el.clientAction.disabled ? el.chooseExecutable : el.clientAction).focus();
   const finish = () => {
     if (exit !== drawerExit) return;
     for (const layer of layers) layer.hidden = true;
@@ -1663,14 +2077,26 @@ function renderDrawer() {
   const install = state.drawerMode === "progress" ? state.install : null;
   const progress = !!install;
   const plan = state.plan;
-  const replays = replay?.gameVersion
-    ? state.library?.entries.filter((entry) => entry.gameVersion === replay.gameVersion).length ?? 1
-    : 1;
+  // El error de la última descarga de esta compilación sigue a la vista hasta el próximo intento.
+  const version = install?.gameVersion ?? replay?.gameVersion;
+  const downloadError = state.installError && state.installError.gameVersion === version ? state.installError.message : null;
 
-  el.drawerTitle.textContent = progress ? "Descargando" : state.planKind === "resume" ? "Reanudar" : "Preparar cliente";
-  el.drawerSubtitle.textContent = replay ? `${replay.fileName} · ${replays} ${replays === 1 ? "repetición" : "repeticiones"}` : "";
-  el.planVersion.textContent = install?.build ?? plan?.gameBuild ?? replay?.gameVersion ?? "—";
-  const mode = progress ? "Descargando" : plan ? modeLabel(plan.mode) : state.planning ? stageLabel(state.planStage) : "—";
+  // Un plan de "Reanudar" que resulta nuevo (no quedó nada) se titula como tal.
+  const resume = plan ? plan.mode === "resume" : state.planKind === "resume";
+  setText(el.drawerTitle, progress ? "Descargando" : resume ? "Reanudar" : "Preparar cliente");
+  // Durante la descarga, lo que se descarga, aunque la partida abierta sea otra.
+  setText(
+    el.drawerSubtitle,
+    install
+      ? `${install.replayName} · ${replaysLabel(install.replays)}`
+      : replay
+        ? `${replay.fileName} · ${replaysLabel(replay.gameVersion ? replaysOf(replay.gameVersion) : 1)}`
+        : "",
+  );
+  setText(el.planVersion, install?.build ?? plan?.gameBuild ?? replay?.gameVersion ?? "—");
+  const mode = install
+    ? install.stopping ? "Deteniendo" : "Descargando"
+    : plan ? modeLabel(plan.mode) : state.planning ? stageLabel(state.planStage) : "—";
   setChip(el.planMode, mode, false);
   const focused = document.activeElement;
   el.planView.hidden = progress;
@@ -1684,26 +2110,37 @@ function renderDrawer() {
   }
 
   if (install) {
-    const percent = install.percent ?? 0;
-    el.progressPercent.textContent = formatPercent(percent);
-    el.progressBytes.textContent = install.total
-      ? `${formatBytes(install.downloaded)} de ${formatBytes(install.total)}`
-      : "";
+    const percent = progressPercent(install.percent, install.done);
+    // Solo el porcentaje es región viva; el archivo en curso cambia demasiado para anunciarlo.
+    setText(el.progressPercent, formatPercent(percent));
+    setText(
+      el.progressBytes,
+      install.total ? `${formatBytes(install.downloaded)} de ${formatBytes(install.total)}` : "",
+    );
     el.progressBar.style.width = `${percent}%`;
-    el.progressTrack.setAttribute("aria-valuenow", String(Math.round(percent)));
-    el.progressFile.textContent = install.detail;
+    el.progressTrack.setAttribute("aria-valuenow", String(percent));
+    setText(el.progressFile, install.detail);
     el.progressFile.title = install.detail;
     const current = STAGES.indexOf(install.stage);
     for (const item of el.stages) {
       const index = STAGES.indexOf(item.dataset.stage ?? "");
       item.dataset.status = index < current ? "done" : index === current ? "active" : "pending";
     }
-    el.progressDestination.textContent = install.destination;
+    setText(el.progressDestination, install.destination);
     el.progressDestination.title = install.destination;
-    el.progressLocale.textContent = install.locale;
+    setText(el.progressLocale, install.locale);
     el.stopClient.disabled = install.stopping;
+    setText(el.stopLabel, install.stopping ? "Deteniendo…" : "Detener");
+    // Un Detener que falló: la descarga sigue y el motivo se ve aquí y bajo la barra del cliente.
+    el.planError.hidden = !downloadError;
+    setText(el.planError, downloadError ?? "");
     return;
   }
+
+  // El plan que no se pudo calcular y, debajo, el fallo de la descarga anterior.
+  const planErrors = [state.planError, downloadError].filter(Boolean).join("\n");
+  el.planError.hidden = !planErrors;
+  setText(el.planError, planErrors);
 
   const status = replay?.gameVersion ? state.statuses.get(replay.gameVersion) : undefined;
   const destination = plan?.destinationPath ?? status?.destinationPath ?? "—";
@@ -1723,8 +2160,6 @@ function renderDrawer() {
     ? [plan.source === "sieve" ? "Riot Sieve" : "riot-manifests", plan.exactBuild ? null : "no exacta"].filter(Boolean).join(" · ")
     : pending;
   el.planSource.title = plan?.manifestUrl ?? "";
-  el.planError.hidden = !state.planError;
-  el.planError.textContent = state.planError ?? "";
   el.confirmLabel.textContent = plan ? confirmLabel(plan.mode) : "Descargar";
   // Usar un cliente listo no descarga nada.
   el.confirmIcon.hidden = plan?.mode === "ready";
@@ -1736,19 +2171,47 @@ function renderDrawer() {
 function renderClients() {
   if (document.activeElement !== el.installFolder) el.installFolder.value = state.settings.clientsRoot ?? "";
   el.revealClientsRoot.disabled = !state.settings.clientsRoot;
-  el.clientsRootError.hidden = !state.clientsError;
-  el.clientsRootError.textContent = state.clientsError ?? "";
+  const error = state.clientsError ?? state.statusesError;
+  el.clientsRootError.hidden = !error;
+  setText(el.clientsRootError, error ?? "");
   const rows = buildRows();
-  const ready = rows.filter((row) => row.status?.state === "ready").length;
-  el.clientsInstalled.textContent = rows.length ? `${ready}/${rows.length}` : "—";
+  const known = rows.every((row) => row.known);
+  const ready = rows.filter((row) => row.known && row.status?.state === "ready").length;
+  el.clientsInstalled.textContent = rows.length && known ? `${ready}/${rows.length}` : "—";
   const bytes = rows.reduce((total, row) => total + (row.status?.installedBytes ?? 0), 0);
-  el.clientsBytes.textContent = state.settings.clientsRoot ? formatBytes(bytes) : "—";
+  el.clientsBytes.textContent = state.settings.clientsRoot && !state.statusesError ? formatBytes(bytes) : "—";
   el.buildsCount.textContent = String(rows.length);
+  // La lista se rehace entera; el foco vuelve al mismo botón de la misma compilación.
+  const focused = buildActionKey(document.activeElement);
   el.buildsList.replaceChildren(
     ...(rows.length
       ? rows.map(buildRow)
       : [h("p", { class: "builds__empty", text: state.library ? "Sin builds" : "Sin biblioteca" })]),
   );
+  if (focused) {
+    const button = [...el.buildsList.querySelectorAll("button")].find((item) => buildActionKey(item) === focused);
+    button?.focus({ preventScroll: true });
+  }
+}
+
+/** Compilación y texto de un botón de la lista de Clientes, para reencontrarlo tras rehacerla. */
+function buildActionKey(element: Element | null) {
+  if (!(element instanceof HTMLButtonElement) || !el.buildsList.contains(element)) return null;
+  return `${element.closest<HTMLElement>(".builds__row")?.dataset.build ?? ""}\n${element.textContent}`;
+}
+
+/** Durante una descarga solo cambia el texto de su fila: la lista no se rehace en cada evento. */
+function renderInstallRow() {
+  const install = state.install;
+  if (!install || state.view !== "clients") return;
+  for (const row of el.buildsList.querySelectorAll<HTMLElement>(".builds__row")) {
+    const text = row.dataset.build === install.build ? row.querySelector<HTMLElement>(".builds__state-text") : null;
+    if (text) setText(text, installStateText(install));
+  }
+}
+
+function installStateText(install: InstallRun) {
+  return install.stopping ? "Deteniendo…" : `Descargando · ${formatPercent(progressPercent(install.percent, install.done))}`;
 }
 
 type BuildRow = {
@@ -1757,6 +2220,8 @@ type BuildRow = {
   version: string | null;
   replays: number;
   status: LocalClientStatus | null;
+  /** El estado en disco ya se leyó (si no, se muestra neutro). */
+  known: boolean;
 };
 
 function buildRows(): BuildRow[] {
@@ -1765,7 +2230,8 @@ function buildRows(): BuildRow[] {
     if (!entry.gameVersion) continue;
     const status = state.statuses.get(entry.gameVersion) ?? null;
     const build = status?.gameBuild ?? entry.gameVersion;
-    const row = rows.get(build) ?? { build, patch: entry.patch ?? "—", version: entry.gameVersion, replays: 0, status };
+    const known = !state.statusesError && state.statusVersions.has(entry.gameVersion);
+    const row = rows.get(build) ?? { build, patch: entry.patch ?? "—", version: entry.gameVersion, replays: 0, status, known };
     row.replays += 1;
     rows.set(build, row);
   }
@@ -1777,6 +2243,7 @@ function buildRows(): BuildRow[] {
         version: null,
         replays: 0,
         status,
+        known: true,
       });
     }
   }
@@ -1784,18 +2251,21 @@ function buildRows(): BuildRow[] {
 }
 
 function buildRow(row: BuildRow) {
-  const installing = state.install?.build === row.build;
-  const statusState = installing ? "busy" : row.status?.state ?? "missing";
+  const install = state.install;
+  const installing = install?.build === row.build;
+  const statusState: GlyphState = installing ? "busy" : !row.known ? "unknown" : row.status?.state ?? "missing";
   const percent = row.status?.totalInstallBytes
-    ? (row.status.installedBytes / row.status.totalInstallBytes) * 100
+    ? progressPercent((row.status.installedBytes / row.status.totalInstallBytes) * 100, false)
     : null;
-  const stateText = installing
-    ? `Descargando${state.install?.percent == null ? "" : ` · ${formatPercent(state.install.percent)}`}`
-    : statusState === "ready"
-      ? "Listo"
-      : statusState === "partial"
-        ? `Incompleto${percent == null ? "" : ` · ${formatPercent(Math.min(percent, 99))}`}`
-        : "No instalado";
+  const stateText = install && installing
+    ? installStateText(install)
+    : statusState === "unknown"
+      ? "—"
+      : statusState === "ready"
+        ? "Listo"
+        : statusState === "partial"
+          ? `Incompleto${percent == null ? "" : ` · ${formatPercent(percent)}`}`
+          : "No instalado";
   const size = statusState === "ready"
     ? formatBytes(row.status?.installedBytes ?? 0)
     : row.status?.totalInstallBytes
@@ -1803,13 +2273,16 @@ function buildRow(row: BuildRow) {
       : "—";
   const actions: HTMLButtonElement[] = [];
   const version = row.version;
+  // Una descarga a la vez: mientras corre otra, las de esta compilación esperan.
+  const busy = !!install;
   if (installing) {
     actions.push(actionButton("Progreso", showProgress));
-  } else {
+  } else if (row.known) {
     if (version && statusState !== "ready") {
-      actions.push(actionButton(statusState === "partial" ? "Reanudar" : "Descargar", () => void goToBuild(version, statusState === "partial" ? "resume" : "install"), true));
+      const kind = statusState === "partial" ? "resume" : "install";
+      actions.push(actionButton(kind === "resume" ? "Reanudar" : "Descargar", () => void goToBuild(version, kind), true, busy));
     }
-    if (version && statusState === "ready") actions.push(actionButton("Verificar", () => void goToBuild(version, "install")));
+    if (version && statusState === "ready") actions.push(actionButton("Verificar", () => void goToBuild(version, "install"), false, busy));
     const path = row.status?.state === "ready" ? row.status.executablePath : row.status?.state === "partial" ? row.status.destinationPath : null;
     if (path) actions.push(actionButton("Abrir", () => void reveal(path, "clients")));
   }
@@ -1826,16 +2299,21 @@ function buildRow(row: BuildRow) {
     h("span", { class: "builds__cell num", text: row.replays }),
     h("span", { class: "builds__cell", text: row.status?.locale ?? "—" }),
     h("span", { class: "builds__cell num", text: size }),
-    h("span", { class: "builds__state" }, glyphElement(statusState as GlyphState), h("span", { text: stateText })),
+    h(
+      "span",
+      { class: "builds__state" },
+      glyphElement(statusState),
+      h("span", { class: "builds__state-text", text: stateText }),
+    ),
     h("div", { class: "builds__actions" }, ...actions),
   );
 }
 
-function actionButton(label: string, run: () => void, primary = false) {
+function actionButton(label: string, run: () => void, primary = false, disabled = false) {
   return h("button", {
     class: `button button--sm${primary ? " button--primary" : ""}`,
     text: label,
-    attrs: { type: "button" },
+    attrs: { type: "button", disabled },
     on: { click: run },
   });
 }
@@ -1880,6 +2358,18 @@ function championName(championId: string) {
   return state.dataDragon?.champions.get(key)?.name
     ?? state.names?.champions.get(key)?.name
     ?? championId.replace(/([a-z])([A-Z])/g, "$1 $2");
+}
+
+// La lista usa los nombres del parche más nuevo de la biblioteca, no los de la partida abierta:
+// así elegir otra partida no cambia el contenido de todas las filas.
+function libraryChampionName(championId: string) {
+  return state.names?.champions.get(normalizeKey(championId))?.name
+    ?? championId.replace(/([a-z])([A-Z])/g, "$1 $2");
+}
+
+function libraryChampionIcon(championId: string, patch: string | null) {
+  return state.names?.champions.get(normalizeKey(championId))?.iconUrl
+    ?? (championId && patch ? `${DATA_DRAGON}/cdn/${patch}.1/img/champion/${championId}.png` : null);
 }
 
 function abbreviate(label: string) {
@@ -1940,6 +2430,25 @@ function fileNameOf(path: string) {
   return path.split(/[\\/]/).pop() || path;
 }
 
+function replaysLabel(count: number) {
+  return `${count} ${count === 1 ? "repetición" : "repeticiones"}`;
+}
+
+/** Escribe el texto solo si cambió (evita volver a anunciar regiones vivas y trabajo de más). */
+function setText(element: HTMLElement, text: string) {
+  if (element.textContent !== text) element.textContent = text;
+}
+
+function setAttribute(element: HTMLElement, name: string, value: string) {
+  if (element.getAttribute(name) !== value) element.setAttribute(name, value);
+}
+
+/** Con el panel abierto, la partida (o su estado vacío) queda fuera del foco y del lector. */
+function setBehindInert(inert: boolean) {
+  el.workspace.inert = inert;
+  el.replayEmpty.inert = inert;
+}
+
 function shortenPath(path: string) {
   if (path.length <= 46) return path;
   const parts = path.split(/[\\/]/);
@@ -1963,15 +2472,18 @@ async function reveal(path: string, from: "match" | "clients") {
   const replay = from === "match" ? state.replay?.path ?? null : null;
   try {
     await revealItemInDir(path);
-    if (replay && state.revealError?.path === replay) {
-      state.revealError = null;
+    if (replay && state.actionError?.path === replay) {
+      state.actionError = null;
       renderClientStrip();
+    } else if (!replay && state.clientsError) {
+      state.clientsError = null;
+      renderClients();
     }
   } catch (error) {
     // El detalle viene del sistema o del complemento: la acción fallida se nombra en español.
     const message = `No se pudo abrir la carpeta. ${errorText(error)}`;
     if (replay) {
-      state.revealError = { path: replay, message };
+      state.actionError = { path: replay, message };
       // Se ve el error de la última acción: el de un inicio anterior deja de mostrarse.
       if (state.launch?.state === "error") state.launch = null;
       renderClientStrip();
