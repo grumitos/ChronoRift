@@ -1041,26 +1041,32 @@ button:disabled {
   container: head / inline-size;
 }
 
+/* Una sola franja: el resultado (chip y lado, uno sobre otro), el marcador y los datos. Centrados,
+   el chip queda en la línea de las etiquetas y los valores a la altura de los números. */
 .match-head__summary {
   display: flex;
   align-items: center;
   gap: 36px;
-  min-height: 88px;
 }
 
+/* Ancho mínimo fijo: cambiar de partida no corre los datos (hasta un marcador de dos cifras). */
 .result {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 16px;
+  min-width: 310px;
+}
+
+/* Del ancho de "VICTORIA", "DERROTA" o "GANA AZUL": el marcador no se corre al cambiar de
+   resultado. "SIN RESULTADO" lo agranda. */
+.result__line {
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
-  gap: 6px;
-  width: 220px;
-}
-
-.result__line {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  height: 20px;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 84px;
 }
 
 .result__side {
@@ -1068,18 +1074,24 @@ button:disabled {
   font-size: 12px;
 }
 
+/* AZUL 15 – 40 ROJO: cada etiqueta por fuera de su número, en la línea base. */
 .score {
   display: flex;
-  align-items: flex-end;
-  gap: 12px;
+  align-items: baseline;
+  gap: 10px;
   margin: 0;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 .score__team {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.score__team:first-child {
+  flex-direction: row-reverse;
 }
 
 .score__value {
@@ -1109,12 +1121,12 @@ button:disabled {
   color: var(--team-red);
 }
 
+/* Alto de línea 1: en la línea base, uno de 44 px bajaría el guion y agrandaría la franja. */
 .score__dash {
-  margin-bottom: 16px;
   color: var(--line-chip);
   font-size: 28px;
   font-weight: 400;
-  line-height: 44px;
+  line-height: 1;
 }
 
 /* Repetición sin analizar: un solo "—", sin equipos ni guion entre ellos. */
@@ -1124,7 +1136,8 @@ button:disabled {
   display: none;
 }
 
-/* Una sola fila que se parte en dos cuando falta ancho. */
+/* Una sola fila, también con la ventana mínima; solo se parte en dos si algo no cabe (por ejemplo,
+   un marcador de tres cifras con poco ancho). */
 .facts {
   display: flex;
   flex: 1;
@@ -1194,6 +1207,39 @@ button:disabled {
   color: var(--ink-3);
 }
 
+/* Con menos ancho (una ventana de menos de unos 1330 px) la franja no cabe: el chip y el lado pasan
+   sobre un marcador más chico y los datos se acercan como los del cliente, así siguen en una fila.
+   Con la ventana mínima sobran unos 20 px. */
+@container head (max-width: 919px) {
+  .match-head__summary {
+    align-items: flex-end;
+    gap: 24px;
+  }
+
+  .result {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+    min-width: 192px;
+  }
+
+  .result__line {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    height: 20px;
+  }
+
+  .score__value {
+    font-size: 32px;
+    line-height: 36px;
+  }
+
+  .facts {
+    column-gap: 16px;
+  }
+}
+
 /* Fila del cliente: estado, build, ubicación e idioma a la izquierda y acciones a la derecha. Va
    sobre la página, sin caja, como los datos de la partida: los botones son las únicas cajas. */
 .client-strip {
@@ -1201,7 +1247,7 @@ button:disabled {
   flex-wrap: wrap;
   align-items: center;
   gap: 12px 28px;
-  margin-top: 20px;
+  margin-top: 16px;
 }
 
 .client-strip__item {
@@ -1331,7 +1377,7 @@ button:disabled {
   align-items: center;
   gap: 4px;
   height: 40px;
-  margin-top: 16px;
+  margin-top: 12px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -1380,7 +1426,7 @@ button:disabled {
 .match__body {
   flex: 1;
   min-height: 0;
-  padding: 12px 24px 24px;
+  padding: 8px 24px 16px;
   overflow: auto;
 }
 
