@@ -147,6 +147,21 @@ async fn set_clients_root(
     .await
 }
 
+/// Guarda si las imágenes de los parches de la biblioteca se descargan de una vez o al abrir cada
+/// partida. Conserva los demás ajustes.
+#[tauri::command]
+async fn set_asset_prefetch(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<settings::AppSettings, String> {
+    let file = settings_path(&app)?;
+    blocking(move || {
+        settings::update(&file, |settings| settings.asset_prefetch = Some(enabled))
+            .map_err(|err| err.to_string())
+    })
+    .await
+}
+
 /// Los comandos sincrónicos corren en el hilo principal: el trabajo de disco va al pool bloqueante
 /// para que una unidad lenta o de red no congele la ventana.
 async fn blocking<T: Send + 'static>(
@@ -213,7 +228,8 @@ pub fn run() {
             client_statuses,
             list_clients,
             get_settings,
-            set_clients_root
+            set_clients_root,
+            set_asset_prefetch
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

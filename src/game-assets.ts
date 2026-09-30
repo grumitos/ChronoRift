@@ -156,6 +156,61 @@ export function mapDataDragonAssets(
   return { version, champions: championMap, items: itemMap };
 }
 
+export type AssetKind = "champion" | "item" | "spell" | "perk" | "style";
+export type PatchImage = { url: string; kind: AssetKind };
+
+/**
+ * Bytes promedio de cada tipo de ícono, medidos en el parche 16.18 (16.18.1) el 2026-09-30: 173
+ * campeones (4,6 MiB), 868 objetos (5,5 MiB), 34 hechizos, 83 runas (1,9 MiB) y 5 ramas; 1163
+ * íconos y 12,2 MiB en total, más 1 MiB de JSON. Estiman el tamaño de un parche antes de pedirlo.
+ */
+export const AVERAGE_ICON_BYTES: Record<AssetKind, number> = {
+  champion: 28_128,
+  item: 6_686,
+  spell: 5_640,
+  perk: 23_670,
+  style: 1_080,
+};
+
+/**
+ * Íconos que la vista de partida puede mostrar para un parche, sin repetir URL: campeones y objetos
+ * de DataDragon; hechizos, runas y ramas de CommunityDragon. Si falta un lado, solo el otro.
+ */
+export function patchImages(
+  data: DataDragonAssets | null,
+  community: CommunityDragonAssets | null,
+): PatchImage[] {
+  const images = new Map<string, AssetKind>();
+  const add = (assets: Iterable<{ iconUrl: string | null }> | undefined, kind: AssetKind) => {
+    for (const { iconUrl } of assets ?? []) if (iconUrl && !images.has(iconUrl)) images.set(iconUrl, kind);
+  };
+  add(data?.champions.values(), "champion");
+  add(data?.items.values(), "item");
+  add(community?.spells.values(), "spell");
+  add(community?.perks.values(), "perk");
+  add(community?.styles.values(), "style");
+  return [...images].map(([url, kind]) => ({ url, kind }));
+}
+
+export type CacheResult = "ok" | "missing" | "error";
+
+/**
+ * Pide un archivo a la caché en disco, que responde cuando ya lo guardó. Un 404 también deja el
+ * archivo resuelto: la caché recuerda como faltante lo que DataDragon (403) o CommunityDragon (404)
+ * no tienen. Otro estado, o la red caída, es un error que se vuelve a intentar otro día.
+ */
+export async function storeInCache(url: string): Promise<CacheResult> {
+  try {
+    const response = await fetch(cachedAssetUrl(url));
+    // El cuerpo no hace falta: la caché ya escribió el archivo antes de responder.
+    response.body?.cancel().catch(() => undefined);
+    if (response.ok) return "ok";
+    return response.status === 404 ? "missing" : "error";
+  } catch {
+    return "error";
+  }
+}
+
 export async function loadDataDragonAssets(
   requestedVersion: string,
   locale: string,

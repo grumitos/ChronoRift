@@ -21,6 +21,9 @@ pub struct AppSettings {
     pub clients_root: Option<String>,
     /// Peticiones de rango en paralelo al descargar un cliente (1–32; sin valor, 8).
     pub download_connections: Option<u8>,
+    /// Si las imágenes de los parches de la biblioteca se descargan de una vez (`true`) o al abrir
+    /// cada partida (`false`). Sin valor, todavía no se preguntó.
+    pub asset_prefetch: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -139,9 +142,15 @@ mod tests {
         assert_eq!(normalized, clients);
         assert!(!clients.exists());
 
+        // Un archivo de una versión anterior no tiene la elección de imágenes: queda sin preguntar.
+        fs::create_dir_all(settings_file.parent().unwrap()).unwrap();
+        fs::write(&settings_file, br#"{ "clientsRoot": "E:\\ChronoRift" }"#).unwrap();
+        assert_eq!(load(&settings_file).unwrap().asset_prefetch, None);
+
         let saved = AppSettings {
             clients_root: Some(normalized.display().to_string()),
             download_connections: Some(12),
+            asset_prefetch: None,
         };
         save(&settings_file, &saved).unwrap();
         assert_eq!(load(&settings_file).unwrap(), saved);
@@ -150,9 +159,11 @@ mod tests {
         // Cambiar un ajuste conserva los demás.
         let updated = update(&settings_file, |settings| {
             settings.download_connections = Some(4);
+            settings.asset_prefetch = Some(true);
         })
         .unwrap();
         assert_eq!(updated.clients_root, saved.clients_root);
+        assert_eq!(updated.asset_prefetch, Some(true));
         assert_eq!(load(&settings_file).unwrap(), updated);
 
         // Un JSON dañado se informa en lugar de ignorarse en silencio, y guardar lo reemplaza.

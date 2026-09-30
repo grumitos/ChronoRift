@@ -215,7 +215,7 @@ type Call = { cmd: string; args: any };
 const calls: Call[] = [];
 const fetched: string[] = [];
 const dialogAnswers: Array<string | null> = [];
-let settings: { clientsRoot: string | null } = { clientsRoot: CLIENTS_ROOT };
+let settings: { clientsRoot: string | null; assetPrefetch?: boolean } = { clientsRoot: CLIENTS_ROOT };
 let planFailure: string | null = null;
 let launchFailure: string | null = null;
 let revealFailure: string | null = null;
@@ -224,6 +224,9 @@ let folderFailure: string | null = null;
 let unavailableRoot: string | null = null;
 let vanguard = "stopped";
 let pendingInstall: { resolve: (value: unknown) => void; reject: (reason: unknown) => void } | null = null;
+// Detener retenido: el backend recibe la orden pero todavía no termina de cerrar la descarga.
+let holdCancel = false;
+let heldCancel: (() => void) | null = null;
 // Lecturas de repeticiones retenidas hasta que la prueba las suelta.
 let holdInspect = false;
 const heldInspects: Array<() => void> = [];
@@ -262,11 +265,15 @@ async function backend(cmd: string, args: any) {
   switch (cmd) {
     case "get_settings":
       return { ...settings };
+    // Como `settings::update`: cambia un ajuste y conserva los demás.
     case "set_clients_root": {
       const path = String(args.path).trim();
-      settings = { clientsRoot: /^[A-Za-z]:\\?$/.test(path) ? `${path.slice(0, 2)}\\ChronoRift` : path };
+      settings = { ...settings, clientsRoot: /^[A-Za-z]:\\?$/.test(path) ? `${path.slice(0, 2)}\\ChronoRift` : path };
       return { ...settings };
     }
+    case "set_asset_prefetch":
+      settings = { ...settings, assetPrefetch: args.enabled };
+      return { ...settings };
     case "plugin:dialog|open":
       return dialogAnswers.shift() ?? null;
     case "plugin:opener|reveal_item_in_dir":
@@ -293,10 +300,15 @@ async function backend(cmd: string, args: any) {
       return new Promise((resolve, reject) => {
         pendingInstall = { resolve, reject };
       });
-    case "cancel_client_install":
-      disk[BUILD_A] = { state: "partial", installedBytes: 6 * GIB, totalInstallBytes: 29.3 * GIB };
-      pendingInstall?.reject("Descarga detenida");
+    case "cancel_client_install": {
+      const settle = () => {
+        disk[BUILD_A] = { state: "partial", installedBytes: 6 * GIB, totalInstallBytes: 29.3 * GIB };
+        pendingInstall?.reject("Descarga detenida");
+      };
+      if (holdCancel) heldCancel = settle;
+      else settle();
       return null;
+    }
     case "launch_replay":
       if (launchFailure) throw launchFailure;
       return null;
@@ -394,6 +406,9 @@ afterAll(async () => {
 
 describe("library → match → client → launch", () => {
   test("opening a folder detects the owner and renders the match without any client work", async () => {
+    // Sin carpeta recordada la pantalla de inicio sale al leer la configuración y la app responde.
+    expect(el("#splash").hidden).toBe(true);
+    expect(el("#library-view").inert).toBe(false);
     // Sin carpeta: solo el estado vacío, sin lista, cuenta ni ruta.
     expect(el("#library-list").hidden).toBe(true);
     expect(el("#library-empty").hidden).toBe(false);
@@ -409,6 +424,8 @@ describe("library → match → client → launch", () => {
     dialogAnswers.push(OTHER_DIR);
     click("#open-library");
     await waitFor(() => text("#library-empty-text") === "Sin repeticiones", "empty folder");
+    // La pregunta por las imágenes era de la carpeta anterior: una sin parches la retira.
+    expect(el("#splash").hidden).toBe(true);
     // El diálogo se abre en la carpeta actual.
     expect(called("plugin:dialog|open").at(-1)?.args.options).toMatchObject({ directory: true, defaultPath: REPLAY_DIR });
     holdInspect = false;
@@ -432,6 +449,23 @@ describe("library → match → client → launch", () => {
     const reads = called("inspect_replay").length;
     dialogAnswers.push(REPLAY_DIR);
     click("#open-library");
+    // Primera biblioteca con parches y sin elección guardada: antes de mostrarla se pregunta por las
+    // imágenes, con cuántas son y cuánto pesan. Solo cuenta 16.18: 16.17 no tiene datos aquí.
+    await waitFor(() => !el("#splash").hidden && !el("#splash-ask").hidden, "prefetch question");
+    expect(el("#library-view").inert).toBe(true);
+    expect(text("#splash-ask-data")).toBe("1 parche · 16 imágenes · ~323 KiB");
+    click("#prefetch-all");
+    await waitFor(() => called("set_asset_prefetch").length === 1, "saved prefetch choice");
+    expect(called("set_asset_prefetch")[0].args).toEqual({ enabled: true });
+    // Cada imagen del parche pasa por la caché en disco; un 404 (recordado como faltante) cuenta
+    // como hecho y la pantalla sale al terminar.
+    await waitFor(() => el("#splash").hidden, "prefetch finished");
+    expect(el("#library-view").inert).toBe(false);
+    expect(fetched).toContain(viaCache(`${DD}/cdn/16.18.1/img/champion/Urgot.png`));
+    expect(fetched).toContain(viaCache(`${DD}/cdn/16.18.1/img/item/3020.png`));
+    expect(fetched).toContain(viaCache(`${CD}/default/v1/perk-images/styles/7204_resolve.png`));
+    // 16.17, sin datos al preguntar, se intenta después en segundo plano: se espera a que termine.
+    await waitFor(() => el("#activity").hidden, "background prefetch");
     await waitFor(() => document.querySelectorAll(".replay-row").length === 2, "replay rows");
     await waitFor(() => text("#file-name") === "LA2-1625354615.rofl", "first replay");
     // Cada repetición de la lista se lee de antemano: elegir otra no espera al backend.
@@ -444,6 +478,9 @@ describe("library → match → client → launch", () => {
     expect(text("#library-owner-name")).toBe(OWNER);
     const rows = [...document.querySelectorAll<HTMLButtonElement>(".replay-row")];
     expect(rows.map((row) => row.querySelector(".result-badge")?.textContent)).toEqual(["V", "D"]);
+    // El tono sale del resultado (una clase), no del texto: V en verde y D en rojo, igual que el chip.
+    expect(rows.map((row) => row.querySelector(".result-badge")?.classList.contains("is-win"))).toEqual([true, false]);
+    expect(rows[1].querySelector(".result-badge")?.classList.contains("is-loss")).toBe(true);
     expect(rows[0].getAttribute("aria-current")).toBe("true");
     expect(rows[0].getAttribute("aria-label")).toContain("9/2/3");
     // El archivo que no se pudo leer queda al final: fila gris con el motivo, sin selección.
@@ -455,6 +492,7 @@ describe("library → match → client → launch", () => {
     expect(text("#replay-count")).toBe("3");
 
     expect(text("#result-chip")).toBe("Victoria");
+    expect(el("#result-chip").classList.contains("is-win")).toBe(true);
     expect(text("#result-side")).toBe("Lado rojo");
     expect(text("#blue-score")).toBe("15");
     expect(text("#red-score")).toBe("40");
@@ -652,20 +690,35 @@ describe("library → match → client → launch", () => {
     expect(el("#client-progress-bar").style.width).toBe("20%");
     expect(text("#client-location")).toBe(DESTINATION);
 
-    // Detener se ve en el acto, antes de que el backend termine.
+    // Detener se ve detenido en el acto, antes de que el backend termine de cerrar la descarga: sin
+    // barra ni indicador, sin "Deteniendo…", y la compilación incompleta con Reanudar.
+    holdCancel = true;
     click("#stop-client-action");
-    expect(text("#stop-client-action")).toBe("Deteniendo…");
-    expect(text("#client-status-text")).toBe("Deteniendo…");
-    expect(text("#activity-label")).toBe("Deteniendo…");
+    expect(text("#client-status-text")).toBe("Incompleto");
+    expect(el("#client-progress").hidden).toBe(true);
+    expect(el("#activity").hidden).toBe(true);
+    expect(el("#client-drawer").hidden).toBe(true);
+    expect(text("#client-action-label")).toBe("Reanudar");
+    expect(document.body.textContent).not.toContain("Deteniendo");
     await waitFor(() => called("cancel_client_install").length === 1, "cancel command");
-    await waitFor(() => el("#client-drawer").hidden, "drawer closed after stop");
+    // Reanudar espera a que el backend cierre la descarga (si no, la rechazaría): el panel se abre,
+    // pero el plan se pide recién después, con lo que quedó en disco.
+    const plans = called("plan_client_install").length;
+    click("#client-action");
+    expect(el("#client-drawer").hidden).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(called("plan_client_install")).toHaveLength(plans);
+    holdCancel = false;
+    heldCancel!();
+    heldCancel = null;
+    await waitFor(() => text("#plan-mode") === "Reanudar", "resume plan after the stop");
+    expect(called("plan_client_install")).toHaveLength(plans + 1);
     await waitFor(() => text("#client-status-text") === "Incompleto · 20 %", "partial status");
     // Una parada pedida no es un error.
     expect(el("#client-error").hidden).toBe(true);
-    expect(text("#client-action-label")).toBe("Reanudar");
-    expect(el("#client-progress").hidden).toBe(true);
-    expect(el("#activity").hidden).toBe(true);
+    expect(el("#plan-error").hidden).toBe(true);
     expect(disabled("#play-replay")).toBe(true);
+    click("#drawer-close");
     pendingInstall = null;
   });
 
@@ -716,9 +769,16 @@ describe("library → match → client → launch", () => {
     const retry = called("install_client").at(-1)!.args.request;
     expect(retry.locale).toBe("en_US");
     expect(retry.confirmed).toMatchObject({ mode: "resume", locale: "en_US" });
+    await emitProgress("download", 20 * GIB, 25 * GIB, "DATA/FINAL/Maps/Shipping/Map11.wad.client");
+    // Detener justo cuando la descarga terminaba bien: se ve detenida un instante y queda "Listo".
+    holdCancel = true;
+    click("#stop-client-action");
+    expect(text("#client-status-text")).toBe("Incompleto");
     disk[BUILD_A] = { state: "ready", installedBytes: 29.3 * GIB, totalInstallBytes: 29.3 * GIB };
     pendingInstall!.resolve({ ...plan("resume", "es_MX"), executablePath: EXECUTABLE, downloadSeconds: 1470 });
     pendingInstall = null;
+    holdCancel = false;
+    heldCancel = null;
     await waitFor(() => text("#client-status-text") === "Listo", "ready status");
     expect(text("#client-location")).toBe(DESTINATION);
     expect(text("#client-locale")).toBe("es_MX");
@@ -851,6 +911,14 @@ describe("library → match → client → launch", () => {
     expect(rows[0].querySelector(".builds__state")?.textContent).toBe("Listo");
     expect(rows[1].querySelector(".builds__state")?.textContent).toBe("No instalado");
     expect(text("#clients-installed")).toBe("1/2");
+
+    // La elección de la primera vez se ve aquí y se puede cambiar; se guarda con el mismo comando.
+    const choice = (value: string) => el(`#asset-prefetch [data-prefetch='${value}']`).getAttribute("aria-pressed");
+    expect([choice("all"), choice("open")]).toEqual(["true", "false"]);
+    click("#asset-prefetch [data-prefetch='open']");
+    await waitFor(() => called("set_asset_prefetch").length === 2, "changed prefetch choice");
+    expect(called("set_asset_prefetch")[1].args).toEqual({ enabled: false });
+    expect([choice("all"), choice("open")]).toEqual(["false", "true"]);
 
     typeInto("#install-folder", "E:\\", ["change"]);
     await waitFor(() => settings.clientsRoot === "E:\\ChronoRift", "normalized folder");

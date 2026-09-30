@@ -186,4 +186,6 @@ export type LocalClientStatus = {
 export type AppSettings = {
   clientsRoot: string | null;
   downloadConnections?: number | null;
+  /** Imágenes de los parches: de una vez (`true`) o al abrir cada partida (`false`); sin valor, sin preguntar. */
+  assetPrefetch?: boolean | null;
 };

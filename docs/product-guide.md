@@ -6,14 +6,14 @@ ChronoRift should make old `.rofl` files easy to inspect and replay without forc
 
 The core flow:
 
-1. User opens a replay folder. ChronoRift lists its `.rofl` files by file date, newest first (on the same date, the higher match id first), and the folder is remembered for the next start.
+1. User opens a replay folder. ChronoRift lists its `.rofl` files by file date, newest first (on the same date, the higher match id first), and the folder is remembered for the next start. The first time a folder with patches loads, before showing it, ChronoRift asks whether to download every image of those patches now or when each match is opened (see Match Enrichment).
 2. User picks a replay. ChronoRift reads its metadata and shows the result, patch, server, match id, duration, and the file's date labeled "Descargada": when the replay was downloaded or saved, not when the game was played.
 3. ChronoRift loads DataDragon champion/item assets for the interface language.
 4. ChronoRift shows the client for the replay's build in one strip: state, build, location under the saved clients folder (for example `E:\ChronoRift`), and locale. The user can also point to an existing executable; only a file named `League of Legends.exe` is accepted, and another one is rejected as soon as it is picked.
 5. If client work is requested, ChronoRift resolves the replay's exact build and classifies the work as a new install, resume, repair, or already ready.
 6. User checks the plan: build, whether it is the exact build, manifest source, mode, affected and reused file counts, download size, install size, the full destination `<clients folder>\<build>\Game`, and locale.
 7. User explicitly confirms the exact plan, including its locale and manifest.
-8. Progress stays visible until the client is ready. Detener shows "Deteniendo…" at once; completed files stay for Reanudar.
+8. Progress stays visible until the client is ready. Detener shows the client as stopped at once ("Incompleto", no progress bar, no top-bar indicator) while the backend finishes stopping in the background; Reanudar waits for it, and completed files stay for it. When the stop ends, the plan is recomputed from what is on disk. A download that finished just as Detener was pressed shows "Listo".
 9. User explicitly launches the replay. The strip shows "Reproduciendo" until the game closes. If Riot Vanguard is running, the strip says "Vanguard activo" next to Reproducir, also while a game is open, and the user exits Vanguard from its tray icon first.
 
 If a download fails after its automatic retries (transient network failures are retried for about a minute), the reason stays under the client strip, with the drawer open or closed, until the next attempt. The plan is then recomputed on its own, so Reanudar opens a plan that is ready to confirm. One download runs at a time: while it runs, the actions that would start another build are disabled.
@@ -35,7 +35,11 @@ If a download fails after its automatic retries (transient network failures are 
 - When a newer build of the same patch is installed instead of the exact one, the strip shows that build marked "no exacta" and launches it.
 - A replay folder that cannot be read stays remembered, because a sleeping network drive or an unplugged USB disk comes back; "Actualizar" retries it.
 - Riot Vanguard is read, never controlled: ChronoRift does not stop it, change its configuration, or ask for elevation. Restarting Windows brings it back for online play.
-- Interface copy is labels and data only: no explanatory text. The single clarification kept is that ChronoRift does not modify the League of Legends installation.
+- Interface copy is labels and data only: no explanatory text. The single clarification kept is that ChronoRift does not modify the League of Legends installation. The first-run question about images is a short question title, its data, and two button labels.
+- The window never paints white: from its creation it has the app's dark background, and a splash with the logo and a sober three-dot loader shows until the library (or its error, or the empty state) is ready. There is no minimum display time.
+- Text that appears during a download never moves the rest of the interface: its space is reserved.
+- Color is semantic and never the only signal: green for a victory and a ready client, red for a defeat and for errors, amber for an incomplete client, Riot Vanguard, or an unavailable drive, and blue for a download in progress. Blue and red team marks go before "Lado azul" and "Lado rojo" and on AZUL and ROJO; team red is a mark, defeat red a chip.
+- ChronoRift's own color is a muted Hextech gold, used sparingly: the single primary action of each view (Reproducir, and Descargar or Reanudar in the client drawer), progress fills, the line under the active tab and section, and the completed steps of a download. Everything else stays monochrome.
 
 ## Language And Server Handling
 
@@ -101,6 +105,13 @@ Replay parsing remains local. After inspection, the visible match may be enriche
 - CommunityDragon supplies summoner-spell and perk names, descriptions, and images.
 
 The selected locale is attempted first, followed by a documented fallback. Static-data failure is non-fatal: identifiers and parsed statistics remain visible, and no client download or launch is triggered.
+
+Images are asked about once, on the splash, the first time a library with patches loads: "¿Descargar todas las imágenes ahora?", with the patches, the number of images, and the estimated size (a patch has about 1 160 images and 12 MiB), and two answers:
+
+- "Descargar todo" downloads every champion, item, summoner-spell, rune, and rune-tree icon of the library's patches into the disk cache, the images the library's replays use first. The splash shows the percentage and the patches done; "Continuar" hides it and the download goes on in the top-bar indicator. A file the CDN does not have counts as done. Errors are never shown: after twelve in a row the download stops and resumes the next time the folder is read. Patches that appear later are downloaded in the background.
+- "Al abrir cada partida" loads the images of each match when it is shown.
+
+The answer is saved and can be changed in Clientes. With either answer, the images the library's replays use are decoded in the background once the library is shown, so switching matches paints them in the same frame. An image that is not ready yet appears with a brief fade in its fixed-size slot; the match never waits for images and never shows a loading state for them.
 
 ## Deliberate Non-Goals For First Cut
 
