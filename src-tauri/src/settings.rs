@@ -1,3 +1,7 @@
+use crate::{
+    i18n::{self, Language},
+    tr,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -24,6 +28,27 @@ pub struct AppSettings {
     /// Si las imágenes de los parches de la biblioteca se descargan de una vez (`true`) o al abrir
     /// cada partida (`false`). Sin valor, todavía no se preguntó.
     pub asset_prefetch: Option<bool>,
+    /// Idioma de la app (`"es"` o `"en"`). Sin valor, todavía no se eligió: rige el del sistema.
+    pub language: Option<Language>,
+}
+
+/// Lo que recibe la interfaz: los ajustes guardados más el idioma del sistema, que se calcula en
+/// cada lectura y no se guarda en el archivo.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsView {
+    #[serde(flatten)]
+    pub settings: AppSettings,
+    pub system_language: Language,
+}
+
+impl From<AppSettings> for SettingsView {
+    fn from(settings: AppSettings) -> Self {
+        Self {
+            settings,
+            system_language: i18n::system_language(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -38,15 +63,26 @@ pub enum SettingsError {
 impl Display for SettingsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(error) => write!(f, "No se pudo acceder a la configuración: {error}"),
-            Self::Json(error) => write!(f, "La configuración no es un JSON válido: {error}"),
-            Self::EmptyPath => write!(f, "Falta la carpeta de clientes"),
-            Self::RelativePath(path) => {
-                write!(f, "La carpeta de clientes no es una ruta absoluta: {path}")
-            }
-            Self::MissingVolume(path) => {
-                write!(f, "La unidad de la carpeta de clientes no existe: {path}")
-            }
+            Self::Io(error) => tr!(
+                write!(f, "No se pudo acceder a la configuración: {error}"),
+                write!(f, "Could not access the settings: {error}")
+            ),
+            Self::Json(error) => tr!(
+                write!(f, "La configuración no es un JSON válido: {error}"),
+                write!(f, "The settings are not valid JSON: {error}")
+            ),
+            Self::EmptyPath => tr!(
+                write!(f, "Falta la carpeta de clientes"),
+                write!(f, "The clients folder is missing")
+            ),
+            Self::RelativePath(path) => tr!(
+                write!(f, "La carpeta de clientes no es una ruta absoluta: {path}"),
+                write!(f, "The clients folder is not an absolute path: {path}")
+            ),
+            Self::MissingVolume(path) => tr!(
+                write!(f, "La unidad de la carpeta de clientes no existe: {path}"),
+                write!(f, "The drive of the clients folder does not exist: {path}")
+            ),
         }
     }
 }
@@ -151,20 +187,35 @@ mod tests {
             clients_root: Some(normalized.display().to_string()),
             download_connections: Some(12),
             asset_prefetch: None,
+            language: None,
         };
         save(&settings_file, &saved).unwrap();
         assert_eq!(load(&settings_file).unwrap(), saved);
         assert!(!settings_file.with_extension("json.tmp").exists());
 
-        // Cambiar un ajuste conserva los demás.
+        // La interfaz recibe `language` (null mientras no se elija) y `systemLanguage`, que se
+        // calcula en cada lectura y nunca llega al archivo.
+        let view = serde_json::to_value(SettingsView::from(saved.clone())).unwrap();
+        assert_eq!(view["language"], serde_json::Value::Null);
+        assert_eq!(view["downloadConnections"], 12);
+        assert!(matches!(view["systemLanguage"].as_str(), Some("es" | "en")));
+        let on_disk = fs::read_to_string(&settings_file).unwrap();
+        assert!(!on_disk.contains("systemLanguage"));
+
+        // Cambiar un ajuste conserva los demás. El idioma se guarda como "es" o "en".
         let updated = update(&settings_file, |settings| {
             settings.download_connections = Some(4);
             settings.asset_prefetch = Some(true);
+            settings.language = Some(Language::En);
         })
         .unwrap();
         assert_eq!(updated.clients_root, saved.clients_root);
         assert_eq!(updated.asset_prefetch, Some(true));
+        assert_eq!(updated.language, Some(Language::En));
         assert_eq!(load(&settings_file).unwrap(), updated);
+        assert!(fs::read_to_string(&settings_file)
+            .unwrap()
+            .contains(r#""language": "en""#));
 
         // Un JSON dañado se informa en lugar de ignorarse en silencio, y guardar lo reemplaza.
         fs::write(&settings_file, b"{not json").unwrap();

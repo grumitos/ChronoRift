@@ -71,6 +71,20 @@ export function cachedAssetUrl(url: string) {
   return `${base}/${match[0]}${url.slice(match[1].length)}`;
 }
 
+/**
+ * Ruta de un archivo dentro del esquema `lolasset`, la que recibe `prefetch_assets`: la de la URL
+ * de la caché (`/ddragon/cdn/…` o `/cdragon/…`), con los `%XX` tal cual. Otro origen, `null`.
+ */
+export function cachedAssetPath(url: string) {
+  const match = CACHED_ORIGINS.find(([, origin]) => url.startsWith(`${origin}/`));
+  if (!match) return null;
+  try {
+    return `/${match[0]}${new URL(url).pathname}`;
+  } catch {
+    return null;
+  }
+}
+
 export function localeCandidates(locale: string) {
   const normalized = locale.trim().toLowerCase();
   if (normalized === "default" || !/^[a-z]{2}_[a-z]{2}$/.test(normalized)) {
@@ -190,25 +204,6 @@ export function patchImages(
   add(community?.perks.values(), "perk");
   add(community?.styles.values(), "style");
   return [...images].map(([url, kind]) => ({ url, kind }));
-}
-
-export type CacheResult = "ok" | "missing" | "error";
-
-/**
- * Pide un archivo a la caché en disco, que responde cuando ya lo guardó. Un 404 también deja el
- * archivo resuelto: la caché recuerda como faltante lo que DataDragon (403) o CommunityDragon (404)
- * no tienen. Otro estado, o la red caída, es un error que se vuelve a intentar otro día.
- */
-export async function storeInCache(url: string): Promise<CacheResult> {
-  try {
-    const response = await fetch(cachedAssetUrl(url));
-    // El cuerpo no hace falta: la caché ya escribió el archivo antes de responder.
-    response.body?.cancel().catch(() => undefined);
-    if (response.ok) return "ok";
-    return response.status === 404 ? "missing" : "error";
-  } catch {
-    return "error";
-  }
 }
 
 export async function loadDataDragonAssets(

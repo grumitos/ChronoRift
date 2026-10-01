@@ -1,6 +1,7 @@
+use crate::tr;
 use serde::{
     de::{self, SeqAccess, Visitor},
-    Deserializer as _, Serialize,
+    Deserializer as _, Serialize, Serializer,
 };
 use serde_json::Value;
 use std::{
@@ -61,7 +62,45 @@ pub struct ReplayInspection {
     pub red_kills: u32,
     pub players: Vec<PlayerStats>,
     pub teams: Vec<TeamSummary>,
-    pub notes: Vec<String>,
+    /// Por qué falta lo que falta; vacía en una repetición leída completa.
+    pub notes: Vec<ReplayNote>,
+}
+
+/// Aviso de una inspección. Se vuelve texto al serializar, no al leer el archivo: las inspecciones
+/// que ya están en la caché de repeticiones salen en el idioma vigente al cambiarlo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayNote {
+    /// Menos bytes que la firma de un archivo ROFL.
+    TooSmall,
+    /// Más de `MAX_PLAYERS` jugadores en `statsJson`: las estadísticas no sirven.
+    StatsOmitted,
+}
+
+impl Display for ReplayNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooSmall => tr!(
+                write!(f, "Archivo demasiado pequeño para ser una repetición ROFL"),
+                write!(f, "File too small to be a ROFL replay")
+            ),
+            Self::StatsOmitted => tr!(
+                write!(
+                    f,
+                    "Estadísticas omitidas: la repetición tiene más de {MAX_PLAYERS} jugadores"
+                ),
+                write!(
+                    f,
+                    "Stats omitted: the replay has more than {MAX_PLAYERS} players"
+                )
+            ),
+        }
+    }
+}
+
+impl Serialize for ReplayNote {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -138,6 +177,7 @@ pub struct PlayerItem {
 pub enum InspectError {
     Io(io::Error),
     InvalidPath,
+    /// El motivo ya viene en el idioma vigente: el error se muestra enseguida, en el mismo comando.
     InvalidHeader(&'static str),
     InvalidMetadata(serde_json::Error),
     InvalidRofl2MetadataLength,
@@ -147,12 +187,22 @@ impl Display for InspectError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(err) => write!(f, "{err}"),
-            Self::InvalidPath => write!(f, "Ruta de repetición no válida"),
-            Self::InvalidHeader(reason) => write!(f, "Cabecera ROFL no válida: {reason}"),
-            Self::InvalidMetadata(err) => write!(f, "Metadatos ROFL no válidos: {err}"),
-            Self::InvalidRofl2MetadataLength => {
-                write!(f, "Longitud de metadatos ROFL2 no válida")
-            }
+            Self::InvalidPath => tr!(
+                write!(f, "Ruta de repetición no válida"),
+                write!(f, "Invalid replay path")
+            ),
+            Self::InvalidHeader(reason) => tr!(
+                write!(f, "Cabecera ROFL no válida: {reason}"),
+                write!(f, "Invalid ROFL header: {reason}")
+            ),
+            Self::InvalidMetadata(err) => tr!(
+                write!(f, "Metadatos ROFL no válidos: {err}"),
+                write!(f, "Invalid ROFL metadata: {err}")
+            ),
+            Self::InvalidRofl2MetadataLength => tr!(
+                write!(f, "Longitud de metadatos ROFL2 no válida"),
+                write!(f, "Invalid ROFL2 metadata length")
+            ),
         }
     }
 }
@@ -191,7 +241,7 @@ pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, Inspec
             file_name,
             ReplayFormat::Unknown,
             ReplayStatus::Invalid,
-            "Archivo demasiado pequeño para ser una repetición ROFL",
+            ReplayNote::TooSmall,
         ));
     }
     let header_bytes = &header_buffer[..read];
@@ -283,7 +333,7 @@ fn inspect_rofl2(
         &metadata,
         &["gameLength", "GameLength", "game_length", "gameDuration"],
     );
-    let mut notes = vec!["Metadatos ROFL2 leídos del bloque final".to_string()];
+    let mut notes = Vec::new();
     let (players, teams) =
         match_from_metadata(&metadata, data_dragon_version.as_deref(), &mut notes);
     let (blue_kills, red_kills, winning_team) = team_summary(&players);
@@ -315,7 +365,7 @@ fn base_inspection(
     file_name: String,
     format: ReplayFormat,
     status: ReplayStatus,
-    note: impl Into<String>,
+    note: ReplayNote,
 ) -> ReplayInspection {
     ReplayInspection {
         path: path.display().to_string(),
@@ -334,7 +384,7 @@ fn base_inspection(
         red_kills: 0,
         players: Vec::new(),
         teams: Vec::new(),
-        notes: vec![note.into()],
+        notes: vec![note],
     }
 }
 
@@ -375,13 +425,17 @@ fn read_up_to<R: Read>(reader: &mut R, buffer: &mut [u8]) -> io::Result<usize> {
 
 fn parse_classic_header(bytes: &[u8]) -> Result<ClassicHeader, InspectError> {
     if bytes.len() < CLASSIC_HEADER_LEN {
-        return Err(InspectError::InvalidHeader(
+        return Err(InspectError::InvalidHeader(tr!(
             "el archivo es más corto que la cabecera clásica",
-        ));
+            "the file is shorter than the classic header"
+        )));
     }
 
     if bytes[..CLASSIC_MAGIC.len()] != *CLASSIC_MAGIC {
-        return Err(InspectError::InvalidHeader("falta la firma RIOT clásica"));
+        return Err(InspectError::InvalidHeader(tr!(
+            "falta la firma RIOT clásica",
+            "the classic RIOT signature is missing"
+        )));
     }
 
     let metadata_offset = u32_at(bytes, 268);
@@ -390,11 +444,17 @@ fn parse_classic_header(bytes: &[u8]) -> Result<ClassicHeader, InspectError> {
     let payload_header_length = u32_at(bytes, 280);
 
     if metadata_length == 0 {
-        return Err(InspectError::InvalidHeader("metadatos vacíos"));
+        return Err(InspectError::InvalidHeader(tr!(
+            "metadatos vacíos",
+            "empty metadata"
+        )));
     }
     // Mismo tope que en ROFL2: un archivo enorme no justifica reservar gigas para el JSON.
     if u64::from(metadata_length) > MAX_METADATA_BYTES {
-        return Err(InspectError::InvalidHeader("metadatos demasiado grandes"));
+        return Err(InspectError::InvalidHeader(tr!(
+            "metadatos demasiado grandes",
+            "metadata too large"
+        )));
     }
 
     Ok(ClassicHeader {
@@ -425,7 +485,10 @@ fn read_slice_at(
     keep: u32,
 ) -> Result<Vec<u8>, InspectError> {
     if u64::from(offset) + u64::from(length) > file_len {
-        return Err(InspectError::InvalidHeader("sección fuera del archivo"));
+        return Err(InspectError::InvalidHeader(tr!(
+            "sección fuera del archivo",
+            "section outside the file"
+        )));
     }
     file.seek(SeekFrom::Start(u64::from(offset)))?;
     let mut bytes = vec![0; length.min(keep) as usize];
@@ -469,12 +532,10 @@ fn get_u64(value: &Value, keys: &[&str]) -> Option<u64> {
 fn match_from_metadata(
     metadata: &Value,
     data_dragon_version: Option<&str>,
-    notes: &mut Vec<String>,
+    notes: &mut Vec<ReplayNote>,
 ) -> (Vec<PlayerStats>, Vec<TeamSummary>) {
     let Ok(stats) = stats_players(metadata) else {
-        notes.push(format!(
-            "Estadísticas omitidas: la repetición tiene más de {MAX_PLAYERS} jugadores"
-        ));
+        notes.push(ReplayNote::StatsOmitted);
         return (Vec::new(), Vec::new());
     };
     let players = stats
@@ -1168,9 +1229,23 @@ mod tests {
         );
         assert!(crowded.players.is_empty() && crowded.teams.is_empty());
         assert_eq!(crowded.winning_team, None);
-        assert!(crowded.notes.contains(&format!(
-            "Estadísticas omitidas: la repetición tiene más de {MAX_PLAYERS} jugadores"
-        )));
+        assert_eq!(crowded.notes, [ReplayNote::StatsOmitted]);
+        // La nota se traduce al serializar: la misma inspección sale en el idioma vigente.
+        let notes = |language| {
+            crate::i18n::with_language(language, || serde_json::to_value(&crowded.notes).unwrap())
+        };
+        assert_eq!(
+            notes(crate::i18n::Language::Es),
+            json!([format!(
+                "Estadísticas omitidas: la repetición tiene más de {MAX_PLAYERS} jugadores"
+            )])
+        );
+        assert_eq!(
+            notes(crate::i18n::Language::En),
+            json!([format!(
+                "Stats omitted: the replay has more than {MAX_PLAYERS} players"
+            )])
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

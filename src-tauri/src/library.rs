@@ -1,4 +1,7 @@
-use crate::rofl::{self, ReplayFormat, ReplayInspection, ReplayStatus};
+use crate::{
+    rofl::{self, ReplayFormat, ReplayInspection, ReplayStatus},
+    tr,
+};
 use serde::Serialize;
 use std::{
     collections::HashMap,
@@ -70,7 +73,10 @@ impl Display for LibraryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "{error}"),
-            Self::NotDirectory => write!(f, "La ruta de repeticiones no es una carpeta"),
+            Self::NotDirectory => tr!(
+                write!(f, "La ruta de repeticiones no es una carpeta"),
+                write!(f, "The replays path is not a folder")
+            ),
         }
     }
 }

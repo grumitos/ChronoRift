@@ -95,3 +95,42 @@ Changes:
 - The 300 s total timeout is replaced by a 60 s inactivity timeout (`read_timeout`). A slow transfer never dies, and a stalled one is retried.
 - Stop aborts requests in flight within 100 ms instead of waiting for the current window. It also interrupts the plan recomputed at confirmation.
 - One install runs at a time: a guard in the process, plus `.chronorift/install.lock` opened without sharing against other processes. The stale-temp cleanup runs only while holding that lock.
+
+## Update 2026-09-30: disk reservation, head-of-line blocking, and resume inside files
+
+A real `16.17.810.4348` install (415 files, 23.7 GiB download, 29.2 GiB installed) to `E:` (NTFS, 4 KiB clusters) showed:
+
+- The process wrote about 1.24 GB while free space on `E:` dropped about 6.24 GB. On a second run, 603 MB written for a 5.4 GB drop. The space came back when Stop deleted the `.part` files.
+- After 57 s, 334 `.part` files were being assembled at once, and none was complete, so Stop kept nothing.
+- Writes stopped completely for 22 s while the download was running.
+- Every resume downloaded the manifest again.
+
+Cause of the reservation, measured on `C:` (NTFS, 4 KiB clusters). Each row is 2,000 writes into one sparse file, 256 KiB apart unless noted. "Reserved" is the drop in free space, which matched `GetCompressedFileSizeW` once flushed:
+
+| Writes | Written | Reserved | Ratio |
+| --- | --- | --- | --- |
+| 4 KiB, inside one 64 KiB unit | 7.8 MiB | 125 MiB | 16.0 |
+| 28 KiB, inside one unit | 54.7 MiB | 125 MiB | 2.29 |
+| 28 KiB, across a unit boundary | 54.7 MiB | 250 MiB | 4.57 |
+| 64 KiB, across a unit boundary | 125 MiB | 250 MiB | 2.00 |
+| 28 KiB, contiguous, shuffled order | 54.7 MiB | 54.8 MiB | 1.00 |
+| Normal file, 28 KiB, 256 KiB apart | 54.7 MiB | 500 MiB | 9.13 (zero-filled) |
+
+- NTFS reserves a sparse file in whole compression units of 16 clusters (64 KiB) when the data is written, before anything is flushed. During the writes, `GetCompressedFileSizeW` still showed about 2 MiB, but free space had already dropped.
+- The real manifest averages about 28 KiB per chunk reference (29 GiB over about 1.08 M references). Bundle order scatters such writes across hundreds of files, so almost every write reserves one or two fresh units. That predicts 2.3 to 4.6 times the written bytes, close to the 5 times observed.
+- The reservation never exceeds the file sizes, and it shrinks back to the exact size as files complete. With bundle order, though, files hardly ever completed.
+
+Head-of-line blocking, confirmed on the local test CDN before any change. With the bundle of the first window in plan order held and 3 connections, the old loop sent exactly 3 requests and wrote nothing for 3 s. It waited for windows in order, so the finished fetches sat in the queue behind the stuck one, and no new request was sent either. A window in retry backoff (2 + 4 + 8 s plus the request times) therefore stops both the network and the disk. This is consistent with the 22 s pause, but it was not proven on the user's PC.
+
+Changes:
+
+- **File-by-file order.** Windows are unchanged (same merging, same request count). They are ordered so that files finish one after another:
+  - Each chunk counts for the file where it lands, the first by path.
+  - The next windows belong to the started file with the fewest windows left; when none is started, the next file by path starts.
+  - A chunk is written into every file that uses it and is already half written. If none is, it lands in the first one by path, and the other files copy it from the disk when they start. A file whose chunks all landed elsewhere is assembled from local copies.
+  - On a synthetic client, a pure model of the measured 64 KiB reservation gives: by bundle, 47 of 48 files half written at once and 7.5 MiB reserved beyond what was written; file by file, 3 files and 0.95 MiB, with the same 770 requests. The synthetic client has 28 KiB chunks on average, four versions of bundles packed in path order, superseded chunks left as gaps, and a block shared by every file. The env-gated real-manifest test prints the same comparison for a real manifest; it has not been run on one yet.
+  - There is no hard cap on open files: when a bundle really mixes many files, a cap would only cut the download down to one connection.
+- **Write on arrival.** Each window is written as soon as it arrives, so a stuck window holds only its own files. Memory stays bounded to about `connections + 2` windows. The test CDN now holds the first-in-order bundle while the later windows are written and their file is committed.
+- **Resume inside files.** Stop, a failure after the retries, or a crash keep the `.part` files. `.chronorift/journal.json` records the ranges of each one that reached the disk. A resume requests only the missing chunks, and its progress starts from the bytes already on disk. See [ADR-003](ADR-003-resume-repair.md).
+- **Pre-extended `.part` files.** A `.part` is extended to its final size only when the sparse flag took, so FAT and exFAT get no up-front allocation.
+- **Saved manifest.** The manifest is saved as `.chronorift/manifest/<id>.manifest` when an install is confirmed. Planning again and resuming reuse it if it parses and declares the id of its URL. It is removed when the client is complete.

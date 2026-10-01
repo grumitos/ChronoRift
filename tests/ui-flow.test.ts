@@ -2,7 +2,7 @@
 // simulado por @tauri-apps/api/mocks y los datos estáticos servidos por un fetch local.
 // Los datos son sintéticos: no se usan Riot IDs reales. Los errores son los textos del backend.
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, setSystemTime, test } from "bun:test";
 
 const REPLAY_DIR = "C:\\Replays";
 const OTHER_DIR = "D:\\Otras";
@@ -186,7 +186,31 @@ function plan(mode: string, locale: string) {
   };
 }
 
+// Los mismos datos en inglés, con otros nombres: al cambiar el idioma, los de la partida cambian.
+const englishData: Record<string, unknown> = {
+  [`${DD}/cdn/16.18.1/data/en_US/champion.json`]: {
+    data: Object.fromEntries(champions.map((id) => [id, { id, name: id === "MonkeyKing" ? "Wukong" : id, image: { full: `${id}.png` } }])),
+  },
+  [`${DD}/cdn/16.18.1/data/en_US/item.json`]: {
+    data: {
+      "3508": { name: "Stormsurge", image: { full: "3508.png" } },
+      "3020": { name: "Sorcerer's Shoes", image: { full: "3020.png" } },
+    },
+  },
+  [`${CD}/en_us/v1/summoner-spells.json`]: [
+    { id: 4, name: "Flash", description: "Teleports", iconPath: "/lol-game-data/assets/DATA/Spells/Icons2D/Summoner_Flash.png" },
+    { id: 14, name: "Ignite", description: "Burns", iconPath: "/lol-game-data/assets/DATA/Spells/Icons2D/SummonerIgnite.png" },
+  ],
+  [`${CD}/en_us/v1/perks.json`]: [
+    { id: 8005, name: "Press the Attack", iconPath: "/lol-game-data/assets/v1/perk-images/Styles/Precision/PressTheAttack/PressTheAttack.png" },
+  ],
+  [`${CD}/en_us/v1/perkstyles.json`]: {
+    styles: [{ id: 8400, name: "Resolve", iconPath: "/lol-game-data/assets/v1/perk-images/Styles/7204_Resolve.png" }],
+  },
+};
+
 const staticData: Record<string, unknown> = {
+  ...englishData,
   [`${DD}/api/versions.json`]: ["16.19.1", "16.18.1", "16.17.1"],
   [`${DD}/cdn/16.18.1/data/es_MX/champion.json`]: {
     data: Object.fromEntries(
@@ -215,7 +239,12 @@ type Call = { cmd: string; args: any };
 const calls: Call[] = [];
 const fetched: string[] = [];
 const dialogAnswers: Array<string | null> = [];
-let settings: { clientsRoot: string | null; assetPrefetch?: boolean } = { clientsRoot: CLIENTS_ROOT };
+// Primera vez: el idioma nunca se eligió y el del sistema es español.
+let settings: { clientsRoot: string | null; assetPrefetch?: boolean; language: string | null; systemLanguage: string } = {
+  clientsRoot: CLIENTS_ROOT,
+  language: null,
+  systemLanguage: "es",
+};
 let planFailure: string | null = null;
 let launchFailure: string | null = null;
 let revealFailure: string | null = null;
@@ -274,6 +303,18 @@ async function backend(cmd: string, args: any) {
     case "set_asset_prefetch":
       settings = { ...settings, assetPrefetch: args.enabled };
       return { ...settings };
+    case "set_language":
+      settings = { ...settings, language: args.language };
+      return { ...settings };
+    // Como la caché en disco: descarga las rutas `lolasset` del parche, avisa el avance y responde
+    // con la cuenta. Aquí todas existen.
+    case "prefetch_assets": {
+      const total = args.paths.length;
+      await emitEvent("asset-prefetch-progress", { done: total, total, ok: total, missing: 0, errors: 0 });
+      return { done: total, total, ok: total, missing: 0, errors: 0, cancelled: false, offline: false };
+    }
+    case "cancel_asset_prefetch":
+      return null;
     case "plugin:dialog|open":
       return dialogAnswers.shift() ?? null;
     case "plugin:opener|reveal_item_in_dir":
@@ -330,10 +371,11 @@ const called = (cmd: string) => calls.filter((call) => call.cmd === cmd);
 const click = (selector: string) => el<HTMLButtonElement>(selector).click();
 const disabled = (selector: string) => el<HTMLButtonElement>(selector).disabled;
 
+// Con `performance.now()`: las pruebas de velocidad fijan la hora de `Date` con `setSystemTime`.
 async function waitFor(predicate: () => boolean, label: string, timeoutMs = 3_000) {
-  const start = Date.now();
+  const start = performance.now();
   while (!predicate()) {
-    if (Date.now() - start > timeoutMs) throw new Error(`Timed out waiting for ${label}`);
+    if (performance.now() - start > timeoutMs) throw new Error(`Timed out waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
 }
@@ -405,8 +447,60 @@ afterAll(async () => {
 });
 
 describe("library → match → client → launch", () => {
+  test("the first run asks the language on the splash, switches live and can change it in Clientes", async () => {
+    // Sin idioma elegido y sin carpeta recordada, la pantalla de inicio pregunta solo el idioma, con
+    // el del sistema que dice el backend (español) marcado, aunque el visor diga inglés.
+    expect(el("#splash").hidden).toBe(false);
+    expect(el("#splash-ask").hidden).toBe(false);
+    expect(el("#setup-language").hidden).toBe(false);
+    expect(el("#setup-images").hidden).toBe(true);
+    expect(el("#setup-continue").hidden).toBe(false);
+    expect(el("#splash-ask").getAttribute("aria-labelledby")).toBe("setup-language-label");
+    expect(el("#setup-languages [data-language='es']").getAttribute("aria-pressed")).toBe("true");
+    expect(document.documentElement.lang).toBe("es");
+    expect(text("#setup-continue")).toBe("Continuar");
+    expect(el("#library-view").inert).toBe(true);
+    // Los botones de la ventana siguen fuera de lo inerte, con sus iconos desde el HTML.
+    expect(el("#window-close").closest("[inert]")).toBeNull();
+    expect(el("#window-close svg")).not.toBeNull();
+
+    // Elegir inglés lo guarda y cambia todo en el acto, sin recargar: textos fijos y pintados.
+    click("#setup-languages [data-language='en']");
+    await waitFor(() => called("set_language").length === 1, "saved language");
+    expect(called("set_language")[0].args).toEqual({ language: "en" });
+    expect(document.documentElement.lang).toBe("en");
+    expect(el("#setup-languages [data-language='en']").getAttribute("aria-pressed")).toBe("true");
+    expect(text("#setup-language-label")).toBe("Language");
+    expect(text("#setup-continue")).toBe("Continue");
+    expect(text(".nav-item[data-view='library']")).toBe("Library");
+    expect(text("#library-empty-text")).toBe("No folder");
+    expect(el("#replay-search").getAttribute("placeholder")).toBe("Search");
+    expect(el("#window-close").getAttribute("aria-label")).toBe("Close");
+    expect(text("#storage-root")).toBe(CLIENTS_ROOT);
+    // Sigue en la pantalla hasta Continuar, que no vuelve a guardar lo ya elegido.
+    expect(el("#splash").hidden).toBe(false);
+    click("#setup-continue");
+    expect(el("#splash").hidden).toBe(true);
+    expect(el("#library-view").inert).toBe(false);
+    expect(called("set_language")).toHaveLength(1);
+
+    // En Clientes se cambia con el mismo control que las imágenes.
+    click(".nav-item[data-view='clients']");
+    expect(text("#language-label")).toBe("App language");
+    expect(el("#app-language [data-language='en']").getAttribute("aria-pressed")).toBe("true");
+    click("#app-language [data-language='es']");
+    await waitFor(() => called("set_language").length === 2, "language changed in Clientes");
+    expect(called("set_language")[1].args).toEqual({ language: "es" });
+    expect(document.documentElement.lang).toBe("es");
+    expect(el("#app-language [data-language='es']").getAttribute("aria-pressed")).toBe("true");
+    expect(text("#clients-view h1")).toBe("Clientes");
+    expect(text("#builds-list")).toBe("Sin biblioteca");
+    click(".nav-item[data-view='library']");
+    expect(text("#library-empty-text")).toBe("Sin carpeta");
+  });
+
   test("opening a folder detects the owner and renders the match without any client work", async () => {
-    // Sin carpeta recordada la pantalla de inicio sale al leer la configuración y la app responde.
+    // Sin carpeta recordada la app ya responde.
     expect(el("#splash").hidden).toBe(true);
     expect(el("#library-view").inert).toBe(false);
     // Sin carpeta: solo el estado vacío, sin lista, cuenta ni ruta.
@@ -453,17 +547,27 @@ describe("library → match → client → launch", () => {
     // imágenes, con cuántas son y cuánto pesan. Solo cuenta 16.18: 16.17 no tiene datos aquí.
     await waitFor(() => !el("#splash").hidden && !el("#splash-ask").hidden, "prefetch question");
     expect(el("#library-view").inert).toBe(true);
+    // El idioma ya se eligió: solo la pregunta por las imágenes.
+    expect(el("#setup-language").hidden).toBe(true);
+    expect(el("#setup-images").hidden).toBe(false);
+    expect(el("#splash-ask").getAttribute("aria-labelledby")).toBe("splash-ask-title");
     expect(text("#splash-ask-data")).toBe("1 parche · 16 imágenes · ~323 KiB");
     click("#prefetch-all");
     await waitFor(() => called("set_asset_prefetch").length === 1, "saved prefetch choice");
     expect(called("set_asset_prefetch")[0].args).toEqual({ enabled: true });
-    // Cada imagen del parche pasa por la caché en disco; un 404 (recordado como faltante) cuenta
-    // como hecho y la pantalla sale al terminar.
+    // El parche entero va en una sola llamada al backend, con las rutas de la caché en disco
+    // (`lolasset`), y la pantalla sale al terminar. El parche queda anotado como descargado.
     await waitFor(() => el("#splash").hidden, "prefetch finished");
     expect(el("#library-view").inert).toBe(false);
-    expect(fetched).toContain(viaCache(`${DD}/cdn/16.18.1/img/champion/Urgot.png`));
-    expect(fetched).toContain(viaCache(`${DD}/cdn/16.18.1/img/item/3020.png`));
-    expect(fetched).toContain(viaCache(`${CD}/default/v1/perk-images/styles/7204_resolve.png`));
+    expect(called("prefetch_assets")).toHaveLength(1);
+    const paths: string[] = called("prefetch_assets")[0].args.paths;
+    expect(paths).toHaveLength(16);
+    expect(paths[0]).toBe("/ddragon/cdn/16.18.1/img/champion/Urgot.png");
+    expect(paths).toContain("/ddragon/cdn/16.18.1/img/item/3020.png");
+    expect(paths).toContain("/cdragon/16.18/plugins/rcp-be-lol-game-data/global/default/v1/perk-images/styles/7204_resolve.png");
+    expect(JSON.parse(localStorage.getItem("chronorift.prefetchedPatches") ?? "[]")).toEqual(["16.18"]);
+    // La interfaz ya no pide imágenes una por una para guardarlas.
+    expect(fetched.some((url) => url.endsWith(".png"))).toBe(false);
     // 16.17, sin datos al preguntar, se intenta después en segundo plano: se espera a que termine.
     await waitFor(() => el("#activity").hidden, "background prefetch");
     await waitFor(() => document.querySelectorAll(".replay-row").length === 2, "replay rows");
@@ -677,18 +781,39 @@ describe("library → match → client → launch", () => {
     expect(el("#progress-view").hidden).toBe(false);
     expect(el("#activity").hidden).toBe(false);
 
+    // El porcentaje lleva un decimal y la velocidad es el promedio de los últimos segundos: hasta
+    // medir un segundo no se muestra (su lugar ya está reservado).
+    const start = Date.now();
+    setSystemTime(new Date(start));
     await emitProgress("manifest", 0, null, "Downloading manifest");
     await emitProgress("download", 5 * GIB, 25 * GIB, "DATA/FINAL/Champions/Aatrox.es_MX.wad.client");
-    await waitFor(() => text("#progress-percent") === "20 %", "progress percent");
+    await waitFor(() => text("#progress-percent") === "20,0 %", "progress percent");
     expect(text("#progress-file")).toBe("DATA/FINAL/Champions/Aatrox.es_MX.wad.client");
     expect(el("#progress-bar").style.width).toBe("20%");
     expect(el("#stages li[data-stage='manifest']").dataset.status).toBe("done");
     expect(el("#stages li[data-stage='download']").dataset.status).toBe("active");
-    expect(text("#activity-percent")).toBe("20 %");
-    expect(text("#client-status-text")).toBe("Descargando · 20 %");
+    expect(text("#activity-percent")).toBe("20,0 %");
+    expect(text("#activity-speed")).toBe("—");
+    expect(text("#progress-rate")).toBe("");
+    expect(text("#client-status-text")).toBe("Descargando · 20,0 %");
     expect(el("#client-progress").hidden).toBe(false);
     expect(el("#client-progress-bar").style.width).toBe("20%");
     expect(text("#client-location")).toBe(DESTINATION);
+    // 30,5 MB en 5 s: 6,1 MB/s; faltan 20 GiB menos eso, unos 58,6 min a esa velocidad.
+    setSystemTime(new Date(start + 5_000));
+    await emitProgress("download", 5 * GIB + 30_500_000, 25 * GIB, "DATA/FINAL/Champions/Ahri.es_MX.wad.client");
+    await waitFor(() => text("#activity-speed") === "6,1 MB/s", "download speed");
+    setSystemTime();
+    expect(text("#progress-percent")).toBe("20,1 %");
+    expect(text("#progress-bytes")).toBe("5,03 GiB de 25 GiB");
+    expect(text("#progress-rate")).toBe("6,1 MB/s · quedan 59 min");
+    expect(text("#client-speed")).toBe("6,1 MB/s");
+    expect(text("#client-status-text")).toBe("Descargando · 20,1 %");
+    // Sin bytes nuevos (un reintento) no llegan avances: el pulso de cada segundo repite la última
+    // muestra y la velocidad baja en lugar de quedar congelada. 30,5 MB en 9 s.
+    setSystemTime(new Date(start + 9_000));
+    await waitFor(() => text("#activity-speed") === "3,4 MB/s", "speed decays during a stall");
+    setSystemTime();
 
     // Detener se ve detenido en el acto, antes de que el backend termine de cerrar la descarga: sin
     // barra ni indicador, sin "Deteniendo…", y la compilación incompleta con Reanudar.
@@ -700,12 +825,19 @@ describe("library → match → client → launch", () => {
     expect(el("#client-drawer").hidden).toBe(true);
     expect(text("#client-action-label")).toBe("Reanudar");
     expect(document.body.textContent).not.toContain("Deteniendo");
+    // Bajo la barra, una nota neutra (no un error): lo descargado se conserva y Reanudar sigue.
+    expect(el("#client-note").hidden).toBe(false);
+    expect(text("#client-note")).toBe("Detenida. Lo descargado se conserva y Reanudar continúa desde ahí.");
     await waitFor(() => called("cancel_client_install").length === 1, "cancel command");
     // Reanudar espera a que el backend cierre la descarga (si no, la rechazaría): el panel se abre,
-    // pero el plan se pide recién después, con lo que quedó en disco.
+    // pero el plan se pide recién después, con lo que quedó en disco. Mientras tanto ya dice
+    // "Reanudar": no pasa por "Descargar".
     const plans = called("plan_client_install").length;
     click("#client-action");
     expect(el("#client-drawer").hidden).toBe(false);
+    expect(text("#drawer-title")).toBe("Reanudar");
+    expect(text("#confirm-label")).toBe("Reanudar");
+    expect(disabled("#confirm-client-action")).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(called("plan_client_install")).toHaveLength(plans);
     holdCancel = false;
@@ -713,7 +845,8 @@ describe("library → match → client → launch", () => {
     heldCancel = null;
     await waitFor(() => text("#plan-mode") === "Reanudar", "resume plan after the stop");
     expect(called("plan_client_install")).toHaveLength(plans + 1);
-    await waitFor(() => text("#client-status-text") === "Incompleto · 20 %", "partial status");
+    // Lo que hay en disco, también lo guardado a medias, sobre el total: 6 de 29,3 GiB.
+    await waitFor(() => text("#client-status-text") === "Incompleto · 20,4 %", "partial status");
     // Una parada pedida no es un error.
     expect(el("#client-error").hidden).toBe(true);
     expect(el("#plan-error").hidden).toBe(true);
@@ -742,8 +875,10 @@ describe("library → match → client → launch", () => {
     expect(el("#client-drawer").hidden).toBe(true);
     expect(el("#activity").hidden).toBe(true);
     await waitFor(() => called("plan_client_install").length === plans + 1, "automatic re-plan");
-    expect(text("#client-status-text")).toBe("Incompleto · 20 %");
+    expect(text("#client-status-text")).toBe("Incompleto · 20,4 %");
     expect(text("#client-action-label")).toBe("Reanudar");
+    // Un intento nuevo quitó la nota de la parada; el fallo ocupa su lugar.
+    expect(el("#client-note").hidden).toBe(true);
 
     click("#client-action");
     expect(el("#client-drawer").hidden).toBe(false);
@@ -920,6 +1055,17 @@ describe("library → match → client → launch", () => {
     expect(called("set_asset_prefetch")[1].args).toEqual({ enabled: false });
     expect([choice("all"), choice("open")]).toEqual(["false", "true"]);
 
+    // Una compilación incompleta muestra lo que ya tiene en disco y de cuánto, no el total.
+    disk[BUILD_B] = { state: "partial", installedBytes: 12.3 * GIB, totalInstallBytes: 29.2 * GIB };
+    click("#refresh-library");
+    await waitFor(() => text(`#builds-list [data-build='${BUILD_B}'] .builds__state`) === "Incompleto · 42,1 %", "partial build");
+    expect(text(`#builds-list [data-build='${BUILD_B}'] .builds__size`)).toBe("12,3 GiB de 29,2 GiB");
+    expect([...document.querySelectorAll(`#builds-list [data-build='${BUILD_B}'] .builds__actions button`)].map((button) => button.textContent))
+      .toEqual(["Reanudar", "Abrir"]);
+    disk[BUILD_B] = { state: "missing", installedBytes: 0, totalInstallBytes: null };
+    click("#refresh-library");
+    await waitFor(() => text(`#builds-list [data-build='${BUILD_B}'] .builds__state`) === "No instalado", "missing again");
+
     typeInto("#install-folder", "E:\\", ["change"]);
     await waitFor(() => settings.clientsRoot === "E:\\ChronoRift", "normalized folder");
     expect(called("set_clients_root").at(-1)?.args).toEqual({ path: "E:\\" });
@@ -949,5 +1095,34 @@ describe("library → match → client → launch", () => {
     window.dispatchEvent(new Event("focus"));
     await waitFor(() => el("#client-error").hidden, "drive back");
     expect(text("#client-status-text")).toBe("No instalado");
+  });
+
+  test("switching to English with a match open re-renders it, with English names and number formats", async () => {
+    document.querySelectorAll<HTMLButtonElement>(".replay-row")[0].click();
+    await waitFor(() => text("#file-name") === "LA2-1625354615.rofl", "replay A");
+    await waitFor(() => el("#teams .slot--item").getAttribute("title") === "Filo de la tormenta", "Spanish names");
+    const kdaRatio = () => text("#teams .sb-player.is-owner .kda__ratio");
+    expect(kdaRatio()).toBe("6,00");
+
+    click(".nav-item[data-view='clients']");
+    click("#app-language [data-language='en']");
+    click(".nav-item[data-view='library']");
+    await waitFor(() => called("set_language").at(-1)?.args.language === "en", "saved English");
+    // Textos, formatos y resultado en inglés en el acto; los nombres de campeones, objetos y runas
+    // llegan con los datos en_US del parche, que se piden ahora.
+    expect(text("#result-chip")).toBe("Victory");
+    expect(text(".tab[data-tab='board']")).toBe("Scoreboard");
+    expect(text("#client-status-text")).toBe("Ready");
+    expect(text("#play-replay")).toBe("Play");
+    expect(kdaRatio()).toBe("6.00");
+    expect(text("#teams .sb-player.is-owner .owner-tag")).toBe("You");
+    expect([...document.querySelectorAll(".replay-row .result-badge")].map((badge) => badge.textContent)).toEqual(["W", "L"]);
+    expect(text("#library-summary")).toBe("1/2 builds · 1 with errors");
+    await waitFor(() => el("#teams .slot--item").getAttribute("title") === "Stormsurge", "English item names");
+    expect(document.querySelector("#teams .slot img[alt='Flash']")).not.toBeNull();
+    expect(fetched).toContain(viaCache(`${DD}/cdn/16.18.1/data/en_US/item.json`));
+    // Las imágenes no dependen del idioma: el parche sigue anotado como descargado.
+    expect(JSON.parse(localStorage.getItem("chronorift.prefetchedPatches") ?? "[]")).toEqual(["16.18"]);
+    expect(called("prefetch_assets")).toHaveLength(1);
   });
 });

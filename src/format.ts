@@ -1,31 +1,26 @@
-// Formato de números, duraciones, tamaños y fechas. La interfaz está en español: se usa la variante
-// del sistema si es español (es-MX, es-ES…) y, si no, "es". Cada formateador se crea una sola vez.
+// Formato de números, duraciones, tamaños, velocidades y fechas en el idioma de la interfaz (ver
+// `formatLocale` en i18n.ts). Cada formateador se crea una vez por locale y se reutiliza.
 
-const NBSP = " ";
-const locale = interfaceLocale();
-const integer = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 });
-// Hasta 0, 1 o 2 decimales, sin ceros finales (tamaños).
-const upTo = [0, 1, 2].map((digits) => new Intl.NumberFormat(locale, { maximumFractionDigits: digits }));
-// Exactamente N decimales (promedios, miles), creados al primer uso de cada N.
-const fixed = new Map<number, Intl.NumberFormat>();
-const dateShort = new Intl.DateTimeFormat(locale, {
-  day: "numeric",
-  month: "short",
-  hour: "2-digit",
-  minute: "2-digit",
-});
-const dateLong = new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" });
+import { currentLanguage, formatLocale, t } from "./i18n";
+
+const NBSP = " ";
 const BYTE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB"];
+const formatters = new Map<string, Intl.NumberFormat | Intl.DateTimeFormat>();
 
-function interfaceLocale() {
-  const system = typeof navigator === "undefined" ? "" : navigator.language ?? "";
-  if (!/^es(?:-|$)/i.test(system)) return "es";
-  try {
-    new Intl.NumberFormat(system);
-    return system;
-  } catch {
-    return "es";
+function cached<T extends Intl.NumberFormat | Intl.DateTimeFormat>(key: string, create: (locale: string) => T): T {
+  const locale = formatLocale();
+  const id = `${locale}|${key}`;
+  let format = formatters.get(id) as T | undefined;
+  if (!format) {
+    format = create(locale);
+    formatters.set(id, format);
   }
+  return format;
+}
+
+/** Hasta `digits` decimales, sin ceros finales (tamaños). */
+function upTo(digits: number) {
+  return cached(`up${digits}`, (locale) => new Intl.NumberFormat(locale, { maximumFractionDigits: digits }));
 }
 
 function roundTo(value: number, digits: number) {
@@ -34,16 +29,15 @@ function roundTo(value: number, digits: number) {
 }
 
 export function formatInt(value: number) {
-  return integer.format(Math.round(value));
+  return upTo(0).format(Math.round(value));
 }
 
+/** Exactamente `digits` decimales (promedios, miles, porcentajes de descarga). */
 export function formatDecimal(value: number, digits: number) {
-  let format = fixed.get(digits);
-  if (!format) {
-    format = new Intl.NumberFormat(locale, { minimumFractionDigits: digits, maximumFractionDigits: digits });
-    fixed.set(digits, format);
-  }
-  return format.format(value);
+  return cached(
+    `fixed${digits}`,
+    (locale) => new Intl.NumberFormat(locale, { minimumFractionDigits: digits, maximumFractionDigits: digits }),
+  ).format(value);
 }
 
 /**
@@ -57,14 +51,34 @@ export function formatThousands(value: number) {
   return `${formatDecimal(thousands, digits)}${NBSP}k`;
 }
 
+/** El signo como en cada idioma: "20 %" en español (con espacio de no separación), "20%" en inglés. */
+function withPercentSign(number: string) {
+  return currentLanguage() === "es" ? `${number}${NBSP}%` : `${number}%`;
+}
+
 export function formatPercent(value: number) {
-  return `${formatInt(value)}${NBSP}%`;
+  return withPercentSign(formatInt(value));
 }
 
 /** Porcentaje entero de una descarga o instalación: nunca llega a 100 antes de terminar. */
 export function progressPercent(percent: number | null, done: boolean) {
   if (done) return 100;
   return Math.min(99, Math.max(0, Math.floor(percent ?? 0)));
+}
+
+/**
+ * Porcentaje de la descarga de un cliente con un decimal: a 6 MB/s cada 1 % de 24 GiB tarda unos
+ * 40 s, y un décimo se ve avanzar cada pocos segundos. Se trunca (Intl redondearía 99,96 a
+ * "100,0") y no pasa de 99,9 antes de terminar.
+ */
+export function downloadPercent(percent: number | null, done: boolean) {
+  if (done) return 100;
+  return Math.min(99.9, Math.max(0, Math.floor((percent ?? 0) * 10) / 10));
+}
+
+/** "20,4 %" / "20.4%"; terminado, "100 %". */
+export function formatDownloadPercent(value: number) {
+  return withPercentSign(value >= 100 ? formatInt(100) : formatDecimal(value, 1));
 }
 
 /** Duración de la partida en minutos y segundos, truncada como en el cliente del juego. */
@@ -99,17 +113,46 @@ export function formatBytes(bytes: number) {
     digits = sizeDigits(value);
   }
   digits = exponent === 0 ? 0 : sizeDigits(roundTo(value, digits));
-  return `${upTo[digits].format(value)}${NBSP}${BYTE_UNITS[exponent]}`;
+  return `${upTo(digits).format(value)}${NBSP}${BYTE_UNITS[exponent]}`;
+}
+
+/**
+ * Velocidad en unidades decimales, como la muestran los navegadores: "6,1 MB/s"; por debajo de
+ * 1 MB/s, "850 kB/s".
+ */
+export function formatSpeed(bytesPerSecond: number) {
+  if (bytesPerSecond < 999_500) return `${formatInt(bytesPerSecond / 1000)}${NBSP}kB/s`;
+  const megabytes = bytesPerSecond / 1_000_000;
+  return `${roundTo(megabytes, 1) >= 100 ? formatInt(megabytes) : formatDecimal(megabytes, 1)}${NBSP}MB/s`;
+}
+
+/** Tiempo restante redondeado hacia arriba al minuto: "< 1 min", "56 min", "1 h 05 min". */
+export function formatEta(seconds: number) {
+  const minutes = Math.ceil(seconds / 60);
+  const time = seconds < 60
+    ? `<${NBSP}1${NBSP}min`
+    : minutes < 60
+      ? `${minutes}${NBSP}min`
+      : `${Math.floor(minutes / 60)}${NBSP}h ${String(minutes % 60).padStart(2, "0")}${NBSP}min`;
+  return t("timeLeft", { time });
 }
 
 export function formatDate(timestamp: number | null) {
-  return timestamp == null ? "—" : dateShort.format(new Date(timestamp));
+  if (timestamp == null) return "—";
+  return cached("dateShort", (locale) => new Intl.DateTimeFormat(locale, {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  })).format(new Date(timestamp));
 }
 
 export function formatDateLong(timestamp: number | null) {
-  return timestamp == null ? "—" : dateLong.format(new Date(timestamp));
+  if (timestamp == null) return "—";
+  return cached("dateLong", (locale) => new Intl.DateTimeFormat(locale, { dateStyle: "medium", timeStyle: "short" }))
+    .format(new Date(timestamp));
 }
 
 export function kdaRatio(kills: number, deaths: number, assists: number, digits = 2) {
-  return deaths === 0 ? "Perfecto" : formatDecimal((kills + assists) / deaths, digits);
+  return deaths === 0 ? t("perfect") : formatDecimal((kills + assists) / deaths, digits);
 }

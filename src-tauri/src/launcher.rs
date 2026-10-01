@@ -1,4 +1,4 @@
-use crate::client::GAME_EXE;
+use crate::{client::GAME_EXE, tr};
 use serde::{Deserialize, Serialize};
 use std::{
     error::Error,
@@ -45,25 +45,38 @@ pub enum LaunchError {
 impl Display for LaunchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnsupportedPlatform => write!(f, "Reproducir solo funciona en Windows"),
-            Self::MissingReplay(path) => {
-                write!(f, "La repetición no existe: {}", path.display())
-            }
-            Self::NotGameExecutable(path) => {
-                write!(f, "No es {GAME_EXE}: {}", path.display())
-            }
-            Self::MissingExecutable(path) => {
-                write!(f, "El ejecutable no existe: {}", path.display())
-            }
-            Self::MissingGameFolder(path) => {
+            Self::UnsupportedPlatform => tr!(
+                write!(f, "Reproducir solo funciona en Windows"),
+                write!(f, "Playing replays only works on Windows")
+            ),
+            Self::MissingReplay(path) => tr!(
+                write!(f, "La repetición no existe: {}", path.display()),
+                write!(f, "The replay does not exist: {}", path.display())
+            ),
+            Self::NotGameExecutable(path) => tr!(
+                write!(f, "No es {GAME_EXE}: {}", path.display()),
+                write!(f, "This is not {GAME_EXE}: {}", path.display())
+            ),
+            Self::MissingExecutable(path) => tr!(
+                write!(f, "El ejecutable no existe: {}", path.display()),
+                write!(f, "The executable does not exist: {}", path.display())
+            ),
+            Self::MissingGameFolder(path) => tr!(
                 write!(
                     f,
                     "El ejecutable no tiene carpeta de juego: {}",
                     path.display()
-                )
-            }
-            Self::InvalidLocale(locale) => write!(f, "Idioma no válido: {locale}"),
-            Self::Spawn(err) => write!(f, "No se pudo iniciar League of Legends: {err}"),
+                ),
+                write!(f, "The executable has no game folder: {}", path.display())
+            ),
+            Self::InvalidLocale(locale) => tr!(
+                write!(f, "Idioma no válido: {locale}"),
+                write!(f, "Invalid locale: {locale}")
+            ),
+            Self::Spawn(err) => tr!(
+                write!(f, "No se pudo iniciar League of Legends: {err}"),
+                write!(f, "Could not start League of Legends: {err}")
+            ),
         }
     }
 }

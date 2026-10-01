@@ -3,6 +3,7 @@
 ; Tauri usa este archivo en lugar de su Spanish.nsh integrado (bundle.windows.nsis.customLanguageFiles)
 ; y lo incluye al final de installer.nsi, cuando ya existen ${LANG_SPANISH} y ${PRODUCTNAME}.
 ; No lleva BOM a propósito: el bundler agrega el suyo al copiarlo, y un BOM doble rompe el script.
+; Las claves de las partes 1 y 2 deben estar también en english.nsh: la que falte queda vacía en inglés.
 ;
 ; Tiene tres partes:
 ;   1. Los textos propios de la plantilla de Tauri. Las claves son las de su English.nsh y deben estar todas.

@@ -322,9 +322,16 @@ button:disabled {
   color: var(--ink-2);
 }
 
-/* Del ancho de "100 %": el avance no corre el resto del indicador. */
+/* Del ancho de "99,9 %": el avance no corre el resto del indicador. */
 .activity__percent {
-  min-width: 5ch;
+  min-width: 6ch;
+  text-align: right;
+}
+
+/* Del ancho de "99,9 MB/s", reservado desde el primer avance (con "—" hasta medir un segundo). */
+.activity__speed {
+  min-width: 9ch;
+  color: var(--ink-2);
   text-align: right;
 }
 
@@ -1257,11 +1264,12 @@ button:disabled {
   gap: 3px;
 }
 
-/* Del ancho de "Descargando · 100 %" con su marca: empezar, avanzar o detener una descarga no mueve
-   los demás datos. Un estado más largo (un inicio fallido) lo agranda. */
+/* Del ancho de "Descargando · 99,9 %" con su marca (y de "Downloading · 99.9%"): empezar, avanzar
+   o detener una descarga no mueve los demás datos. Un estado más largo (un inicio fallido) lo
+   agranda. */
 .client-strip__item--status {
   position: relative;
-  min-width: 142px;
+  min-width: 156px;
 }
 
 /* La ruta ocupa lo que sobra y se recorta (completa en `title`). La fila solo se parte cuando
@@ -1311,14 +1319,36 @@ button:disabled {
 }
 
 /* Progreso de la descarga en curso, bajo el texto del estado y fuera del flujo: aparecer no
-   cambia ni el ancho ni el alto de la fila. */
-.client-strip__status .meter {
+   cambia ni el ancho ni el alto de la fila. La velocidad va a la derecha de la barra, en la misma
+   línea. */
+.client-strip__progress {
   position: absolute;
   right: 0;
   bottom: -8px;
   left: 15px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 3px;
+}
+
+.client-strip__progress .meter {
+  flex: 1;
   width: auto;
   height: 3px;
+}
+
+.client-strip__speed,
+.builds__rate {
+  color: var(--ink-3);
+  font-size: 10.5px;
+  font-weight: 400;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.client-strip__speed:empty {
+  display: none;
 }
 
 .client-strip__path {
@@ -1362,7 +1392,8 @@ button:disabled {
   height: 14px;
 }
 
-.client-error {
+.client-error,
+.client-note {
   margin: 8px 0 0;
   overflow: hidden;
   color: var(--loss);
@@ -1370,6 +1401,11 @@ button:disabled {
   line-height: 18px;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+/* Aclaración neutra en el mismo lugar que un error (tras Detener): sin tono de alarma. */
+.client-note {
+  color: var(--ink-2);
 }
 
 .tabs {
@@ -2324,11 +2360,29 @@ button:disabled {
   gap: 10px;
 }
 
+/* El porcentaje grande a la izquierda y, a su derecha, dos líneas: los bytes y, debajo, la
+   velocidad y el tiempo restante. Caben en el alto del porcentaje: el panel no crece. */
 .progress__line {
   display: flex;
-  align-items: baseline;
+  align-items: flex-end;
   justify-content: space-between;
   gap: 12px;
+}
+
+.progress__numbers {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  min-width: 0;
+  padding-bottom: 3px;
+  font-size: 12.5px;
+  line-height: 17px;
+  white-space: nowrap;
+}
+
+/* Reservada aunque esté vacía: la velocidad llega tras el primer segundo medido. */
+.progress__numbers > span {
+  min-height: 17px;
 }
 
 .progress__percent {
@@ -2570,13 +2624,38 @@ button:disabled {
   font-size: 12.5px;
 }
 
-/* Como en la barra del cliente: el progreso bajo el texto del estado, fuera del flujo. */
-.builds__meter {
+/* Como en la barra del cliente: el progreso bajo el texto del estado, fuera del flujo, con la
+   velocidad a su derecha. */
+.builds__progress {
   position: absolute;
+  right: 0;
   bottom: -7px;
   left: 16px;
-  width: 120px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   height: 3px;
+}
+
+.builds__meter {
+  flex: none;
+  width: 104px;
+  height: 3px;
+}
+
+
+
+/* Incompleta: lo que hay en disco y, debajo, de cuánto. */
+.builds__size {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.builds__size small {
+  color: var(--ink-3);
+  font-size: 11px;
 }
 
 .builds__actions {
@@ -2591,12 +2670,17 @@ button:disabled {
   color: var(--ink-3);
 }
 
-/* Imágenes de las partidas: una fila con la elección entre descargar todo o al abrir cada partida. */
+/* Preferencias: el idioma de la app y las imágenes de las partidas, una fila cada una con su
+   elección a la derecha. */
 .assets {
   display: flex;
   align-items: center;
   gap: 16px;
   padding: 12px 20px;
+}
+
+.assets + .assets {
+  border-top: 1px solid var(--line-soft);
 }
 
 .assets__label {
@@ -2667,6 +2751,31 @@ button:disabled {
 
 .splash__continue {
   margin-top: 10px;
+}
+
+/* Primera configuración: el idioma en una fila (etiqueta y las dos opciones) y, debajo, la
+   pregunta por las imágenes si corresponde. */
+.splash__language {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.splash__languages button {
+  flex: none;
+  min-width: 84px;
+  padding: 0 14px;
+}
+
+.splash__images {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.splash__language:not([hidden]) + .splash__continue[hidden] + .splash__images {
+  margin-top: 22px;
 }
 
 ::-webkit-scrollbar {

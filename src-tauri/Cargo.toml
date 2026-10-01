@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Replay archive and playback helper for League of Legends ROFL files."
 authors = ["ChronoRift contributors"]
 edition = "2021"
+# El mayor `rust-version` del grafo bloqueado (`cargo metadata --locked`), acordado con FairTranslator.
+rust-version = "1.88"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -18,24 +20,25 @@ name = "chronorift_lib"
 crate-type = ["rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 cdragon-rman = "0.2"
-tauri = { version = "2", features = [] }
-tauri-plugin-dialog = "2"
-tauri-plugin-opener = "2"
+tauri = { version = "=2.11.6", features = [] }
+tauri-plugin-dialog = "=2.7.3"
+tauri-plugin-opener = "=2.5.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zstd = "0.13"
 # Ya está en el árbol por Tauri: el candado por archivo y el límite de descargas de la caché.
 tokio = { version = "1", features = ["sync"] }
 
-# Ya está en el árbol por Tauri; solo se habilitan las API de consulta de servicios y la marca
-# de archivo disperso (`FSCTL_SET_SPARSE`) de los temporales de descarga.
+# Ya está en el árbol por Tauri; solo se habilitan las API de consulta de servicios, la marca de
+# archivo disperso (`FSCTL_SET_SPARSE`) de los temporales de descarga y el idioma de la interfaz
+# de Windows (`GetUserDefaultUILanguage`).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Services"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Services"] }
 
 # Solo las dependencias se optimizan en desarrollo: zstd, TLS y hashing sin optimizar limitan
 # el throughput de descarga en `tauri dev`. El crate de la app sigue en debug.

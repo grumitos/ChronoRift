@@ -1,14 +1,15 @@
-use crate::settings;
+use crate::{settings, tr};
 use cdragon_rman::{BundleChunk, Rman};
 use reqwest::{header, redirect, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     error::Error,
+    ffi::OsStr,
     fmt::{self, Display},
     fs::{self, File, OpenOptions},
     future::Future,
-    io::{self, Cursor, Seek, SeekFrom, Write},
+    io::{self, Cursor, Read, Seek, SeekFrom, Write},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     pin::{pin, Pin},
@@ -54,9 +55,12 @@ pub(crate) fn same_origin_redirects() -> redirect::Policy {
             .is_some_and(|first| first.origin() == attempt.url().origin());
         if !same_origin {
             let refused = attempt.url().origin().ascii_serialization();
-            attempt.error(format!("redirección rechazada hacia {refused}"))
+            attempt.error(tr!(
+                format!("redirección rechazada hacia {refused}"),
+                format!("redirect refused to {refused}")
+            ))
         } else if attempt.previous().len() > MAX_REDIRECTS {
-            attempt.error("demasiadas redirecciones")
+            attempt.error(tr!("demasiadas redirecciones", "too many redirects"))
         } else {
             attempt.follow()
         }
@@ -101,6 +105,14 @@ const INSTALL_METADATA: &str = "install.json";
 const PLAN_METADATA: &str = "plan.json";
 /// Candado entre procesos mientras dura una instalación en ese destino.
 const LOCK_FILE: &str = "install.lock";
+/// Diario de los `.part` a medio armar: qué rangos de cada uno ya llegaron al disco.
+const JOURNAL_FILE: &str = "journal.json";
+const JOURNAL_VERSION: u32 = 1;
+/// Carpeta, dentro de `METADATA_DIR`, del manifiesto de la instalación en curso.
+const MANIFEST_CACHE_DIR: &str = "manifest";
+/// Cada cuánto, como mínimo, se vuelcan los `.part` y se reemplaza el diario. Una parada o un
+/// fallo hacen un último punto de control; un corte de luz pierde a lo sumo este lapso.
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,10 +127,10 @@ pub enum ClientWorkMode {
 impl Display for ClientWorkMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = match self {
-            Self::Install => "instalación nueva",
-            Self::Resume => "reanudación",
-            Self::Repair => "reparación",
-            Self::Ready => "cliente listo",
+            Self::Install => tr!("instalación nueva", "new install"),
+            Self::Resume => tr!("reanudación", "resume"),
+            Self::Repair => tr!("reparación", "repair"),
+            Self::Ready => tr!("cliente listo", "ready client"),
         };
         f.write_str(value)
     }
@@ -274,7 +286,8 @@ pub struct LocalClientStatus {
     pub state: LocalClientState,
     pub executable_path: Option<String>,
     pub locale: Option<String>,
-    /// Bytes de los archivos del juego ya confirmados (sin metadatos ni temporales).
+    /// Bytes de los archivos del juego ya confirmados (sin metadatos) más los que el diario
+    /// registra en los `.part` conservados de una descarga detenida.
     pub installed_bytes: u64,
     /// Total previsto, de `install.json` o del plan confirmado.
     pub total_install_bytes: Option<u64>,
@@ -288,6 +301,7 @@ pub struct LocalClientStatus {
 struct StoredInstall {
     locale: Option<String>,
     total_install_bytes: Option<u64>,
+    manifest_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -373,127 +387,233 @@ pub enum ClientInstallError {
 impl Display for ClientInstallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidPatch => write!(f, "Parche no válido"),
-            Self::InvalidLocale(locale) => write!(f, "Idioma no válido: {locale}"),
-            Self::UnavailableLocale(locale) => {
-                write!(f, "Idioma no disponible en este cliente: {locale}")
-            }
-            Self::InvalidClientsRoot(err) => write!(f, "{err}"),
-            Self::ClientsRootUnavailable(path) => {
-                write!(f, "La carpeta de clientes no está disponible: {path}")
-            }
-            Self::InvalidReleaseVersion(version) => {
-                write!(f, "Versión de cliente inesperada: {version}")
-            }
-            Self::InvalidManifestUrl(url) => write!(f, "URL de manifiesto no válida: {url}"),
-            Self::UntrustedManifestUrl(url) => {
-                write!(f, "Manifiesto fuera del CDN de Riot: {url}")
-            }
-            Self::MissingBundleBase(url) => {
-                write!(f, "Sin URL de bundles para el manifiesto: {url}")
-            }
-            Self::HttpClient(err) => write!(
-                f,
-                "No se pudo preparar el cliente HTTP: {}",
-                network_detail(err)
+            Self::InvalidPatch => tr!(write!(f, "Parche no válido"), write!(f, "Invalid patch")),
+            Self::InvalidLocale(locale) => tr!(
+                write!(f, "Idioma no válido: {locale}"),
+                write!(f, "Invalid language: {locale}")
             ),
-            Self::Resolve(err) => {
-                write!(f, "No se pudo consultar Riot Sieve: {}", network_detail(err))
-            }
-            Self::InvalidResolveResponse(err) => {
-                write!(f, "Respuesta inesperada de Riot Sieve: {err}")
-            }
-            Self::ManifestIndex(err) => write!(
-                f,
-                "No se pudo leer el índice riot-manifests: {}",
-                network_detail(err)
+            Self::UnavailableLocale(locale) => tr!(
+                write!(f, "Idioma no disponible en este cliente: {locale}"),
+                write!(f, "Language not available in this client: {locale}")
+            ),
+            Self::InvalidClientsRoot(err) => write!(f, "{err}"),
+            Self::ClientsRootUnavailable(path) => tr!(
+                write!(f, "La carpeta de clientes no está disponible: {path}"),
+                write!(f, "The clients folder is not available: {path}")
+            ),
+            Self::InvalidReleaseVersion(version) => tr!(
+                write!(f, "Versión de cliente inesperada: {version}"),
+                write!(f, "Unexpected client version: {version}")
+            ),
+            Self::InvalidManifestUrl(url) => tr!(
+                write!(f, "URL de manifiesto no válida: {url}"),
+                write!(f, "Invalid manifest URL: {url}")
+            ),
+            Self::UntrustedManifestUrl(url) => tr!(
+                write!(f, "Manifiesto fuera del CDN de Riot: {url}"),
+                write!(f, "Manifest outside Riot's CDN: {url}")
+            ),
+            Self::MissingBundleBase(url) => tr!(
+                write!(f, "Sin URL de bundles para el manifiesto: {url}"),
+                write!(f, "No bundle URL for the manifest: {url}")
+            ),
+            Self::HttpClient(err) => tr!(
+                write!(
+                    f,
+                    "No se pudo preparar el cliente HTTP: {}",
+                    network_detail(err)
+                ),
+                write!(f, "Could not set up the HTTP client: {}", network_detail(err))
+            ),
+            Self::Resolve(err) => tr!(
+                write!(f, "No se pudo consultar Riot Sieve: {}", network_detail(err)),
+                write!(f, "Could not query Riot Sieve: {}", network_detail(err))
+            ),
+            Self::InvalidResolveResponse(err) => tr!(
+                write!(f, "Respuesta inesperada de Riot Sieve: {err}"),
+                write!(f, "Unexpected response from Riot Sieve: {err}")
+            ),
+            Self::ManifestIndex(err) => tr!(
+                write!(
+                    f,
+                    "No se pudo leer el índice riot-manifests: {}",
+                    network_detail(err)
+                ),
+                write!(
+                    f,
+                    "Could not read the riot-manifests index: {}",
+                    network_detail(err)
+                )
             ),
             Self::ResolveFailed { sieve, index } => write!(f, "{sieve}. {index}"),
-            Self::ResponseTooLarge { host, limit } => write!(
-                f,
-                "Respuesta demasiado grande de {host}: supera {} MiB",
-                limit / (1024 * 1024)
-            ),
-            Self::Metadata(err) => {
-                write!(f, "No se pudieron guardar los datos de la instalación: {err}")
+            Self::ResponseTooLarge { host, limit } => {
+                let mib = limit / (1024 * 1024);
+                tr!(
+                    write!(f, "Respuesta demasiado grande de {host}: supera {mib} MiB"),
+                    write!(f, "Response too large from {host}: over {mib} MiB")
+                )
             }
+            Self::Metadata(err) => tr!(
+                write!(f, "No se pudieron guardar los datos de la instalación: {err}"),
+                write!(f, "Could not save the install data: {err}")
+            ),
             Self::ReleaseNotFound {
                 region,
                 patch,
-                version,
-            } => {
-                if let Some(version) = version {
-                    write!(
-                        f,
-                        "Sin manifiesto de {GAME_ARTIFACT} para {region} {version} ({patch}) en Riot Sieve ni en riot-manifests"
-                    )
-                } else {
-                    write!(f, "Sin manifiesto de {GAME_ARTIFACT} para {region} {patch}")
-                }
-            }
-            Self::Download(err) => write!(f, "Falló la descarga: {}", network_detail(err)),
+                version: Some(version),
+            } => tr!(
+                write!(
+                    f,
+                    "Sin manifiesto de {GAME_ARTIFACT} para {region} {version} ({patch}) en Riot Sieve ni en riot-manifests"
+                ),
+                write!(
+                    f,
+                    "No {GAME_ARTIFACT} manifest for {region} {version} ({patch}) in Riot Sieve or riot-manifests"
+                )
+            ),
+            Self::ReleaseNotFound {
+                region,
+                patch,
+                version: None,
+            } => tr!(
+                write!(f, "Sin manifiesto de {GAME_ARTIFACT} para {region} {patch}"),
+                write!(f, "No {GAME_ARTIFACT} manifest for {region} {patch}")
+            ),
+            Self::Download(err) => tr!(
+                write!(f, "Falló la descarga: {}", network_detail(err)),
+                write!(f, "Download failed: {}", network_detail(err))
+            ),
             Self::InvalidChunkSize {
                 expected,
                 actual: Some(actual),
-            } => write!(
-                f,
-                "Rango de bundle con tamaño inesperado: {actual} bytes en lugar de {expected}"
+            } => tr!(
+                write!(
+                    f,
+                    "Rango de bundle con tamaño inesperado: {actual} bytes en lugar de {expected}"
+                ),
+                write!(
+                    f,
+                    "Bundle range with an unexpected size: {actual} bytes instead of {expected}"
+                )
             ),
             Self::InvalidChunkSize {
                 expected,
                 actual: None,
-            } => write!(
-                f,
-                "Rango de bundle sin tamaño declarado; se esperaban {expected} bytes"
+            } => tr!(
+                write!(
+                    f,
+                    "Rango de bundle sin tamaño declarado; se esperaban {expected} bytes"
+                ),
+                write!(
+                    f,
+                    "Bundle range without a declared size; expected {expected} bytes"
+                )
             ),
-            Self::RangeIgnored(status) => {
-                write!(f, "El CDN no respetó el rango pedido: HTTP {status}")
-            }
-            Self::IncompleteRange { expected, actual } => write!(
-                f,
-                "Rango de bundle incompleto: {actual} de {expected} bytes"
+            Self::RangeIgnored(status) => tr!(
+                write!(f, "El CDN no respetó el rango pedido: HTTP {status}"),
+                write!(f, "The CDN ignored the requested range: HTTP {status}")
             ),
-            Self::InvalidChunkData { expected, actual } => write!(
-                f,
-                "Fragmento descomprimido con tamaño inesperado: {actual} bytes en lugar de {expected}"
+            Self::IncompleteRange { expected, actual } => tr!(
+                write!(
+                    f,
+                    "Rango de bundle incompleto: {actual} de {expected} bytes"
+                ),
+                write!(f, "Incomplete bundle range: {actual} of {expected} bytes")
             ),
-            Self::ChunkLayoutMismatch(path) => write!(
-                f,
-                "Los fragmentos del manifiesto no suman el tamaño del archivo: {path}"
+            Self::InvalidChunkData { expected, actual } => tr!(
+                write!(
+                    f,
+                    "Fragmento descomprimido con tamaño inesperado: {actual} bytes en lugar de {expected}"
+                ),
+                write!(
+                    f,
+                    "Decompressed chunk with an unexpected size: {actual} bytes instead of {expected}"
+                )
             ),
-            Self::Io(err) => write!(f, "Falló la instalación: {err}"),
-            Self::Rman(err) => write!(f, "No se pudo leer el manifiesto de Riot: {err}"),
-            Self::CorruptManifest => write!(f, "Manifiesto de Riot dañado o desconocido"),
-            Self::MissingChunk(id) => {
-                write!(f, "El manifiesto usa un fragmento inexistente: {id:016X}")
-            }
-            Self::Zstd(err) => write!(f, "No se pudo descomprimir un fragmento: {err}"),
-            Self::UnsafeManifestPath(path) => {
-                write!(f, "Ruta insegura en el manifiesto: {path}")
-            }
-            Self::WouldOverwrite(path) => {
-                write!(f, "El archivo ya existe: {}", path.display())
-            }
-            Self::InvalidExistingTarget(path) => {
-                write!(f, "El destino no es un archivo: {}", path.display())
-            }
+            Self::ChunkLayoutMismatch(path) => tr!(
+                write!(
+                    f,
+                    "Los fragmentos del manifiesto no suman el tamaño del archivo: {path}"
+                ),
+                write!(
+                    f,
+                    "The manifest chunks do not add up to the file size: {path}"
+                )
+            ),
+            Self::Io(err) => tr!(
+                write!(f, "Falló la instalación: {err}"),
+                write!(f, "The install failed: {err}")
+            ),
+            Self::Rman(err) => tr!(
+                write!(f, "No se pudo leer el manifiesto de Riot: {err}"),
+                write!(f, "Could not read the Riot manifest: {err}")
+            ),
+            Self::CorruptManifest => tr!(
+                write!(f, "Manifiesto de Riot dañado o desconocido"),
+                write!(f, "Damaged or unknown Riot manifest")
+            ),
+            Self::MissingChunk(id) => tr!(
+                write!(f, "El manifiesto usa un fragmento inexistente: {id:016X}"),
+                write!(f, "The manifest uses a chunk that does not exist: {id:016X}")
+            ),
+            Self::Zstd(err) => tr!(
+                write!(f, "No se pudo descomprimir un fragmento: {err}"),
+                write!(f, "Could not decompress a chunk: {err}")
+            ),
+            Self::UnsafeManifestPath(path) => tr!(
+                write!(f, "Ruta insegura en el manifiesto: {path}"),
+                write!(f, "Unsafe path in the manifest: {path}")
+            ),
+            Self::WouldOverwrite(path) => tr!(
+                write!(f, "El archivo ya existe: {}", path.display()),
+                write!(f, "The file already exists: {}", path.display())
+            ),
+            Self::InvalidExistingTarget(path) => tr!(
+                write!(f, "El destino no es un archivo: {}", path.display()),
+                write!(f, "The target is not a file: {}", path.display())
+            ),
             Self::ConfirmationRequired {
                 planned,
                 version,
                 destination,
-            } => write!(f, "El plan cambió a {planned}: {version} en {destination}"),
-            Self::LocaleChanged { confirmed, planned } => write!(
-                f,
-                "El plan cambió de idioma: {planned} en lugar de {confirmed}"
+            } => tr!(
+                write!(f, "El plan cambió a {planned}: {version} en {destination}"),
+                write!(f, "The plan changed to {planned}: {version} in {destination}")
             ),
-            Self::ManifestChanged(url) => write!(f, "El plan cambió de manifiesto: {url}"),
-            Self::MissingExecutable(path) => {
-                write!(f, "Falta el ejecutable: {}", path.display())
-            }
-            Self::Emit(err) => write!(f, "No se pudo publicar el progreso: {err}"),
-            Self::Worker(err) => write!(f, "Falló una tarea de la descarga: {err}"),
-            Self::Cancelled => write!(f, "Descarga detenida"),
-            Self::AlreadyRunning => write!(f, "Ya hay una descarga en curso."),
+            Self::LocaleChanged { confirmed, planned } => tr!(
+                write!(
+                    f,
+                    "El plan cambió de idioma: {planned} en lugar de {confirmed}"
+                ),
+                write!(
+                    f,
+                    "The plan changed language: {planned} instead of {confirmed}"
+                )
+            ),
+            Self::ManifestChanged(url) => tr!(
+                write!(f, "El plan cambió de manifiesto: {url}"),
+                write!(f, "The plan changed manifest: {url}")
+            ),
+            Self::MissingExecutable(path) => tr!(
+                write!(f, "Falta el ejecutable: {}", path.display()),
+                write!(f, "The executable is missing: {}", path.display())
+            ),
+            Self::Emit(err) => tr!(
+                write!(f, "No se pudo publicar el progreso: {err}"),
+                write!(f, "Could not publish the progress: {err}")
+            ),
+            Self::Worker(err) => tr!(
+                write!(f, "Falló una tarea de la descarga: {err}"),
+                write!(f, "A download task failed: {err}")
+            ),
+            Self::Cancelled => tr!(
+                write!(f, "Descarga detenida"),
+                write!(f, "Download stopped")
+            ),
+            Self::AlreadyRunning => tr!(
+                write!(f, "Ya hay una descarga en curso."),
+                write!(f, "A download is already running.")
+            ),
         }
     }
 }
@@ -528,23 +648,23 @@ fn is_transient_network(error: &reqwest::Error) -> bool {
         || error.is_decode()
 }
 
-/// Motivo de un fallo de red en español, con el host cuando se conoce. Lo que no se reconoce
-/// queda con el texto de reqwest.
+/// Motivo de un fallo de red en el idioma de la interfaz, con el host cuando se conoce. Lo que no
+/// se reconoce queda con el texto de reqwest.
 fn network_detail(error: &reqwest::Error) -> String {
-    // La política de redirecciones ya da su motivo en español, con el origen rechazado.
+    // La política de redirecciones ya da su motivo traducido, con el origen rechazado.
     if error.is_redirect() {
         if let Some(reason) = error.source() {
             return reason.to_string();
         }
     }
     let reason = if error.is_timeout() {
-        "tiempo de espera agotado".to_string()
+        tr!("tiempo de espera agotado", "timed out").to_string()
     } else if error.is_connect() {
-        "no se pudo conectar".to_string()
+        tr!("no se pudo conectar", "could not connect").to_string()
     } else if let Some(status) = error.status() {
         format!("HTTP {}", status.as_u16())
     } else if error.is_body() || error.is_decode() {
-        "respuesta incompleta".to_string()
+        tr!("respuesta incompleta", "incomplete response").to_string()
     } else {
         return error.to_string();
     };
@@ -699,7 +819,14 @@ fn status_for_destination(destination: PathBuf, game_build: String) -> LocalClie
     let installed = read_stored(&metadata_dir, INSTALL_METADATA);
     let planned = read_stored(&metadata_dir, PLAN_METADATA);
     let executable = destination.join(GAME_EXE);
-    let installed_bytes = game_file_bytes(&destination, &metadata_dir);
+    // Una descarga detenida suma lo que su diario registra en los `.part` conservados.
+    let journaled = planned
+        .as_ref()
+        .and_then(|plan| plan.manifest_url.as_deref())
+        .map_or(0, |manifest_url| {
+            journaled_bytes(&destination, manifest_url)
+        });
+    let installed_bytes = game_file_bytes(&destination, &metadata_dir) + journaled;
     let state = if installed.is_some() && executable.is_file() {
         LocalClientState::Ready
     } else if planned.is_some() || installed_bytes > 0 {
@@ -767,7 +894,7 @@ async fn install_client_with(
     let _running = cancel.begin()?;
     let client = http_client_with(tuning.read_timeout)?;
     // Detener también corta el plan recalculado (Sieve, índice y manifiesto).
-    let planned = until_cancelled(
+    let mut planned = until_cancelled(
         cancel,
         build_install_plan(&client, progress, endpoints, &request),
     )
@@ -780,34 +907,66 @@ async fn install_client_with(
     // Candado entre procesos antes de tocar el destino: la limpieza de temporales nunca alcanza
     // los archivos de otra instalación en curso.
     let _lock = InstallLock::acquire(&planned.destination)?;
+    // Otra instancia pudo cambiar el diario entre el plan y el candado: entonces el plan ya no
+    // es el que se revisó.
+    let identity = JournalIdentity::of(&planned.plan);
+    let kept = KeptParts::load(&planned.destination, &identity, &planned.pending_files);
+    if kept != planned.kept {
+        return Err(ClientInstallError::ConfirmationRequired {
+            planned: planned.plan.mode,
+            version: planned.plan.game_build.clone(),
+            destination: planned.plan.destination_path.clone(),
+        });
+    }
     // Recién con el plan confirmado, y también si ya está listo: un `.backup` de una reparación
-    // cortada puede quedar aunque el archivo ya esté completo.
-    remove_stale_temp_files(&planned.destination.join(METADATA_DIR).join(TEMP_DIR))?;
+    // cortada puede quedar aunque el archivo ya esté completo. Los `.part` que el diario
+    // conserva para este plan se quedan.
+    remove_stale_temp_files(&planned.destination, &kept)?;
+
+    let mut total_bytes = 0;
+    let started = Instant::now();
     if planned.plan.mode != ClientWorkMode::Ready {
         // El plan confirmado da el total si la descarga queda a medias. `install.json` sigue
         // hasta que se confirma el primer archivo y vuelve a escribirse con el cliente completo.
         write_metadata(&planned.destination, PLAN_METADATA, &planned.plan)?;
+        // Reanudar o volver a planificar no vuelve a bajar el manifiesto.
+        if let Some(manifest) = planned.manifest.take() {
+            store_manifest(&planned.destination, &planned.plan.manifest_url, &manifest)?;
+        }
+        let work = plan_download(&planned.pending_files, &kept, tuning.max_window)?;
+        total_bytes = work.stored_bytes + work.missing_bytes;
+        let assembling = (0..planned.pending_files.len())
+            .map(|file| kept.get(file).is_some())
+            .collect::<Vec<_>>();
+        let writer = FileWriter::new(
+            &planned.destination,
+            &planned.pending_files,
+            &kept,
+            Assembly::new(work.chunks, work.remaining, &assembling),
+            identity,
+            planned.plan.mode == ClientWorkMode::Repair,
+        )?;
+        let mut downloader = Downloader {
+            client: &client,
+            progress,
+            destination: &planned.destination,
+            bundle_base: &bundle_base,
+            tuning,
+            cancel,
+            stored_bytes: work.stored_bytes,
+            missing_bytes: work.missing_bytes,
+            received: Arc::default(),
+            reported_bytes: 0,
+            last_report: None,
+        };
+        download_files(
+            &mut downloader,
+            &planned.pending_files,
+            work.windows,
+            writer,
+        )
+        .await?;
     }
-
-    let mut downloader = Downloader {
-        client: &client,
-        progress,
-        destination: &planned.destination,
-        bundle_base: &bundle_base,
-        tuning,
-        cancel,
-        total_bytes: planned.plan.download_bytes,
-        received: Arc::default(),
-        reported_bytes: 0,
-        last_report: None,
-    };
-    let started = Instant::now();
-    download_files(
-        &mut downloader,
-        &planned.pending_files,
-        planned.plan.mode == ClientWorkMode::Repair,
-    )
-    .await?;
     let download_seconds = started.elapsed().as_secs_f64();
 
     let executable = planned.destination.join(GAME_EXE);
@@ -828,13 +987,14 @@ async fn install_client_with(
         write_metadata(&planned.destination, INSTALL_METADATA, &result)?;
     }
     remove_metadata(&planned.destination, PLAN_METADATA)?;
+    remove_manifest_cache(&planned.destination)?;
     publish(
         progress,
         &planned.destination,
         "complete",
-        "Cliente listo",
-        result.plan.download_bytes,
-        Some(result.plan.download_bytes),
+        tr!("Cliente listo", "Client ready"),
+        total_bytes,
+        Some(total_bytes),
         true,
     )?;
     Ok(result)
@@ -951,9 +1111,22 @@ struct SelectedRelease {
 
 #[derive(Debug, Clone)]
 struct InstallFile {
+    /// Posición en la selección completa del manifiesto: estable entre ejecuciones del mismo
+    /// plan, nombra su `.part`.
+    index: usize,
     path: String,
     filesize: u32,
     chunks: Vec<BundleChunk>,
+}
+
+impl InstallFile {
+    fn temp_name(&self) -> String {
+        format!(
+            "{:05}-{}.{TEMP_SUFFIX}",
+            self.index,
+            temp_name_for_manifest_path(&self.path)
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -961,6 +1134,10 @@ struct PlannedInstall {
     plan: ClientInstallPlan,
     destination: PathBuf,
     pending_files: Vec<InstallFile>,
+    /// `.part` de una ejecución anterior que el plan aprovecha.
+    kept: KeptParts,
+    /// Manifiesto recién descargado, para guardarlo al confirmar; `None` si salió del guardado.
+    manifest: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -1017,7 +1194,10 @@ async fn build_install_plan(
         progress,
         &clients_root,
         "resolve",
-        "Buscando el manifiesto de Riot",
+        tr!(
+            "Buscando el manifiesto de Riot",
+            "Looking up the Riot manifest"
+        ),
         0,
         None,
         false,
@@ -1033,25 +1213,40 @@ async fn build_install_plan(
     let game_build = client_folder_name(&release.version)
         .ok_or_else(|| ClientInstallError::InvalidReleaseVersion(release.version.clone()))?;
     let destination = clients_root.join(&game_build).join(GAME_FOLDER);
-    let manifest = download_manifest(client, progress, &destination, &release.manifest_url).await?;
-    publish(
+    let (files, manifest) = load_install_files(
+        client,
         progress,
         &destination,
-        "plan",
-        "Planificando archivos",
-        0,
-        None,
-        false,
-    )?;
-
-    let files = parse_install_files(manifest, &locale)?;
+        &release.manifest_url,
+        &locale,
+    )
+    .await?;
     let classified = classify_install_files(&destination, &files)?;
-    let (download_bytes, install_bytes) = install_totals(&classified.pending_files);
-    let (_, total_install_bytes) = install_totals(&files);
+    // Lo que el diario de una descarga detenida ya tiene en disco no se cuenta como pendiente.
+    let identity = JournalIdentity {
+        manifest_url: release.manifest_url.clone(),
+        resolved_version: release.version.clone(),
+        locale: locale.clone(),
+        destination_path: destination.display().to_string(),
+    };
+    let kept = KeptParts::load(&destination, &identity, &classified.pending_files);
+    let (needed, remaining, _) = needed_chunks(&classified.pending_files, &kept)?;
+    let download_bytes = needed
+        .iter()
+        .map(|chunk| u64::from(chunk.bundle_size))
+        .sum();
+    let install_bytes = remaining.iter().sum();
+    let total_install_bytes = files.iter().map(|file| u64::from(file.filesize)).sum();
+    // Una descarga detenida antes de confirmar su primer archivo también se reanuda; una
+    // reparación sigue siendo reparación.
+    let mode = match classified.mode {
+        ClientWorkMode::Install if kept.any() => ClientWorkMode::Resume,
+        mode => mode,
+    };
 
     Ok(PlannedInstall {
         plan: ClientInstallPlan {
-            mode: classified.mode,
+            mode,
             patch,
             resolved_version: release.version,
             game_build,
@@ -1072,6 +1267,8 @@ async fn build_install_plan(
         },
         destination,
         pending_files: classified.pending_files,
+        kept,
+        manifest,
     })
 }
 
@@ -1104,23 +1301,6 @@ fn validate_confirmation(
         ));
     }
     Ok(())
-}
-
-/// Bytes a descargar (cada fragmento de bundle una sola vez, aunque lo usen varios archivos)
-/// y bytes que ocuparán los archivos en disco.
-fn install_totals(files: &[InstallFile]) -> (u64, u64) {
-    let mut seen = HashSet::new();
-    let download_bytes = files
-        .iter()
-        .flat_map(|file| file.chunks.iter())
-        .filter(|chunk| seen.insert((chunk.bundle_id, chunk.bundle_offset)))
-        .map(|chunk| u64::from(chunk.bundle_size))
-        .sum::<u64>();
-    let install_bytes = files
-        .iter()
-        .map(|file| u64::from(file.filesize))
-        .sum::<u64>();
-    (download_bytes, install_bytes)
 }
 
 /// Sieve primero; si no tiene la compilación exacta, el índice público; si tampoco, la
@@ -1391,7 +1571,10 @@ async fn download_manifest(
             progress,
             destination,
             "manifest",
-            "Descargando el manifiesto de Riot",
+            tr!(
+                "Descargando el manifiesto de Riot",
+                "Downloading the Riot manifest"
+            ),
             read,
             total,
             false,
@@ -1415,22 +1598,165 @@ async fn download_manifest(
     .await
 }
 
-fn read_rman_manifest(mut manifest: Vec<u8>) -> Result<Rman, ClientInstallError> {
+/// Archivos del manifiesto para el idioma. Reanudar o volver a planificar usa el manifiesto que
+/// guardó la instalación confirmada en el destino, si es el de esa URL y se puede leer entero;
+/// si no, lo descarga. Devuelve también los bytes recién descargados, para guardarlos al confirmar.
+async fn load_install_files(
+    client: &reqwest::Client,
+    progress: &dyn ProgressSink,
+    destination: &Path,
+    manifest_url: &str,
+    locale: &str,
+) -> Result<(Vec<InstallFile>, Option<Vec<u8>>), ClientInstallError> {
+    if let Some((cached, manifest_id)) = read_cached_manifest(destination, manifest_url) {
+        match parse_install_files(&cached, locale, Some(manifest_id)) {
+            Ok(files) => {
+                let size = cached.len() as u64;
+                publish(
+                    progress,
+                    destination,
+                    "manifest",
+                    tr!(
+                        "Usando el manifiesto de Riot guardado",
+                        "Using the saved Riot manifest"
+                    ),
+                    size,
+                    Some(size),
+                    false,
+                )?;
+                publish_planning(progress, destination)?;
+                return Ok((files, None));
+            }
+            // El idioma no depende de la copia: descargarlo otra vez daría lo mismo.
+            Err(error @ ClientInstallError::UnavailableLocale(_)) => return Err(error),
+            // Una copia dañada o de otro manifiesto se ignora.
+            Err(_) => {}
+        }
+    }
+    let manifest = download_manifest(client, progress, destination, manifest_url).await?;
+    publish_planning(progress, destination)?;
+    let files = parse_install_files(&manifest, locale, None)?;
+    Ok((files, Some(manifest)))
+}
+
+fn publish_planning(
+    progress: &dyn ProgressSink,
+    destination: &Path,
+) -> Result<(), ClientInstallError> {
+    publish(
+        progress,
+        destination,
+        "plan",
+        tr!("Planificando archivos", "Planning files"),
+        0,
+        None,
+        false,
+    )
+}
+
+/// Dónde se guarda el manifiesto de esa URL y el id que debe declarar. Las URL de Riot terminan en
+/// `<id de 16 dígitos hexadecimales>.manifest`; otra forma no se guarda.
+fn manifest_cache_path(destination: &Path, manifest_url: &str) -> Option<(PathBuf, u64)> {
+    let url = Url::parse(manifest_url).ok()?;
+    let name = url.path_segments()?.next_back()?;
+    let stem = name.strip_suffix(".manifest")?;
+    if stem.len() != 16 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let manifest_id = u64::from_str_radix(stem, 16).ok()?;
+    let path = destination
+        .join(METADATA_DIR)
+        .join(MANIFEST_CACHE_DIR)
+        .join(format!("{stem}.manifest"));
+    Some((path, manifest_id))
+}
+
+fn read_cached_manifest(destination: &Path, manifest_url: &str) -> Option<(Vec<u8>, u64)> {
+    let (path, manifest_id) = manifest_cache_path(destination, manifest_url)?;
+    let mut bytes = Vec::new();
+    File::open(path)
+        .ok()?
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_MANIFEST_BYTES).then_some((bytes, manifest_id))
+}
+
+/// Guarda el manifiesto confirmado (aparte y luego renombrado) y quita los de otras URL.
+fn store_manifest(
+    destination: &Path,
+    manifest_url: &str,
+    manifest: &[u8],
+) -> Result<(), ClientInstallError> {
+    let Some((path, _)) = manifest_cache_path(destination, manifest_url) else {
+        return Ok(());
+    };
+    let directory = destination.join(METADATA_DIR).join(MANIFEST_CACHE_DIR);
+    fs::create_dir_all(&directory)?;
+    remove_cached_manifests(&directory, Some(&path))?;
+    if path.is_file() {
+        return Ok(());
+    }
+    let pending = path.with_extension("tmp");
+    fs::write(&pending, manifest)?;
+    fs::rename(&pending, &path)?;
+    Ok(())
+}
+
+/// Quita el manifiesto guardado: el cliente quedó completo.
+fn remove_manifest_cache(destination: &Path) -> Result<(), ClientInstallError> {
+    let directory = destination.join(METADATA_DIR).join(MANIFEST_CACHE_DIR);
+    remove_cached_manifests(&directory, None)?;
+    // Solo si quedó vacía.
+    let _ = fs::remove_dir(directory);
+    Ok(())
+}
+
+/// Quita los manifiestos guardados (y sus copias a medio escribir) salvo `keep`; lo desconocido se
+/// queda.
+fn remove_cached_manifests(
+    directory: &Path,
+    keep: Option<&Path>,
+) -> Result<(), ClientInstallError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let ours = path
+            .extension()
+            .is_some_and(|extension| extension == "manifest" || extension == "tmp");
+        if ours && Some(path.as_path()) != keep && path.is_file() {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_rman_manifest(manifest: &[u8]) -> Result<Rman, ClientInstallError> {
     // Los manifiestos actuales de Riot declaran RMAN 2.1; cdragon-rman 0.2 solo acepta 2.0,
     // pero el diseño de tablas que se lee aquí es compatible. Las pruebas cubren este ajuste.
-    if manifest.get(..6) == Some(b"RMAN\x02\x01") {
-        manifest[5] = 0;
-    }
-    Rman::read(Cursor::new(manifest)).map_err(ClientInstallError::Rman)
+    let read = match manifest.split_at_checked(6) {
+        Some((b"RMAN\x02\x01", body)) => Rman::read(Cursor::new(*b"RMAN\x02\x00").chain(body)),
+        _ => Rman::read(manifest),
+    };
+    read.map_err(ClientInstallError::Rman)
 }
 
 /// cdragon-rman documenta que entra en pánico con datos corruptos; aquí se convierte en error.
+/// Con `manifest_id`, el manifiesto debe declarar ese id (el de su URL).
 fn parse_install_files(
-    manifest: Vec<u8>,
+    manifest: &[u8],
     locale: &str,
+    manifest_id: Option<u64>,
 ) -> Result<Vec<InstallFile>, ClientInstallError> {
     panic::catch_unwind(AssertUnwindSafe(|| {
         let rman = read_rman_manifest(manifest)?;
+        if manifest_id.is_some_and(|id| id != rman.manifest_id) {
+            return Err(ClientInstallError::CorruptManifest);
+        }
         select_install_files(&rman, locale)
     }))
     .unwrap_or(Err(ClientInstallError::CorruptManifest))
@@ -1473,6 +1799,7 @@ fn select_install_files(rman: &Rman, locale: &str) -> Result<Vec<InstallFile>, C
             })
             .collect::<Result<Vec<_>, _>>()?;
         files.push(InstallFile {
+            index: files.len(),
             path,
             filesize: file.filesize,
             chunks: file_chunks,
@@ -1595,7 +1922,10 @@ struct Downloader<'a> {
     bundle_base: &'a str,
     tuning: DownloadTuning,
     cancel: &'a CancelSignal,
-    total_bytes: u64,
+    /// Bytes de bundle de lo que ya estaba en los `.part` conservados: el progreso arranca ahí.
+    stored_bytes: u64,
+    /// Bytes de bundle que faltan descargar.
+    missing_bytes: u64,
     /// Bytes de bundle recibidos por las peticiones en curso o terminadas; un intento fallido
     /// descuenta los suyos.
     received: Arc<AtomicU64>,
@@ -1611,13 +1941,25 @@ struct Placement {
     target_offset: u64,
 }
 
-/// Fragmento único de un bundle: aunque varios archivos lo usen, se descarga una sola vez.
+/// Fragmento único que todavía falta en algún archivo: aunque varios lo usen, se descarga una sola
+/// vez.
+#[derive(Debug)]
+struct NeededChunk {
+    bundle_id: u64,
+    bundle_offset: u32,
+    bundle_size: u32,
+    target_size: u32,
+    /// Posiciones que faltan escribir, por orden de ruta del archivo.
+    placements: Vec<Placement>,
+}
+
+/// Fragmento de una ventana: dónde está en la respuesta y qué fragmento único es.
 #[derive(Debug)]
 struct WindowChunk {
     bundle_offset: u32,
     bundle_size: u32,
     target_size: u32,
-    placements: Vec<Placement>,
+    chunk: usize,
 }
 
 /// Rango contiguo de un bundle que se pide en una sola petición HTTP.
@@ -1627,130 +1969,430 @@ struct DownloadWindow {
     start: u32,
     end: u32,
     chunks: Vec<WindowChunk>,
+    /// Archivo que se estaba terminando cuando se ordenó la ventana: el detalle del progreso.
+    file_index: usize,
 }
 
-impl DownloadWindow {
-    fn first_placement(&self) -> Option<Placement> {
-        self.chunks
-            .iter()
-            .flat_map(|chunk| chunk.placements.iter().copied())
-            .min()
+/// Lo que falta descargar de los archivos pendientes.
+#[derive(Debug)]
+struct DownloadWork {
+    chunks: Vec<NeededChunk>,
+    /// En el orden en que se piden.
+    windows: Vec<DownloadWindow>,
+    /// Bytes que faltan escribir en cada archivo.
+    remaining: Vec<u64>,
+    /// Bytes de bundle de los fragmentos que ya están en los `.part` conservados.
+    stored_bytes: u64,
+    /// Bytes de bundle que faltan descargar.
+    missing_bytes: u64,
+}
+
+/// Posición de cada archivo en orden de ruta: un orden estable que no depende del orden interno
+/// del manifiesto. Decide dónde aterriza un fragmento compartido y qué archivo empieza después.
+fn path_rank(files: &[InstallFile]) -> Vec<usize> {
+    let mut by_path = (0..files.len()).collect::<Vec<_>>();
+    by_path.sort_by(|a, b| files[*a].path.cmp(&files[*b].path));
+    let mut rank = vec![0; files.len()];
+    for (position, file) in by_path.into_iter().enumerate() {
+        rank[file] = position;
     }
+    rank
 }
 
-/// Agrupa los fragmentos pendientes por bundle, quita duplicados, fusiona los contiguos en
-/// ventanas de hasta `max_window` bytes y las ordena por la primera escritura que producen,
-/// para que cada archivo se escriba casi en orden.
-fn plan_download_windows(
+/// Fragmentos que faltan: los de cada archivo pendiente menos los que el diario ya registra en su
+/// `.part`. Cada fragmento único se cuenta una vez. Devuelve también los bytes que faltan escribir
+/// en cada archivo y los bytes de bundle que ya están en disco. Los fragmentos de cada archivo
+/// deben sumar su tamaño.
+fn needed_chunks(
     files: &[InstallFile],
-    max_window: u32,
-) -> Result<Vec<DownloadWindow>, ClientInstallError> {
-    let mut unique: HashMap<(u64, u32), WindowChunk> = HashMap::new();
+    kept: &KeptParts,
+) -> Result<(Vec<NeededChunk>, Vec<u64>, u64), ClientInstallError> {
+    let rank = path_rank(files);
+    let mut unique: HashMap<(u64, u32), usize> = HashMap::new();
+    let mut chunks: Vec<NeededChunk> = Vec::new();
+    let mut remaining = vec![0_u64; files.len()];
     for (file_index, file) in files.iter().enumerate() {
+        let written = kept.ranges(file_index);
         let mut target_offset = 0_u64;
         for chunk in &file.chunks {
             if chunk.bundle_size == 0 {
                 return Err(ClientInstallError::CorruptManifest);
             }
-            unique
+            let id = *unique
                 .entry((chunk.bundle_id, chunk.bundle_offset))
-                .or_insert_with(|| WindowChunk {
-                    bundle_offset: chunk.bundle_offset,
-                    bundle_size: chunk.bundle_size,
-                    target_size: chunk.target_size,
-                    placements: Vec::new(),
-                })
-                .placements
-                .push(Placement {
+                .or_insert_with(|| {
+                    chunks.push(NeededChunk {
+                        bundle_id: chunk.bundle_id,
+                        bundle_offset: chunk.bundle_offset,
+                        bundle_size: chunk.bundle_size,
+                        target_size: chunk.target_size,
+                        placements: Vec::new(),
+                    });
+                    chunks.len() - 1
+                });
+            let size = u64::from(chunk.target_size);
+            if !covers(written, target_offset, size) {
+                chunks[id].placements.push(Placement {
                     file_index,
                     target_offset,
                 });
-            target_offset += u64::from(chunk.target_size);
+                remaining[file_index] += size;
+            }
+            target_offset += size;
+        }
+        if target_offset != u64::from(file.filesize) {
+            return Err(ClientInstallError::ChunkLayoutMismatch(file.path.clone()));
         }
     }
+    let stored_bytes = chunks
+        .iter()
+        .filter(|chunk| chunk.placements.is_empty())
+        .map(|chunk| u64::from(chunk.bundle_size))
+        .sum();
+    chunks.retain(|chunk| !chunk.placements.is_empty());
+    for chunk in &mut chunks {
+        chunk
+            .placements
+            .sort_by_key(|placement| (rank[placement.file_index], placement.target_offset));
+    }
+    Ok((chunks, remaining, stored_bytes))
+}
 
-    let mut by_bundle: HashMap<u64, Vec<WindowChunk>> = HashMap::new();
-    for ((bundle_id, _), chunk) in unique {
-        by_bundle.entry(bundle_id).or_default().push(chunk);
+/// Agrupa los fragmentos que faltan por bundle, fusiona los contiguos en ventanas de hasta
+/// `max_window` bytes y las ordena con [`order_windows`].
+fn plan_download(
+    files: &[InstallFile],
+    kept: &KeptParts,
+    max_window: u32,
+) -> Result<DownloadWork, ClientInstallError> {
+    let (chunks, remaining, stored_bytes) = needed_chunks(files, kept)?;
+    let missing_bytes = chunks
+        .iter()
+        .map(|chunk| u64::from(chunk.bundle_size))
+        .sum();
+    let mut by_bundle: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    for (id, chunk) in chunks.iter().enumerate() {
+        by_bundle.entry(chunk.bundle_id).or_default().push(id);
     }
 
     let mut windows = Vec::new();
-    for (bundle_id, mut chunks) in by_bundle {
-        chunks.sort_by_key(|chunk| chunk.bundle_offset);
+    for (bundle_id, mut ids) in by_bundle {
+        ids.sort_by_key(|id| chunks[*id].bundle_offset);
         let mut current: Option<DownloadWindow> = None;
-        for chunk in chunks {
+        for id in ids {
+            let chunk = &chunks[id];
             let end = chunk
                 .bundle_offset
                 .checked_add(chunk.bundle_size)
                 .ok_or(ClientInstallError::CorruptManifest)?;
+            let piece = WindowChunk {
+                bundle_offset: chunk.bundle_offset,
+                bundle_size: chunk.bundle_size,
+                target_size: chunk.target_size,
+                chunk: id,
+            };
             let extends = current.as_ref().is_some_and(|window| {
                 window.end == chunk.bundle_offset && end - window.start <= max_window
             });
             if extends {
                 let window = current.as_mut().expect("window in progress");
                 window.end = end;
-                window.chunks.push(chunk);
+                window.chunks.push(piece);
             } else {
                 windows.extend(current.take());
                 current = Some(DownloadWindow {
                     bundle_id,
                     start: chunk.bundle_offset,
                     end,
-                    chunks: vec![chunk],
+                    chunks: vec![piece],
+                    file_index: 0,
                 });
             }
         }
         windows.extend(current);
     }
-    windows.sort_by_cached_key(DownloadWindow::first_placement);
-    Ok(windows)
+    let windows = order_windows(windows, &chunks, &path_rank(files));
+    Ok(DownloadWork {
+        chunks,
+        windows,
+        remaining,
+        stored_bytes,
+        missing_bytes,
+    })
 }
 
-/// Archivo que se arma en la carpeta temporal hasta que tiene todos sus bytes.
-struct PendingFile {
-    manifest_path: String,
-    target: PathBuf,
-    temp_path: PathBuf,
-    handle: Option<File>,
-    remaining: u64,
-    committed: bool,
+/// Ordena las ventanas para que los archivos se terminen uno tras otro. Un bundle guarda fragmentos
+/// de muchos archivos, así que pedir las ventanas por bundle deja cientos de `.part` a medias, y
+/// en NTFS cada escritura suelta en un `.part` disperso reserva una unidad entera de 64 KiB.
+///
+/// Cada fragmento cuenta para el archivo donde aterriza (el primero por ruta). Se termina el
+/// archivo empezado al que le quedan menos ventanas, y al terminarlo se piden todas las suyas; si
+/// no hay ninguno empezado, sigue el próximo por ruta. Cada ventana recuerda el archivo por el que
+/// se pidió: es el detalle del progreso.
+fn order_windows(
+    windows: Vec<DownloadWindow>,
+    chunks: &[NeededChunk],
+    rank: &[usize],
+) -> Vec<DownloadWindow> {
+    let file_count = rank.len();
+    // Archivos donde aterriza cada ventana y, por archivo, sus ventanas desde la primera posición
+    // que escriben en él.
+    let mut touches = Vec::with_capacity(windows.len());
+    let mut of_file: Vec<Vec<(u64, usize)>> = vec![Vec::new(); file_count];
+    for (index, window) in windows.iter().enumerate() {
+        let mut landings = window
+            .chunks
+            .iter()
+            .filter_map(|piece| chunks[piece.chunk].placements.first())
+            .map(|placement| (placement.file_index, placement.target_offset))
+            .collect::<Vec<_>>();
+        landings.sort_unstable();
+        landings.dedup_by_key(|(file, _)| *file);
+        for (file, offset) in &landings {
+            of_file[*file].push((*offset, index));
+        }
+        touches.push(
+            landings
+                .into_iter()
+                .map(|(file, _)| file)
+                .collect::<Vec<_>>(),
+        );
+    }
+    for list in &mut of_file {
+        list.sort_unstable();
+    }
+
+    let mut by_rank = (0..file_count).collect::<Vec<_>>();
+    by_rank.sort_by_key(|file| rank[*file]);
+    let mut remaining = of_file.iter().map(Vec::len).collect::<Vec<_>>();
+    // Archivos empezados: (ventanas que les quedan, rango, archivo).
+    let mut started: BTreeSet<(usize, usize, usize)> = BTreeSet::new();
+    let mut emitted = vec![false; windows.len()];
+    let mut order = Vec::with_capacity(windows.len());
+    let mut cursor = 0;
+    loop {
+        let file = match started.first() {
+            Some(&(_, _, file)) => file,
+            None => {
+                while cursor < file_count && remaining[by_rank[cursor]] == 0 {
+                    cursor += 1;
+                }
+                let Some(&file) = by_rank.get(cursor) else {
+                    break;
+                };
+                file
+            }
+        };
+        for &(_, window) in &of_file[file] {
+            if std::mem::replace(&mut emitted[window], true) {
+                continue;
+            }
+            order.push((window, file));
+            for &touched in &touches[window] {
+                started.remove(&(remaining[touched], rank[touched], touched));
+                remaining[touched] -= 1;
+                if remaining[touched] > 0 {
+                    started.insert((remaining[touched], rank[touched], touched));
+                }
+            }
+        }
+    }
+
+    let mut slots = windows.into_iter().map(Some).collect::<Vec<_>>();
+    order
+        .into_iter()
+        .filter_map(|(window, file)| {
+            let mut window = slots[window].take()?;
+            window.file_index = file;
+            Some(window)
+        })
+        .collect()
 }
 
-impl PendingFile {
-    /// Escribe un fragmento en su posición; devuelve `true` cuando el archivo queda completo.
-    fn write_at(&mut self, offset: u64, data: &[u8]) -> Result<bool, ClientInstallError> {
-        if self.handle.is_none() {
-            let handle = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&self.temp_path)?;
-            mark_sparse(&handle);
-            self.handle = Some(handle);
+/// `true` si `[offset, offset + len)` está dentro de uno de los rangos (ordenados y disjuntos).
+fn covers(ranges: &[(u64, u64)], offset: u64, len: u64) -> bool {
+    let after = ranges.partition_point(|(start, _)| *start <= offset);
+    after > 0 && ranges[after - 1].1 >= offset + len
+}
+
+/// Ordena y une rangos que se tocan o se solapan.
+fn merge_ranges(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
         }
-        let handle = self.handle.as_mut().expect("temp file is open");
-        handle.seek(SeekFrom::Start(offset))?;
-        handle.write_all(data)?;
-        self.remaining = self
-            .remaining
-            .checked_sub(data.len() as u64)
-            .ok_or_else(|| ClientInstallError::ChunkLayoutMismatch(self.manifest_path.clone()))?;
-        if self.remaining == 0 {
-            // Se cierra antes de renombrar: Windows no mueve archivos con identificadores abiertos.
-            self.handle = None;
+    }
+    merged
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Sin datos en disco.
+    Waiting,
+    /// Con un `.part` a medio armar.
+    Assembling,
+    Done,
+}
+
+/// Lo que hay que hacer con los bytes de un fragmento: lo decide [`Assembly`] y lo ejecuta
+/// [`FileWriter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// Escribe el fragmento recibido en esa posición.
+    Write(Placement),
+    /// Copia `len` bytes de un fragmento compartido que ya está escrito en `from`.
+    Copy {
+        to: Placement,
+        from: Placement,
+        len: u32,
+    },
+    /// El archivo quedó completo.
+    Commit(usize),
+}
+
+/// Cuentas de los archivos y fragmentos pendientes, sin E/S: decide dónde va cada fragmento. Se
+/// escribe en los archivos que ya están a medio armar; si ninguno lo está, aterriza en el primero
+/// por ruta. En los demás archivos que lo usan se copia desde ahí cuando empiezan, así un fragmento
+/// compartido por cientos de archivos no los deja a todos a medias. Un archivo cuyos fragmentos ya
+/// aterrizaron todos en otros se arma entero con copias, sin red.
+#[derive(Debug)]
+struct Assembly {
+    stages: Vec<Stage>,
+    remaining: Vec<u64>,
+    /// Posiciones pendientes de cada archivo cuyo fragmento todavía no llegó.
+    unavailable: Vec<usize>,
+    /// Copias que esperan a que su archivo empiece: fragmento y posición.
+    deferred: Vec<Vec<(usize, u64)>>,
+    placements: Vec<Vec<Placement>>,
+    sizes: Vec<u32>,
+    /// Dónde quedó escrito cada fragmento: la fuente de sus copias.
+    sources: Vec<Option<Placement>>,
+}
+
+impl Assembly {
+    /// `assembling` marca los archivos que ya tienen un `.part` conservado.
+    fn new(chunks: Vec<NeededChunk>, remaining: Vec<u64>, assembling: &[bool]) -> Self {
+        let mut unavailable = vec![0; remaining.len()];
+        let mut placements = Vec::with_capacity(chunks.len());
+        let mut sizes = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            for placement in &chunk.placements {
+                unavailable[placement.file_index] += 1;
+            }
+            placements.push(chunk.placements);
+            sizes.push(chunk.target_size);
         }
-        Ok(self.remaining == 0)
+        Self {
+            stages: assembling
+                .iter()
+                .map(|kept| {
+                    if *kept {
+                        Stage::Assembling
+                    } else {
+                        Stage::Waiting
+                    }
+                })
+                .collect(),
+            deferred: vec![Vec::new(); remaining.len()],
+            remaining,
+            unavailable,
+            sources: vec![None; placements.len()],
+            placements,
+            sizes,
+        }
+    }
+
+    /// Archivos que el diario ya tiene completos: se confirman al empezar.
+    fn prepare(&mut self, steps: &mut Vec<Step>) {
+        for (file, stage) in self.stages.iter_mut().enumerate() {
+            if *stage == Stage::Assembling && self.remaining[file] == 0 {
+                *stage = Stage::Done;
+                steps.push(Step::Commit(file));
+            }
+        }
+    }
+
+    /// Decide dónde se escribe un fragmento recién llegado.
+    fn land(&mut self, chunk: usize, steps: &mut Vec<Step>) {
+        let placements = std::mem::take(&mut self.placements[chunk]);
+        let len = self.sizes[chunk];
+        let landing = placements
+            .iter()
+            .find(|placement| self.stages[placement.file_index] == Stage::Assembling)
+            .or_else(|| placements.first())
+            .map(|placement| placement.file_index);
+        let mut deferred = Vec::new();
+        for &placement in &placements {
+            let file = placement.file_index;
+            self.unavailable[file] -= 1;
+            match self.stages[file] {
+                Stage::Assembling => {}
+                Stage::Waiting if Some(file) == landing => self.start(file, steps),
+                _ => {
+                    deferred.push(placement);
+                    continue;
+                }
+            }
+            steps.push(Step::Write(placement));
+            self.sources[chunk].get_or_insert(placement);
+            self.wrote(file, len, steps);
+        }
+        for placement in &deferred {
+            self.deferred[placement.file_index].push((chunk, placement.target_offset));
+        }
+        for placement in deferred {
+            let file = placement.file_index;
+            if self.stages[file] == Stage::Waiting && self.unavailable[file] == 0 {
+                self.start(file, steps);
+            }
+        }
+    }
+
+    /// El archivo empieza: primero las copias de los fragmentos que ya aterrizaron en otros.
+    fn start(&mut self, file: usize, steps: &mut Vec<Step>) {
+        self.stages[file] = Stage::Assembling;
+        for (chunk, target_offset) in std::mem::take(&mut self.deferred[file]) {
+            let from = self.sources[chunk].expect("a deferred chunk already landed");
+            let len = self.sizes[chunk];
+            steps.push(Step::Copy {
+                to: Placement {
+                    file_index: file,
+                    target_offset,
+                },
+                from,
+                len,
+            });
+            self.wrote(file, len, steps);
+        }
+    }
+
+    fn wrote(&mut self, file: usize, len: u32, steps: &mut Vec<Step>) {
+        // El plan comprobó que los fragmentos suman el tamaño del archivo.
+        self.remaining[file] = self.remaining[file].saturating_sub(u64::from(len));
+        if self.remaining[file] == 0 {
+            self.stages[file] = Stage::Done;
+            steps.push(Step::Commit(file));
+        }
     }
 }
 
-/// Marca el `.part` como disperso antes de su primera escritura. Los fragmentos llegan en orden de
-/// bundle y, en un archivo normal, NTFS rellena con ceros de forma síncrona todo lo que queda antes
-/// de una escritura lejana. Medido en NTFS, 1 MiB escrito a 2 GiB tarda unos 2 s y reserva 2 GiB;
-/// en un archivo disperso es inmediato y reserva 1 MiB. Ese relleno frenaba al único escritor y,
-/// con él, a todas las ventanas en vuelo. La marca queda al confirmar el archivo: quitarla obliga a
-/// volcar en el acto los tramos que se llenaron tarde. Si el sistema de archivos no la admite, se
-/// sigue sin ella.
+/// Marca el `.part` como disperso antes de su primera escritura y dice si lo logró. Los fragmentos
+/// no llegan en el orden del archivo y, en un archivo normal, NTFS rellena con ceros de forma
+/// síncrona todo lo que queda antes de una escritura lejana. Medido en NTFS, 1 MiB escrito a
+/// 2 GiB tarda unos 2 s y reserva 2 GiB; en un archivo disperso es inmediato. Ese relleno frenaba
+/// al único escritor y, con él, a todas las ventanas en vuelo.
+///
+/// A cambio, NTFS reserva un archivo disperso en unidades de 16 clústeres (64 KiB con clústeres
+/// de 4 KiB), en el momento de escribir: medido el 2026-09-30, 2.000 escrituras sueltas de 28 KiB
+/// reservaron 4,57 veces lo escrito (dos unidades cuando cruzan un borde) y de 4 KiB, 16 veces;
+/// las contiguas, aun desordenadas, lo justo. Por eso [`order_windows`] termina los archivos uno
+/// tras otro. La marca queda al confirmar el archivo: quitarla obliga a volcar en el acto los
+/// tramos que se llenaron tarde. Si el sistema de archivos no la admite, se sigue sin ella.
 #[cfg(windows)]
-fn mark_sparse(file: &File) {
+fn mark_sparse(file: &File) -> bool {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::System::{
         Ioctl::{FILE_SET_SPARSE_BUFFER, FSCTL_SET_SPARSE},
@@ -1762,7 +2404,7 @@ fn mark_sparse(file: &File) {
     // SAFETY: el identificador es válido mientras `file` viva, el búfer de entrada es un
     // `FILE_SET_SPARSE_BUFFER` que vive durante la llamada, no hay búfer de salida y la E/S no es
     // superpuesta.
-    unsafe {
+    let marked = unsafe {
         DeviceIoControl(
             file.as_raw_handle(),
             FSCTL_SET_SPARSE,
@@ -1772,94 +2414,407 @@ fn mark_sparse(file: &File) {
             0,
             &mut returned,
             std::ptr::null_mut(),
-        );
-    }
+        )
+    };
+    marked != 0
 }
 
 #[cfg(not(windows))]
-fn mark_sparse(_file: &File) {}
+fn mark_sparse(_file: &File) -> bool {
+    false
+}
 
-/// Descomprime y escribe las ventanas en orden. Es dueño de los archivos temporales para
-/// poder trabajar en un hilo bloqueante sin frenar las descargas en curso.
+/// Plan al que pertenece un diario: solo se aprovecha con el mismo manifiesto, versión, idioma y
+/// destino.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalIdentity {
+    manifest_url: String,
+    resolved_version: String,
+    locale: String,
+    destination_path: String,
+}
+
+impl JournalIdentity {
+    fn of(plan: &ClientInstallPlan) -> Self {
+        Self {
+            manifest_url: plan.manifest_url.clone(),
+            resolved_version: plan.resolved_version.clone(),
+            locale: plan.locale.clone(),
+            destination_path: plan.destination_path.clone(),
+        }
+    }
+}
+
+/// `.chronorift/journal.json`: los `.part` a medio armar y los rangos de cada uno que ya llegaron
+/// al disco. Se reemplaza entero en cada punto de control.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadJournal {
+    version: u32,
+    #[serde(flatten)]
+    identity: JournalIdentity,
+    files: Vec<JournalFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JournalFile {
+    /// Ruta del manifiesto.
+    path: String,
+    /// Nombre del `.part` en la carpeta temporal.
+    temp_name: String,
+    size: u64,
+    /// Disperso y creado con su tamaño final; si no, solo crece hasta lo escrito.
+    sparse: bool,
+    /// Fecha de creación del `.part` (ns desde 1970): otro archivo con el mismo nombre no vale.
+    created: Option<u64>,
+    /// Rangos escritos y volcados al disco, ordenados y disjuntos.
+    ranges: Vec<(u64, u64)>,
+}
+
+impl JournalFile {
+    fn bytes(&self) -> u64 {
+        self.ranges.iter().map(|(start, end)| end - start).sum()
+    }
+
+    /// El `.part` sigue en su lugar, es el mismo archivo y los rangos tienen sentido.
+    fn part_matches(&self, temp_dir: &Path) -> bool {
+        let mut end = 0;
+        for &(start, stop) in &self.ranges {
+            if start < end || start >= stop || stop > self.size {
+                return false;
+            }
+            end = stop;
+        }
+        // Solo un nombre, nunca una ruta: el diario no puede apuntar fuera de la carpeta temporal.
+        if Path::new(&self.temp_name).file_name() != Some(OsStr::new(&self.temp_name)) {
+            return false;
+        }
+        let Ok(metadata) = fs::symlink_metadata(temp_dir.join(&self.temp_name)) else {
+            return false;
+        };
+        let length_matches = if self.sparse {
+            metadata.len() == self.size
+        } else {
+            (end..=self.size).contains(&metadata.len())
+        };
+        metadata.is_file() && length_matches && created_nanos(&metadata) == self.created
+    }
+}
+
+fn created_nanos(metadata: &fs::Metadata) -> Option<u64> {
+    let created = metadata.created().ok()?;
+    let since = created.duration_since(std::time::UNIX_EPOCH).ok()?;
+    u64::try_from(since.as_nanos()).ok()
+}
+
+fn read_journal(metadata_dir: &Path) -> Option<DownloadJournal> {
+    let bytes = fs::read(metadata_dir.join(JOURNAL_FILE)).ok()?;
+    serde_json::from_slice::<DownloadJournal>(&bytes)
+        .ok()
+        .filter(|journal| journal.version == JOURNAL_VERSION)
+}
+
+/// `.part` conservados por una ejecución anterior que se pueden aprovechar, por archivo pendiente.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct KeptParts(Vec<Option<JournalFile>>);
+
+impl KeptParts {
+    /// Las entradas del diario del mismo plan cuyo `.part` sigue intacto. Una entrada de otro
+    /// archivo, de otro tamaño o cuyo `.part` cambió no se usa (y su `.part` se quita al confirmar).
+    fn load(destination: &Path, identity: &JournalIdentity, files: &[InstallFile]) -> Self {
+        let metadata_dir = destination.join(METADATA_DIR);
+        let Some(journal) =
+            read_journal(&metadata_dir).filter(|journal| journal.identity == *identity)
+        else {
+            return Self(vec![None; files.len()]);
+        };
+        let temp_dir = metadata_dir.join(TEMP_DIR);
+        let mut entries = journal
+            .files
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect::<HashMap<_, _>>();
+        Self(
+            files
+                .iter()
+                .map(|file| {
+                    entries.remove(&file.path).filter(|entry| {
+                        entry.size == u64::from(file.filesize)
+                            && entry.temp_name == file.temp_name()
+                            && entry.part_matches(&temp_dir)
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn ranges(&self, file: usize) -> &[(u64, u64)] {
+        self.0
+            .get(file)
+            .and_then(Option::as_ref)
+            .map_or(&[], |entry| entry.ranges.as_slice())
+    }
+
+    fn get(&self, file: usize) -> Option<&JournalFile> {
+        self.0.get(file).and_then(Option::as_ref)
+    }
+
+    fn any(&self) -> bool {
+        self.0
+            .iter()
+            .flatten()
+            .any(|entry| !entry.ranges.is_empty())
+    }
+
+    fn temp_names(&self) -> HashSet<&str> {
+        self.0
+            .iter()
+            .flatten()
+            .map(|entry| entry.temp_name.as_str())
+            .collect()
+    }
+}
+
+/// Bytes que el diario del plan confirmado registra en `.part` que siguen en su lugar y cuyo
+/// archivo todavía no existe. Para el estado local: no lee el manifiesto.
+fn journaled_bytes(destination: &Path, manifest_url: &str) -> u64 {
+    let metadata_dir = destination.join(METADATA_DIR);
+    let Some(journal) = read_journal(&metadata_dir) else {
+        return 0;
+    };
+    if journal.identity.manifest_url != manifest_url
+        || journal.identity.destination_path != destination.display().to_string()
+    {
+        return 0;
+    }
+    let temp_dir = metadata_dir.join(TEMP_DIR);
+    journal
+        .files
+        .iter()
+        .filter(|entry| {
+            entry.part_matches(&temp_dir)
+                && resolve_install_path(destination, &entry.path)
+                    .is_ok_and(|target| !target.exists())
+        })
+        .map(JournalFile::bytes)
+        .sum()
+}
+
+/// Reemplaza el diario de forma atómica: se escribe aparte, se vuelca y se renombra encima. Sin
+/// `.part` que conservar, se quita.
+fn write_journal(metadata_dir: &Path, journal: &DownloadJournal) -> Result<(), ClientInstallError> {
+    if journal.files.is_empty() {
+        return remove_metadata_file(metadata_dir, JOURNAL_FILE);
+    }
+    let path = metadata_dir.join(JOURNAL_FILE);
+    let pending = metadata_dir.join(format!("{JOURNAL_FILE}.tmp"));
+    let mut file = File::create(&pending)?;
+    serde_json::to_writer(&mut file, journal).map_err(ClientInstallError::Metadata)?;
+    file.sync_data()?;
+    drop(file);
+    fs::rename(&pending, &path)?;
+    Ok(())
+}
+
+/// Un archivo pendiente y su `.part` en la carpeta temporal.
+struct PartFile {
+    manifest_path: String,
+    target: PathBuf,
+    temp_name: String,
+    temp_path: PathBuf,
+    size: u64,
+    handle: Option<File>,
+    /// El `.part` existe: lo creó esta ejecución o lo conservó el diario.
+    exists: bool,
+    sparse: bool,
+    created: Option<u64>,
+    /// Rangos escritos y volcados al disco: los que registra el diario.
+    synced: Vec<(u64, u64)>,
+    /// Rangos escritos desde el último punto de control.
+    unsynced: Vec<(u64, u64)>,
+    committed: bool,
+}
+
+impl PartFile {
+    /// Abre el `.part`: el conservado por el diario, o uno nuevo, disperso y, si la marca se
+    /// aplicó, con su tamaño final (así el diario puede comprobarlo).
+    fn open(&mut self) -> Result<&mut File, ClientInstallError> {
+        if self.handle.is_none() {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true);
+            let handle = if self.exists {
+                options.open(&self.temp_path)?
+            } else {
+                let handle = options.create_new(true).open(&self.temp_path)?;
+                self.sparse = mark_sparse(&handle);
+                if self.sparse {
+                    handle.set_len(self.size)?;
+                }
+                self.created = handle.metadata().ok().and_then(|info| created_nanos(&info));
+                self.exists = true;
+                handle
+            };
+            self.handle = Some(handle);
+        }
+        Ok(self.handle.as_mut().expect("temp file is open"))
+    }
+
+    fn journal_entry(&self) -> JournalFile {
+        JournalFile {
+            path: self.manifest_path.clone(),
+            temp_name: self.temp_name.clone(),
+            size: self.size,
+            sparse: self.sparse,
+            created: self.created,
+            ranges: self.synced.clone(),
+        }
+    }
+}
+
+/// Descomprime y escribe los fragmentos donde decide [`Assembly`], y lleva el diario. Es dueño de
+/// los `.part` para poder trabajar en un hilo bloqueante sin frenar las descargas en curso.
 struct FileWriter {
-    files: Vec<PendingFile>,
+    files: Vec<PartFile>,
+    assembly: Assembly,
+    metadata_dir: PathBuf,
     temp_dir: PathBuf,
     allow_replace: bool,
     /// `install.json` del cliente anterior: deja de describirlo con el primer archivo que se
     /// agrega o reemplaza, así que se quita justo antes.
     stale_install_metadata: Option<PathBuf>,
+    identity: JournalIdentity,
+    last_checkpoint: Instant,
+    /// El diario en disco ya no describe los `.part`: un archivo se confirmó, o es el comienzo.
+    journal_stale: bool,
+    steps: Vec<Step>,
 }
 
 impl FileWriter {
     fn new(
         destination: &Path,
-        temp_dir: &Path,
         files: &[InstallFile],
+        kept: &KeptParts,
+        assembly: Assembly,
+        identity: JournalIdentity,
         allow_replace: bool,
     ) -> Result<Self, ClientInstallError> {
-        let mut pending = Vec::with_capacity(files.len());
+        let metadata_dir = destination.join(METADATA_DIR);
+        let temp_dir = metadata_dir.join(TEMP_DIR);
+        fs::create_dir_all(&temp_dir)?;
+        let mut parts = Vec::with_capacity(files.len());
         for (index, file) in files.iter().enumerate() {
-            let temp_name = temp_name_for_manifest_path(&file.path);
-            pending.push(PendingFile {
+            let entry = kept.get(index);
+            let temp_name = file.temp_name();
+            parts.push(PartFile {
                 manifest_path: file.path.clone(),
                 target: resolve_install_path(destination, &file.path)?,
-                temp_path: temp_dir.join(format!("{index:05}-{temp_name}.{TEMP_SUFFIX}")),
+                temp_path: temp_dir.join(&temp_name),
+                temp_name,
+                size: u64::from(file.filesize),
                 handle: None,
-                remaining: u64::from(file.filesize),
+                exists: entry.is_some(),
+                sparse: entry.is_some_and(|entry| entry.sparse),
+                created: entry.and_then(|entry| entry.created),
+                synced: entry.map(|entry| entry.ranges.clone()).unwrap_or_default(),
+                unsynced: Vec::new(),
                 committed: false,
             });
         }
         Ok(Self {
-            files: pending,
-            temp_dir: temp_dir.to_path_buf(),
+            files: parts,
+            assembly,
+            stale_install_metadata: Some(metadata_dir.join(INSTALL_METADATA)),
+            metadata_dir,
+            temp_dir,
             allow_replace,
-            stale_install_metadata: Some(destination.join(METADATA_DIR).join(INSTALL_METADATA)),
+            identity,
+            last_checkpoint: Instant::now(),
+            journal_stale: true,
+            steps: Vec::new(),
         })
     }
 
-    /// Escribe cada fragmento de la ventana en todos los archivos que lo usan y confirma los
-    /// archivos que quedan completos, así una interrupción conserva lo terminado.
+    /// Confirma los archivos que el diario ya tiene completos y deja el diario solo con los
+    /// `.part` que se conservaron.
+    fn prepare(&mut self) -> Result<(), ClientInstallError> {
+        let mut steps = std::mem::take(&mut self.steps);
+        steps.clear();
+        self.assembly.prepare(&mut steps);
+        let outcome = self.execute(&steps, &[]);
+        self.steps = steps;
+        outcome?;
+        self.checkpoint()
+    }
+
+    /// Escribe cada fragmento de la ventana donde corresponde y confirma los archivos que quedan
+    /// completos, así una interrupción conserva lo terminado.
     fn apply(&mut self, window: &DownloadWindow, data: &[u8]) -> Result<(), ClientInstallError> {
-        for chunk in &window.chunks {
-            let start = (chunk.bundle_offset - window.start) as usize;
-            let compressed = &data[start..start + chunk.bundle_size as usize];
-            let decompressed = zstd::bulk::decompress(compressed, chunk.target_size as usize)
+        for piece in &window.chunks {
+            let start = (piece.bundle_offset - window.start) as usize;
+            let compressed = &data[start..start + piece.bundle_size as usize];
+            let decompressed = zstd::bulk::decompress(compressed, piece.target_size as usize)
                 .map_err(ClientInstallError::Zstd)?;
-            if decompressed.len() != chunk.target_size as usize {
+            if decompressed.len() != piece.target_size as usize {
                 return Err(ClientInstallError::InvalidChunkData {
-                    expected: chunk.target_size,
+                    expected: piece.target_size,
                     actual: decompressed.len(),
                 });
             }
-            for placement in &chunk.placements {
-                let file = &mut self.files[placement.file_index];
-                if file.write_at(placement.target_offset, &decompressed)? {
-                    self.commit(placement.file_index)?;
+            let mut steps = std::mem::take(&mut self.steps);
+            steps.clear();
+            self.assembly.land(piece.chunk, &mut steps);
+            let outcome = self.execute(&steps, &decompressed);
+            self.steps = steps;
+            outcome?;
+        }
+        if self.last_checkpoint.elapsed() >= CHECKPOINT_INTERVAL {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    fn execute(&mut self, steps: &[Step], data: &[u8]) -> Result<(), ClientInstallError> {
+        for step in steps {
+            match *step {
+                Step::Write(placement) => self.write_at(placement, data)?,
+                Step::Copy { to, from, len } => {
+                    let copied = self.read_at(from, len)?;
+                    self.write_at(to, &copied)?;
                 }
+                Step::Commit(file) => self.commit(file)?,
             }
         }
         Ok(())
     }
 
-    /// Confirma los archivos vacíos (sin fragmentos) y comprueba que ninguno quedó incompleto.
-    fn finish(&mut self) -> Result<(), ClientInstallError> {
-        for index in 0..self.files.len() {
-            let file = &mut self.files[index];
-            if file.committed {
-                continue;
-            }
-            if file.remaining != 0 {
-                return Err(ClientInstallError::ChunkLayoutMismatch(
-                    file.manifest_path.clone(),
-                ));
-            }
-            file.handle = None;
-            if !file.temp_path.exists() {
-                File::create(&file.temp_path)?;
-            }
-            self.commit(index)?;
-        }
+    fn write_at(&mut self, placement: Placement, data: &[u8]) -> Result<(), ClientInstallError> {
+        let file = &mut self.files[placement.file_index];
+        let handle = file.open()?;
+        handle.seek(SeekFrom::Start(placement.target_offset))?;
+        handle.write_all(data)?;
+        file.unsynced.push((
+            placement.target_offset,
+            placement.target_offset + data.len() as u64,
+        ));
         Ok(())
+    }
+
+    /// Lee un fragmento ya escrito: del `.part`, o del archivo si ya se confirmó.
+    fn read_at(&mut self, placement: Placement, len: u32) -> Result<Vec<u8>, ClientInstallError> {
+        let file = &mut self.files[placement.file_index];
+        let mut data = vec![0; len as usize];
+        if file.committed {
+            let mut source = File::open(&file.target)?;
+            source.seek(SeekFrom::Start(placement.target_offset))?;
+            source.read_exact(&mut data)?;
+        } else {
+            let handle = file.open()?;
+            handle.seek(SeekFrom::Start(placement.target_offset))?;
+            handle.read_exact(&mut data)?;
+        }
+        Ok(data)
     }
 
     fn commit(&mut self, index: usize) -> Result<(), ClientInstallError> {
@@ -1870,6 +2825,13 @@ impl FileWriter {
             }
         }
         let file = &mut self.files[index];
+        // Un archivo vacío no tuvo escrituras: su `.part` se crea aquí.
+        file.open()?;
+        // Lo escrito llega al disco antes del renombre: tras un corte de luz, un archivo con el
+        // tamaño correcto nunca queda con huecos.
+        if let Some(handle) = file.handle.take() {
+            handle.sync_data()?;
+        }
         commit_downloaded_file(
             &file.temp_path,
             &file.target,
@@ -1877,14 +2839,73 @@ impl FileWriter {
             self.allow_replace,
         )?;
         file.committed = true;
+        file.synced.clear();
+        file.unsynced.clear();
+        self.journal_stale = true;
         Ok(())
     }
 
-    /// Quita los temporales de archivos sin confirmar; los confirmados quedan para reanudar.
-    fn discard_uncommitted(&mut self) {
-        for file in self.files.iter_mut().filter(|file| !file.committed) {
+    /// Punto de control: vuelca los `.part` escritos desde el anterior y recién entonces
+    /// reemplaza el diario, que así nunca registra bytes que no llegaron al disco. Sin cambios
+    /// (la red quieta), no toca el disco.
+    fn checkpoint(&mut self) -> Result<(), ClientInstallError> {
+        self.last_checkpoint = Instant::now();
+        for file in &mut self.files {
+            if file.unsynced.is_empty() {
+                continue;
+            }
+            self.journal_stale = true;
+            if let Some(handle) = &file.handle {
+                handle.sync_data()?;
+            }
+            let mut ranges = std::mem::take(&mut file.synced);
+            ranges.append(&mut file.unsynced);
+            file.synced = merge_ranges(ranges);
+        }
+        if !self.journal_stale {
+            return Ok(());
+        }
+        let journal = DownloadJournal {
+            version: JOURNAL_VERSION,
+            identity: self.identity.clone(),
+            files: self
+                .files
+                .iter()
+                .filter(|file| !file.committed && !file.synced.is_empty())
+                .map(PartFile::journal_entry)
+                .collect(),
+        };
+        // Si no se puede reemplazar (un antivirus que lo tiene abierto, por ejemplo), sigue
+        // valiendo el anterior, que solo registra bytes ya volcados: se reintenta en el próximo.
+        if write_journal(&self.metadata_dir, &journal).is_ok() {
+            self.journal_stale = false;
+        }
+        Ok(())
+    }
+
+    /// Confirma los archivos vacíos (sin fragmentos), comprueba que ninguno quedó incompleto y
+    /// quita el diario.
+    fn finish(&mut self) -> Result<(), ClientInstallError> {
+        for index in 0..self.files.len() {
+            if self.files[index].committed {
+                continue;
+            }
+            if self.assembly.remaining[index] != 0 {
+                return Err(ClientInstallError::ChunkLayoutMismatch(
+                    self.files[index].manifest_path.clone(),
+                ));
+            }
+            self.commit(index)?;
+        }
+        remove_metadata_file(&self.metadata_dir, JOURNAL_FILE)
+    }
+
+    /// Tras una parada o un fallo: último punto de control, y los `.part` quedan para reanudar.
+    /// Si el volcado falla, sigue valiendo el diario anterior.
+    fn suspend(&mut self) {
+        let _ = self.checkpoint();
+        for file in &mut self.files {
             file.handle = None;
-            let _ = fs::remove_file(&file.temp_path);
         }
     }
 }
@@ -1900,118 +2921,170 @@ enum Report {
     IfChanged,
 }
 
+type FetchTask = tauri::async_runtime::JoinHandle<Result<Vec<u8>, ClientInstallError>>;
+/// El escritor va en una caja: viaja entre el bucle y el hilo de escritura en cada ventana.
+type WriterTask =
+    tauri::async_runtime::JoinHandle<(Box<FileWriter>, Result<(), ClientInstallError>)>;
+
+/// Lo que despierta al bucle de la descarga.
+enum Event {
+    /// Terminó la petición de esa posición de `in_flight`.
+    Fetched(
+        usize,
+        Result<Result<Vec<u8>, ClientInstallError>, tauri::Error>,
+    ),
+    /// El hilo de escritura terminó su trabajo y devuelve el escritor.
+    Written(Result<(Box<FileWriter>, Result<(), ClientInstallError>), tauri::Error>),
+    Tick,
+}
+
+/// Espera la primera petición que termine, el hilo de escritura o el próximo tic.
+async fn next_event(
+    in_flight: &mut [(usize, FetchTask)],
+    writing: &mut Option<WriterTask>,
+    ticker: &mut Interval,
+) -> Event {
+    std::future::poll_fn(|cx| {
+        if let Some(task) = writing.as_mut() {
+            if let Poll::Ready(outcome) = Pin::new(task).poll(cx) {
+                return Poll::Ready(Event::Written(outcome));
+            }
+        }
+        for (slot, (_, task)) in in_flight.iter_mut().enumerate() {
+            if let Poll::Ready(fetched) = Pin::new(task).poll(cx) {
+                return Poll::Ready(Event::Fetched(slot, fetched));
+            }
+        }
+        ticker.poll_tick(cx).map(|_| Event::Tick)
+    })
+    .await
+}
+
 impl Downloader<'_> {
     /// Mantiene hasta `connections` peticiones en curso como tareas independientes, cada una con
-    /// sus reintentos, y aplica cada ventana en orden en un hilo bloqueante. Mientras espera a la
-    /// red o al disco revisa la parada y publica los bytes recibidos. La memoria queda acotada a
-    /// unas `connections + 1` ventanas.
+    /// sus reintentos, y escribe cada ventana en cuanto llega, en un hilo bloqueante: una ventana
+    /// que espera un reintento no frena a las demás. La memoria queda acotada a unas
+    /// `connections + 2` ventanas: las que están en vuelo o esperan al disco, más la que se
+    /// escribe. Mientras espera revisa la parada y publica los bytes recibidos.
     async fn run(
         &mut self,
         windows: Arc<Vec<DownloadWindow>>,
         files: &[InstallFile],
         writer: FileWriter,
     ) -> (Option<FileWriter>, Result<(), ClientInstallError>) {
-        // El detalle del progreso es el archivo que arma la ventana que se espera.
+        // El detalle del progreso es el archivo de la primera ventana que falta escribir.
         let detail = |index: usize| {
             windows
                 .get(index.min(windows.len().saturating_sub(1)))
-                .and_then(DownloadWindow::first_placement)
-                .and_then(|placement| files.get(placement.file_index))
+                .and_then(|window| files.get(window.file_index))
                 .map_or("", |file| file.path.as_str())
         };
-        let mut writer = Some(writer);
-        let mut in_flight = VecDeque::new();
+        let spawn_writer =
+            |mut writer: Box<FileWriter>, job: Option<(usize, Vec<u8>)>| -> WriterTask {
+                let windows = Arc::clone(&windows);
+                tauri::async_runtime::spawn_blocking(move || {
+                    let outcome = match job {
+                        Some((index, data)) => writer.apply(&windows[index], &data),
+                        None => writer.prepare(),
+                    };
+                    (writer, outcome)
+                })
+            };
+        let mut idle = None;
+        // Lo primero es confirmar lo que el diario ya tiene completo.
+        let mut writing = Some(spawn_writer(Box::new(writer), None));
+        let mut writing_index = None;
+        let mut in_flight: Vec<(usize, FetchTask)> = Vec::new();
+        let mut arrived: VecDeque<(usize, Vec<u8>)> = VecDeque::new();
+        let mut written = vec![false; windows.len()];
+        let mut oldest = 0;
         let mut next = 0;
         let mut ticker = ticker();
         let failure = 'windows: {
             if let Err(error) = self.report(detail(0), Report::Always) {
                 break 'windows Some(error);
             }
-            for index in 0..windows.len() {
-                while next < windows.len() && in_flight.len() < self.tuning.connections {
-                    in_flight.push_back(self.spawn_fetch(&windows[next]));
+            loop {
+                while next < windows.len()
+                    && in_flight.len() < self.tuning.connections
+                    && in_flight.len() + arrived.len() <= self.tuning.connections
+                {
+                    in_flight.push((next, self.spawn_fetch(&windows[next])));
                     next += 1;
                 }
-                let Some(mut fetch) = in_flight.pop_front() else {
-                    break;
-                };
-                // Detener no espera a la red: la petición se aborta en el próximo tic.
-                let fetched = loop {
-                    match wait_or_tick(&mut fetch, &mut ticker).await {
-                        Waited::Ready(fetched) => break fetched,
-                        Waited::Tick => {
-                            let checked = if self.cancel.is_cancelled() {
-                                Err(ClientInstallError::Cancelled)
-                            } else {
-                                self.report(detail(index), Report::IfChanged)
-                            };
-                            if let Err(error) = checked {
-                                fetch.abort();
-                                break 'windows Some(error);
+                if writing.is_none() {
+                    if let Some((index, data)) = arrived.pop_front() {
+                        let owned = idle.take().expect("writer is available between jobs");
+                        writing = Some(spawn_writer(owned, Some((index, data))));
+                        writing_index = Some(index);
+                    } else if in_flight.is_empty() && next == windows.len() {
+                        break;
+                    }
+                }
+                match next_event(&mut in_flight, &mut writing, &mut ticker).await {
+                    Event::Fetched(slot, fetched) => {
+                        let (index, _) = in_flight.swap_remove(slot);
+                        match fetched {
+                            Ok(Ok(data)) => arrived.push_back((index, data)),
+                            Ok(Err(error)) => break 'windows Some(error),
+                            Err(error) => break 'windows Some(ClientInstallError::Worker(error)),
+                        }
+                    }
+                    Event::Written(outcome) => {
+                        writing = None;
+                        let (returned, result) = match outcome {
+                            Ok(done) => done,
+                            Err(error) => break 'windows Some(ClientInstallError::Worker(error)),
+                        };
+                        idle = Some(returned);
+                        if let Err(error) = result {
+                            break 'windows Some(error);
+                        }
+                        if let Some(index) = writing_index.take() {
+                            written[index] = true;
+                            while written.get(oldest) == Some(&true) {
+                                oldest += 1;
                             }
                         }
-                    }
-                };
-                let data = match fetched {
-                    Ok(Ok(data)) => data,
-                    Ok(Err(error)) => break 'windows Some(error),
-                    Err(error) => break 'windows Some(ClientInstallError::Worker(error)),
-                };
-
-                let mut owned = writer.take().expect("writer is available between windows");
-                let shared = Arc::clone(&windows);
-                let mut applying = tauri::async_runtime::spawn_blocking(move || {
-                    let outcome = owned.apply(&shared[index], &data);
-                    (owned, outcome)
-                });
-                // El disco no se interrumpe a mitad de ventana: la parada espera a que termine
-                // esta, y mientras tanto el progreso de la red se sigue publicando.
-                let mut report_error = None;
-                let applied = loop {
-                    match wait_or_tick(&mut applying, &mut ticker).await {
-                        Waited::Ready(applied) => break applied,
-                        Waited::Tick if report_error.is_none() => {
-                            report_error = self.report(detail(index), Report::IfChanged).err();
+                        if self.cancel.is_cancelled() {
+                            break 'windows Some(ClientInstallError::Cancelled);
                         }
-                        Waited::Tick => {}
-                    }
-                };
-                match applied {
-                    Ok((returned, outcome)) => {
-                        writer = Some(returned);
-                        if let Err(error) = outcome {
+                        if let Err(error) = self.report(detail(oldest), Report::AfterApply) {
                             break 'windows Some(error);
                         }
                     }
-                    Err(error) => break 'windows Some(ClientInstallError::Worker(error)),
-                }
-                if let Some(error) = report_error {
-                    break 'windows Some(error);
-                }
-                if self.cancel.is_cancelled() {
-                    break 'windows Some(ClientInstallError::Cancelled);
-                }
-                if let Err(error) = self.report(detail(index + 1), Report::AfterApply) {
-                    break 'windows Some(error);
+                    // Detener no espera a la red: las peticiones se abortan en el próximo tic.
+                    Event::Tick if self.cancel.is_cancelled() => {
+                        break 'windows Some(ClientInstallError::Cancelled)
+                    }
+                    Event::Tick => {
+                        if let Err(error) = self.report(detail(oldest), Report::IfChanged) {
+                            break 'windows Some(error);
+                        }
+                    }
                 }
             }
-            // Todo aplicado: el último evento de la descarga muestra el total.
+            // Todo escrito: el último evento de la descarga muestra el total.
             self.report(detail(windows.len()), Report::Always).err()
         };
 
-        for fetch in &in_flight {
+        for (_, fetch) in &in_flight {
             fetch.abort();
         }
+        // El disco no se interrumpe a mitad de ventana: la parada espera a que termine esta.
+        if let Some(task) = writing.take() {
+            if let Ok((returned, _)) = task.await {
+                idle = Some(returned);
+            }
+        }
+        let idle = idle.map(|writer| *writer);
         match failure {
-            Some(error) => (writer, Err(error)),
-            None => (writer, Ok(())),
+            Some(error) => (idle, Err(error)),
+            None => (idle, Ok(())),
         }
     }
 
-    fn spawn_fetch(
-        &self,
-        window: &DownloadWindow,
-    ) -> tauri::async_runtime::JoinHandle<Result<Vec<u8>, ClientInstallError>> {
+    fn spawn_fetch(&self, window: &DownloadWindow) -> FetchTask {
         tauri::async_runtime::spawn(fetch_window(
             self.client.clone(),
             format!("{}/{:016X}.bundle", self.bundle_base, window.bundle_id),
@@ -2021,11 +3094,12 @@ impl Downloader<'_> {
         ))
     }
 
-    /// Publica los bytes recibidos hasta ahora. El valor nunca retrocede: si un reintento
-    /// descarta bytes, el progreso espera a que el nuevo intento lo alcance.
+    /// Publica los bytes que ya estaban en disco más los recibidos hasta ahora. El valor nunca
+    /// retrocede: si un reintento descarta bytes, el progreso espera a que el nuevo intento lo
+    /// alcance.
     fn report(&mut self, detail: &str, when: Report) -> Result<(), ClientInstallError> {
-        let received = self.received.load(Ordering::SeqCst).min(self.total_bytes);
-        let bytes = self.reported_bytes.max(received);
+        let received = self.received.load(Ordering::SeqCst).min(self.missing_bytes);
+        let bytes = self.reported_bytes.max(self.stored_bytes + received);
         let due = self
             .last_report
             .is_none_or(|last| last.elapsed() >= self.tuning.progress_interval);
@@ -2045,7 +3119,7 @@ impl Downloader<'_> {
             "download",
             detail,
             bytes,
-            Some(self.total_bytes),
+            Some(self.stored_bytes + self.missing_bytes),
             false,
         )
     }
@@ -2132,38 +3206,43 @@ async fn fetch_range(
 async fn download_files(
     downloader: &mut Downloader<'_>,
     files: &[InstallFile],
-    allow_replace: bool,
+    windows: Vec<DownloadWindow>,
+    writer: FileWriter,
 ) -> Result<(), ClientInstallError> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    let windows = Arc::new(plan_download_windows(files, downloader.tuning.max_window)?);
-    // Los temporales de una ejecución interrumpida ya se quitaron al confirmar el plan.
-    let temp_dir = downloader.destination.join(METADATA_DIR).join(TEMP_DIR);
-    fs::create_dir_all(&temp_dir)?;
-    let writer = FileWriter::new(downloader.destination, &temp_dir, files, allow_replace)?;
-
-    let (writer, outcome) = downloader.run(windows, files, writer).await;
+    let temp_dir = writer.temp_dir.clone();
+    let (writer, outcome) = downloader.run(Arc::new(windows), files, writer).await;
     let Some(mut writer) = writer else {
-        // Solo ocurre si falló el hilo de escritura; los `.part` se limpian en el próximo intento.
+        // Solo ocurre si falló el hilo de escritura: vale el diario del último punto de control.
         return outcome;
     };
-    let finished = outcome.and_then(|()| writer.finish());
-    if finished.is_err() {
-        writer.discard_uncommitted();
-        return finished;
-    }
+    // Volcar y renombrar es E/S bloqueante: fuera del hilo asíncrono.
+    tauri::async_runtime::spawn_blocking(move || {
+        let finished = outcome.and_then(|()| writer.finish());
+        if finished.is_err() {
+            writer.suspend();
+        }
+        finished
+    })
+    .await
+    .map_err(ClientInstallError::Worker)??;
 
     // Solo quita la carpeta temporal si quedó vacía; nunca borra archivos del usuario.
     let _ = fs::remove_dir(&temp_dir);
     Ok(())
 }
 
-/// Quita lo que dejó una ejecución interrumpida en la carpeta temporal de ChronoRift: los `.part`
-/// a medio armar y los `.backup` de una reparación cortada entre sus dos renombres (el archivo
-/// reemplazado, del tamaño equivocado). Solo corre al confirmar un plan; lo desconocido se queda.
-fn remove_stale_temp_files(temp_dir: &Path) -> Result<(), ClientInstallError> {
-    let entries = match fs::read_dir(temp_dir) {
+/// Quita lo que dejó una ejecución anterior en la carpeta temporal de ChronoRift y ya no sirve:
+/// los `.part` que el diario no conserva para este plan y los `.backup` de una reparación cortada
+/// entre sus dos renombres (el archivo reemplazado, del tamaño equivocado). Sin `.part`
+/// conservados, también el diario. Solo corre al confirmar un plan; lo desconocido se queda.
+fn remove_stale_temp_files(destination: &Path, kept: &KeptParts) -> Result<(), ClientInstallError> {
+    let metadata_dir = destination.join(METADATA_DIR);
+    let keep = kept.temp_names();
+    if keep.is_empty() {
+        remove_metadata_file(&metadata_dir, JOURNAL_FILE)?;
+    }
+    let temp_dir = metadata_dir.join(TEMP_DIR);
+    let entries = match fs::read_dir(&temp_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.into()),
@@ -2172,7 +3251,11 @@ fn remove_stale_temp_files(temp_dir: &Path) -> Result<(), ClientInstallError> {
         let path = entry?.path();
         let stale = path
             .extension()
-            .is_some_and(|extension| extension == TEMP_SUFFIX || extension == BACKUP_SUFFIX);
+            .is_some_and(|extension| extension == TEMP_SUFFIX || extension == BACKUP_SUFFIX)
+            && !path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|name| keep.contains(name));
         if stale && path.is_file() {
             fs::remove_file(path)?;
         }
@@ -2231,7 +3314,11 @@ fn write_metadata(
 
 /// Solo borra metadatos propios de ChronoRift dentro de la carpeta del cliente.
 fn remove_metadata(destination: &Path, name: &str) -> Result<(), ClientInstallError> {
-    match fs::remove_file(destination.join(METADATA_DIR).join(name)) {
+    remove_metadata_file(&destination.join(METADATA_DIR), name)
+}
+
+fn remove_metadata_file(metadata_dir: &Path, name: &str) -> Result<(), ClientInstallError> {
+    match fs::remove_file(metadata_dir.join(name)) {
         Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error.into()),
         _ => Ok(()),
     }
@@ -2396,6 +3483,7 @@ fn temp_name_for_manifest_path(manifest_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::i18n;
     use std::{
         io::{BufRead, BufReader, Read},
         net::{TcpListener, TcpStream},
@@ -2567,37 +3655,44 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Un fragmento compartido se pide una sola vez, los contiguos se fusionan hasta el tope de
-    /// la ventana y el orden sigue a la primera escritura de cada archivo.
+    /// Un fragmento compartido se pide una sola vez y los contiguos se fusionan hasta el tope de la
+    /// ventana. En un cliente con la forma de uno real, el orden nuevo termina los archivos uno
+    /// tras otro: pocos `.part` a medias y poca reserva de más en NTFS, con las mismas peticiones
+    /// que el orden por bundle de antes.
     #[test]
-    fn plans_deduplicated_contiguous_windows_in_file_order() {
+    fn plans_windows_so_files_finish_one_after_another() {
         let chunk = |bundle_id: u64, bundle_offset: u32, bundle_size: u32| BundleChunk {
             bundle_id,
             bundle_offset,
             bundle_size,
             target_size: bundle_size * 2,
         };
+        let file =
+            |index: usize, path: &str, filesize: u32, chunks: Vec<BundleChunk>| InstallFile {
+                index,
+                path: path.to_string(),
+                filesize,
+                chunks,
+            };
         let files = vec![
-            InstallFile {
-                path: "a.bin".to_string(),
-                filesize: 120,
-                chunks: vec![
+            file(
+                0,
+                "a.bin",
+                120,
+                vec![
                     chunk(2, 0, 10),
                     chunk(2, 10, 10),
                     chunk(2, 20, 10),
                     chunk(1, 0, 30),
                 ],
-            },
-            InstallFile {
-                path: "b.bin".to_string(),
-                filesize: 40,
-                chunks: vec![chunk(2, 0, 10), chunk(2, 40, 10)],
-            },
+            ),
+            file(1, "b.bin", 40, vec![chunk(2, 0, 10), chunk(2, 40, 10)]),
         ];
 
-        let windows = plan_download_windows(&files, 25).unwrap();
+        let work = plan_download(&files, &KeptParts::default(), 25).unwrap();
 
-        let summary = windows
+        let summary = work
+            .windows
             .iter()
             .map(|window| {
                 (
@@ -2605,15 +3700,22 @@ mod tests {
                     window.start,
                     window.end,
                     window.chunks.len(),
+                    window.file_index,
                 )
             })
             .collect::<Vec<_>>();
         assert_eq!(
             summary,
-            [(2, 0, 20, 2), (2, 20, 30, 1), (1, 0, 30, 1), (2, 40, 50, 1)]
+            [
+                (2, 0, 20, 2, 0),
+                (2, 20, 30, 1, 0),
+                (1, 0, 30, 1, 0),
+                (2, 40, 50, 1, 1)
+            ]
         );
+        let shared = work.windows[0].chunks[0].chunk;
         assert_eq!(
-            windows[0].chunks[0].placements,
+            work.chunks[shared].placements,
             [
                 Placement {
                     file_index: 0,
@@ -2625,20 +3727,60 @@ mod tests {
                 }
             ]
         );
-        assert_eq!(install_totals(&files), (70, 160));
+        assert_eq!(
+            (
+                work.missing_bytes,
+                work.stored_bytes,
+                work.remaining.clone()
+            ),
+            (70, 0, vec![120, 40])
+        );
+        // Con el primer fragmento de `a.bin` ya en su `.part`, solo falta el de `b.bin` que no
+        // comparte: el compartido se vuelve a pedir para `b.bin`.
+        let kept = KeptParts(vec![
+            Some(JournalFile {
+                path: "a.bin".to_string(),
+                temp_name: files[0].temp_name(),
+                size: 120,
+                sparse: true,
+                created: None,
+                ranges: vec![(0, 60)],
+            }),
+            None,
+        ]);
+        let resumed = plan_download(&files, &kept, 25).unwrap();
+        assert_eq!(
+            (
+                resumed.missing_bytes,
+                resumed.stored_bytes,
+                resumed.remaining
+            ),
+            (50, 20, vec![60, 40])
+        );
         assert_eq!(DownloadTuning::with_connections(None).connections, 8);
         assert_eq!(DownloadTuning::with_connections(Some(0)).connections, 1);
         assert_eq!(DownloadTuning::with_connections(Some(200)).connections, 32);
 
-        let empty_chunk = [InstallFile {
-            path: "broken.bin".to_string(),
-            filesize: 0,
-            chunks: vec![chunk(1, 0, 0)],
-        }];
+        let broken = [file(0, "broken.bin", 0, vec![chunk(1, 0, 0)])];
         assert!(matches!(
-            plan_download_windows(&empty_chunk, 25),
+            plan_download(&broken, &KeptParts::default(), 25),
             Err(ClientInstallError::CorruptManifest)
         ));
+        let short = [file(0, "short.bin", 99, vec![chunk(1, 0, 10)])];
+        assert!(matches!(
+            plan_download(&short, &KeptParts::default(), 25),
+            Err(ClientInstallError::ChunkLayoutMismatch(_))
+        ));
+
+        let client = synthetic_client();
+        let (before, after) = reservation_peaks(&client, 256 * 1024);
+        eprintln!("synthetic client: by bundle {before:?}, file by file {after:?}");
+        assert_eq!(before.requests, after.requests);
+        assert!(after.files <= 4, "{after:?}");
+        assert!(
+            after.overhead * 4 < before.overhead,
+            "{before:?} vs {after:?}"
+        );
     }
 
     /// Flujo completo contra un CDN local: plan → confirmaciones que no coinciden → instalación
@@ -2754,20 +3896,15 @@ mod tests {
         assert!(!destination.exists());
 
         // 3. Interrupción: el bundle B2 falla siempre. Cada ventana hace 1 intento y 5 reintentos
-        //    antes de rendirse. Las ventanas se aplican en orden, así que el ejecutable y el
-        //    archivo que comparte su primer fragmento quedan confirmados y el resto no, aunque
-        //    otras peticiones estuvieran en vuelo. Mientras el ejecutable está a medio armar, su
-        //    `.part` es disperso.
+        //    antes de rendirse. Con una conexión el punto de corte es conocido: el plan empieza
+        //    por `Bootstrap` (A1), que queda confirmado, y sigue con `Aatrox.es_MX` (B2), que
+        //    agota los reintentos. Nada quedó a medias: ni `.part` ni diario.
         cdn.fail_paths_containing(Some(bundle_b2));
-        let probe = PartProbe {
-            temp_dir: temp_dir.clone(),
-            seen: Mutex::default(),
-        };
         let failed = run(install_client_with(
-            &probe,
+            &progress,
             &endpoints,
             request(Some(&first)),
-            tuning,
+            test_tuning(1, 1),
             &never,
         ))
         .unwrap_err();
@@ -2784,38 +3921,27 @@ mod tests {
         assert!(log
             .iter()
             .all(|(path, start)| range_requests(&log, path, *start) <= attempts));
-        #[cfg(windows)]
-        {
-            let seen = probe.seen.lock().unwrap();
-            assert!(
-                seen.iter()
-                    .any(|(name, _)| name.ends_with("League_of_Legends.exe.part")),
-                "{seen:?}"
-            );
-            assert!(seen.iter().all(|(_, sparse)| *sparse), "{seen:?}");
-        }
-        for path in [GAME_EXE, "DATA/FINAL/Shared.wad.client"] {
-            assert_eq!(
-                fs::read(destination.join(path)).unwrap(),
-                fixture.content(path),
-                "{path}"
-            );
-        }
+        let bootstrap = "DATA/FINAL/Bootstrap.windows.wad.client";
+        assert_eq!(
+            fs::read(destination.join(bootstrap)).unwrap(),
+            fixture.content(bootstrap)
+        );
         for path in [
+            GAME_EXE,
+            "DATA/FINAL/Shared.wad.client",
             "DATA/FINAL/Champions/Aatrox.es_MX.wad.client",
-            "DATA/FINAL/Bootstrap.windows.wad.client",
         ] {
             assert!(!destination.join(path).exists(), "{path}");
         }
         assert!(eventually_empty(&temp_dir));
+        assert!(!metadata_dir.join(JOURNAL_FILE).exists());
         // El estado local ve la instalación a medias, con el total del plan confirmado.
         let partial = status_of(&root_text, "16.18.817.5716");
         assert_eq!(partial.state, LocalClientState::Partial);
         assert_eq!(partial.total_install_bytes, Some(first.total_install_bytes));
         assert_eq!(
             partial.installed_bytes,
-            (fixture.content(GAME_EXE).len()
-                + fixture.content("DATA/FINAL/Shared.wad.client").len()) as u64
+            fixture.content(bootstrap).len() as u64
         );
         assert!(partial.executable_path.is_none());
         fs::write(destination.join("user-notes.txt"), b"mine").unwrap();
@@ -2831,7 +3957,7 @@ mod tests {
         assert_eq!(resume.mode, ClientWorkMode::Resume);
         assert_eq!(
             (resume.reused_file_count, resume.affected_file_count),
-            (2, 2)
+            (1, 3)
         );
         let merged = DownloadTuning {
             retry_delays: &FAST_RETRIES,
@@ -2839,9 +3965,14 @@ mod tests {
             progress_interval: Duration::ZERO,
             ..DownloadTuning::with_connections(None)
         };
-        let windows = plan_download_windows(&resume_planned.pending_files, merged.max_window)
-            .unwrap()
-            .len();
+        let windows = plan_download(
+            &resume_planned.pending_files,
+            &resume_planned.kept,
+            merged.max_window,
+        )
+        .unwrap()
+        .windows
+        .len();
         let chunks = resume_planned
             .pending_files
             .iter()
@@ -3093,12 +4224,13 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Detener mientras el CDN retiene una ventana vuelve enseguida, conserva lo confirmado, no
-    /// deja temporales ni candado, deja el estado local en "incompleto" con el total del plan y la
-    /// reanudación termina el cliente. El estado distingue una carpeta que todavía no existe de una
-    /// unidad que no está.
+    /// Una ventana retenida no frena a las demás: se escriben a medida que llegan. Detener vuelve
+    /// enseguida y conserva los archivos confirmados, los `.part` a medio armar y su diario; el
+    /// estado local cuenta esos bytes. Reanudar pide solo los fragmentos que faltan, sin volver a
+    /// bajar el manifiesto, y el progreso arranca desde lo que ya estaba en disco. El estado
+    /// distingue una carpeta que todavía no existe de una unidad que no está.
     #[test]
-    fn e2e_stopping_keeps_committed_files_and_resuming_finishes_the_client() {
+    fn e2e_stopping_keeps_partial_files_and_resuming_fetches_only_what_is_missing() {
         let fixture = build_fixture();
         let cdn = TestCdn::start();
         let manifest_path = "/channels/public/releases/0000000000005EED.manifest";
@@ -3144,9 +4276,61 @@ mod tests {
                     .map(|planned| planned.plan)
             })
         };
-        // Una conexión y ventanas de un fragmento: la parada ocurre en un punto conocido.
-        let tuning = test_tuning(1, 1);
         let destination = root.join("16.18.817.5716").join(GAME_FOLDER);
+        let metadata_dir = destination.join(METADATA_DIR);
+        let temp_dir = metadata_dir.join(TEMP_DIR);
+        let journal_path = metadata_dir.join(JOURNAL_FILE);
+        let aatrox = "DATA/FINAL/Champions/Aatrox.es_MX.wad.client";
+        let committed_bytes = || {
+            fixture
+                .selected()
+                .filter(|(path, _, _)| destination.join(path).is_file())
+                .map(|(_, content, _)| content.len() as u64)
+                .sum::<u64>()
+        };
+        // Fragmentos del ejecutable: el primero lo comparte `Shared.wad.client`.
+        let exe_chunks = parse_install_files(&fixture.manifest, "es_MX", None)
+            .unwrap()
+            .into_iter()
+            .find(|file| file.path == GAME_EXE)
+            .unwrap()
+            .chunks;
+        let installs = |tuning: DownloadTuning, cancel: &CancelSignal, confirmed| {
+            run(install_client_with(
+                &ProgressLog::default(),
+                &endpoints,
+                request(Some(confirmed)),
+                tuning,
+                cancel,
+            ))
+        };
+        // Detiene la instalación en cuanto `ready` se cumple, y comprueba que vuelve enseguida.
+        let stop_when =
+            |held: &str, tuning: DownloadTuning, confirmed, ready: &dyn Fn() -> bool| {
+                let cancel = CancelSignal::default();
+                thread::scope(|scope| {
+                    let _held = cdn.hold(held);
+                    let running = scope.spawn(|| installs(tuning, &cancel, confirmed));
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while !ready() {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the install never reached the stop point"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    let asked = Instant::now();
+                    cancel.cancel();
+                    let stopped = running.join().unwrap();
+                    // Detener no espera a las ventanas retenidas.
+                    assert!(
+                        asked.elapsed() < Duration::from_secs(1),
+                        "stopping took {:?}",
+                        asked.elapsed()
+                    );
+                    stopped.unwrap_err()
+                })
+            };
 
         // Consultar el estado de una compilación ausente no crea carpetas, y una carpeta de
         // clientes que todavía no existe no es un error.
@@ -3185,65 +4369,125 @@ mod tests {
             ));
         }
 
-        // El CDN retiene el bundle B2: cuando la instalación espera esa ventana, el ejecutable y
-        // el archivo que comparte su primer fragmento ya están confirmados.
+        // 1. El CDN retiene el bundle A1, que tiene la primera ventana del plan. Con 3 conexiones,
+        //    las dos ventanas de B2 llegan, se escriben y confirman `Aatrox.es_MX` mientras tanto,
+        //    y sus lugares los ocupan otras dos de A1: cinco peticiones, tres retenidas.
         let first = plan(request(None)).unwrap();
-        let cancel = CancelSignal::default();
-        let stopped = thread::scope(|scope| {
-            let _held = cdn.hold("00000000000000B2.bundle");
-            let running = scope.spawn(|| {
-                run(install_client_with(
-                    &ProgressLog::default(),
-                    &endpoints,
-                    request(Some(&first)),
-                    tuning,
-                    &cancel,
-                ))
-            });
-            cdn.wait_for_held(1);
-            let asked = Instant::now();
-            cancel.cancel();
-            let stopped = running.join().unwrap();
-            // Detener no espera a la ventana retenida.
-            assert!(
-                asked.elapsed() < Duration::from_secs(1),
-                "stopping took {:?}",
-                asked.elapsed()
-            );
-            stopped
-        });
-        assert_eq!(stopped.unwrap_err().to_string(), "Descarga detenida");
-        let temp_dir = destination.join(METADATA_DIR).join("tmp");
-        assert!(!temp_dir.exists() || eventually_empty(&temp_dir));
-        assert!(!destination.join(METADATA_DIR).join(LOCK_FILE).exists());
-
-        let committed = fixture
-            .selected()
-            .filter(|(path, _, _)| destination.join(path).is_file())
-            .map(|(_, content, _)| content.len() as u64)
-            .sum::<u64>();
-        assert_eq!(
-            committed,
-            (fixture.content(GAME_EXE).len()
-                + fixture.content("DATA/FINAL/Shared.wad.client").len()) as u64
+        assert_eq!(cdn.hits(manifest_path), 1);
+        let stopped = stop_when(
+            "00000000000000A1.bundle",
+            test_tuning(3, 1),
+            &first,
+            &|| destination.join(aatrox).is_file() && cdn.held() == 3,
         );
+        assert_eq!(cdn.hits("/bundles/"), 5);
+        assert_eq!(stopped.to_string(), "Descarga detenida");
+        assert_eq!(
+            i18n::with_language(i18n::Language::En, || stopped.to_string()),
+            "Download stopped"
+        );
+        assert_eq!(
+            fs::read(destination.join(aatrox)).unwrap(),
+            fixture.content(aatrox)
+        );
+        assert_eq!(committed_bytes(), fixture.content(aatrox).len() as u64);
+        // Nada quedó a medias: sin `.part`, sin diario y sin candado.
+        assert!(!temp_dir.exists() || eventually_empty(&temp_dir));
+        assert!(!journal_path.exists());
+        assert!(!metadata_dir.join(LOCK_FILE).exists());
         let partial = status_of(&root_text, "16.18.817.5716");
         assert_eq!(partial.state, LocalClientState::Partial);
         assert_eq!(partial.total_install_bytes, Some(first.total_install_bytes));
-        assert_eq!(partial.installed_bytes, committed);
+        assert_eq!(partial.installed_bytes, committed_bytes());
         assert_eq!(list_local_clients(&root_text).unwrap(), vec![partial]);
 
-        // La señal quedó en "detenida": la próxima instalación la limpia al empezar.
+        // 2. Reanudar con una conexión, reteniendo solo la ventana del último fragmento del
+        //    ejecutable. `Bootstrap` y `Shared` se confirman; el ejecutable recibe el fragmento que
+        //    comparte con `Shared` (copiado del disco) y el segundo, y al detener queda su `.part`
+        //    disperso con su tamaño final y el diario con esos 8 KiB.
         let resume = plan(request(None)).unwrap();
         assert_eq!(resume.mode, ClientWorkMode::Resume);
+        assert_eq!(
+            (resume.reused_file_count, resume.affected_file_count),
+            (1, 3)
+        );
+        let last_chunk = format!("00000000000000A1.bundle#{}#", exe_chunks[2].bundle_offset);
+        let exe = fixture.content(GAME_EXE);
+        let journaled = (exe.len() - exe_chunks[2].target_size as usize) as u64;
+        let exe_part = temp_dir.join(format!(
+            "00000-{}.part",
+            temp_name_for_manifest_path(GAME_EXE)
+        ));
+        stop_when(&last_chunk, test_tuning(1, 1), &resume, &|| {
+            fs::read(&exe_part)
+                .is_ok_and(|part| part.get(..journaled as usize) == exe.get(..journaled as usize))
+        });
+        assert!(destination.join("DATA/FINAL/Shared.wad.client").is_file());
+        assert!(!destination.join(GAME_EXE).exists());
+        assert_eq!(fs::metadata(&exe_part).unwrap().len(), exe.len() as u64);
+        #[cfg(windows)]
+        assert!(is_sparse(&exe_part));
+        let journal = read_journal(&metadata_dir).unwrap();
+        assert_eq!(journal.identity, JournalIdentity::of(&resume));
+        assert_eq!(
+            journal
+                .files
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry.ranges.clone()))
+                .collect::<Vec<_>>(),
+            [(GAME_EXE, vec![(0, journaled)])]
+        );
+        let partial = status_of(&root_text, "16.18.817.5716");
+        assert_eq!(partial.state, LocalClientState::Partial);
+        assert_eq!(partial.installed_bytes, committed_bytes() + journaled);
+        assert_eq!(partial.total_install_bytes, Some(first.total_install_bytes));
+
+        // 3. El plan cuenta solo lo que falta y la reanudación pide solo eso. El progreso arranca
+        //    desde los bytes de bundle que ya estaban en disco, con el total de los archivos
+        //    pendientes, y al terminar no quedan diario, `.part` ni manifiesto guardado. Ni el plan
+        //    ni las instalaciones de los pasos 2 y 3 volvieron a bajar el manifiesto.
+        let last = plan(request(None)).unwrap();
+        assert_eq!(last.mode, ClientWorkMode::Resume);
+        assert_eq!((last.reused_file_count, last.affected_file_count), (3, 1));
+        assert_eq!(last.download_bytes, u64::from(exe_chunks[2].bundle_size));
+        assert_eq!(last.install_bytes, exe.len() as u64 - journaled);
+        let stored = u64::from(exe_chunks[0].bundle_size + exe_chunks[1].bundle_size);
+        let progress = ProgressLog::default();
+        // Las peticiones retenidas del paso 2 se atienden al soltarlas: no son de este paso.
+        cdn.wait_until_idle();
+        let (requests_before, bytes_before) = cdn.bundle_traffic();
         run(install_client_with(
-            &ProgressLog::default(),
+            &progress,
             &endpoints,
-            request(Some(&resume)),
-            tuning,
-            &cancel,
+            request(Some(&last)),
+            test_tuning(1, 1),
+            &CancelSignal::default(),
         ))
         .unwrap();
+        let (requests_after, bytes_after) = cdn.bundle_traffic();
+        assert_eq!(
+            (
+                requests_after - requests_before,
+                (bytes_after - bytes_before) as u64
+            ),
+            (1, last.download_bytes)
+        );
+        let events = progress.take();
+        let first_download = events
+            .iter()
+            .find(|event| event.stage == "download")
+            .unwrap();
+        assert_eq!(
+            (first_download.downloaded_bytes, first_download.total_bytes),
+            (stored, Some(stored + last.download_bytes))
+        );
+        let complete = events.last().unwrap();
+        assert!(complete.done);
+        assert_eq!(complete.total_bytes, Some(stored + last.download_bytes));
+        assert_eq!(cdn.hits(manifest_path), 2);
+        assert!(!journal_path.exists());
+        assert!(!metadata_dir.join(MANIFEST_CACHE_DIR).exists());
+        assert!(!temp_dir.exists() || eventually_empty(&temp_dir));
         let ready = status_of(&root_text, "16.18.817.5716");
         assert_eq!(ready.state, LocalClientState::Ready);
         assert_eq!(ready.installed_bytes, fixture.selected_bytes());
@@ -3256,36 +4500,6 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
-    }
-
-    /// Anota, en cada evento de descarga, los `.part` de la carpeta temporal y si son dispersos.
-    struct PartProbe {
-        temp_dir: PathBuf,
-        seen: Mutex<Vec<(String, bool)>>,
-    }
-
-    impl ProgressSink for PartProbe {
-        fn publish(&self, progress: ClientInstallProgress) -> Result<(), ClientInstallError> {
-            if progress.stage != "download" {
-                return Ok(());
-            }
-            let parts = fs::read_dir(&self.temp_dir)
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .map(|entry| entry.path())
-                .filter(|path| {
-                    path.extension()
-                        .is_some_and(|extension| extension == "part")
-                })
-                .map(|path| {
-                    let name = path.file_name().unwrap().to_string_lossy().into_owned();
-                    (name, is_sparse(&path))
-                })
-                .collect::<Vec<_>>();
-            self.seen.lock().unwrap().extend(parts);
-            Ok(())
-        }
     }
 
     #[cfg(windows)]
@@ -3473,7 +4687,8 @@ mod tests {
     }
 
     /// Con un manifiesto real (CHRONORIFT_MANIFEST_SAMPLE), contrasta la selección por rutas con
-    /// las banderas RMAN de cada archivo e informa los totales y las peticiones del plan.
+    /// las banderas RMAN de cada archivo e informa los totales, las peticiones del plan y la
+    /// reserva de más estimada en NTFS con el orden por bundle de antes y con el de ahora.
     #[test]
     fn real_manifest_selection_matches_rman_flags() {
         let Ok(path) = std::env::var("CHRONORIFT_MANIFEST_SAMPLE") else {
@@ -3483,11 +4698,11 @@ mod tests {
         let locale =
             std::env::var("CHRONORIFT_MANIFEST_LOCALE").unwrap_or_else(|_| "es_MX".to_string());
         let bytes = fs::read(path).expect("real manifest should read");
-        let files = parse_install_files(bytes.clone(), &locale).expect("real manifest should plan");
+        let files = parse_install_files(&bytes, &locale, None).expect("real manifest should plan");
         assert!(files.iter().any(|file| file.path == GAME_EXE));
         assert!(files.len() > 100);
 
-        let rman = read_rman_manifest(bytes).unwrap();
+        let rman = read_rman_manifest(&bytes).unwrap();
         // En RMAN 2.1 los ids de bandera empiezan en 1 y la máscara usa el bit `id - 1`;
         // cdragon-rman 0.2 prueba el bit `id`, así que se le pasan ids desplazados.
         let flags = rman
@@ -3531,14 +4746,24 @@ mod tests {
                 _ => {}
             }
         }
-        let (download_bytes, install_bytes) = install_totals(&files);
+        let work = plan_download(&files, &KeptParts::default(), MAX_WINDOW_BYTES).unwrap();
+        let install_bytes = work.remaining.iter().sum::<u64>();
         let chunk_references = files.iter().map(|file| file.chunks.len()).sum::<usize>();
-        let windows = plan_download_windows(&files, MAX_WINDOW_BYTES).unwrap();
         eprintln!(
-            "{locale}: {} files, {chunk_references} chunk references, {} range requests, download {download_bytes} B, install {install_bytes} B, {} extra by path rule",
+            "{locale}: {} files, {chunk_references} chunk references, {} range requests, download {} B, install {install_bytes} B, {} extra by path rule",
             files.len(),
-            windows.len(),
+            work.windows.len(),
+            work.missing_bytes,
             extra.len()
+        );
+        let (before, after) = reservation_peaks(&files, MAX_WINDOW_BYTES);
+        let mib = |bytes: u64| bytes as f64 / 1_048_576.0;
+        eprintln!(
+            "reserved beyond written, one window at a time: by bundle {} files at once, {:.0} MiB; file by file {} files at once, {:.0} MiB",
+            before.files,
+            mib(before.overhead),
+            after.files,
+            mib(after.overhead)
         );
         assert!(
             missing.is_empty(),
@@ -3661,6 +4886,205 @@ mod tests {
         }
     }
 
+    /// Unidad que NTFS reserva entera en un archivo disperso con clústeres de 4 KiB: medida el
+    /// 2026-09-30, cada escritura suelta reserva una (o dos si cruza un borde) aunque escriba 4 KiB.
+    const SPARSE_UNIT: u64 = 64 * 1024;
+
+    /// Pico de archivos a medias y de bytes reservados de más al escribir las ventanas en orden,
+    /// una a la vez, y cantidad de peticiones.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    struct ReservationPeak {
+        files: usize,
+        overhead: u64,
+        requests: usize,
+    }
+
+    /// Modelo de la reserva: un `.part` a medio armar reserva cada unidad que tocó; al confirmarlo
+    /// queda justo.
+    struct ReservationModel {
+        units: Vec<HashSet<u64>>,
+        written: Vec<u64>,
+        sizes: Vec<u64>,
+        peak: ReservationPeak,
+    }
+
+    impl ReservationModel {
+        fn new(files: &[InstallFile]) -> Self {
+            Self {
+                units: vec![HashSet::new(); files.len()],
+                written: vec![0; files.len()],
+                sizes: files.iter().map(|file| u64::from(file.filesize)).collect(),
+                peak: ReservationPeak::default(),
+            }
+        }
+
+        /// Devuelve `true` si el archivo quedó completo.
+        fn write(&mut self, placement: Placement, len: u32) -> bool {
+            let file = placement.file_index;
+            let end = placement.target_offset + u64::from(len);
+            self.units[file]
+                .extend(placement.target_offset / SPARSE_UNIT..end.div_ceil(SPARSE_UNIT));
+            self.written[file] += u64::from(len);
+            self.written[file] == self.sizes[file]
+        }
+
+        fn commit(&mut self, file: usize) {
+            self.units[file].clear();
+        }
+
+        fn sample(&mut self) {
+            let open = (0..self.units.len())
+                .filter(|file| !self.units[*file].is_empty())
+                .collect::<Vec<_>>();
+            let overhead = open
+                .iter()
+                .map(|file| self.units[*file].len() as u64 * SPARSE_UNIT - self.written[*file])
+                .sum::<u64>();
+            self.peak.files = self.peak.files.max(open.len());
+            self.peak.overhead = self.peak.overhead.max(overhead);
+        }
+    }
+
+    /// Reserva de más con el orden de antes (por la primera escritura de cada ventana, todas las
+    /// posiciones de cada fragmento al llegar) y con el de ahora (`order_windows` y `Assembly`).
+    fn reservation_peaks(
+        files: &[InstallFile],
+        max_window: u32,
+    ) -> (ReservationPeak, ReservationPeak) {
+        let work = plan_download(files, &KeptParts::default(), max_window).unwrap();
+
+        let mut by_bundle = work.windows.iter().collect::<Vec<_>>();
+        by_bundle.sort_by_cached_key(|window| {
+            window
+                .chunks
+                .iter()
+                .flat_map(|piece| work.chunks[piece.chunk].placements.iter().copied())
+                .min()
+        });
+        let mut before = ReservationModel::new(files);
+        for window in &by_bundle {
+            for piece in &window.chunks {
+                for placement in &work.chunks[piece.chunk].placements {
+                    if before.write(*placement, piece.target_size) {
+                        before.commit(placement.file_index);
+                    }
+                }
+            }
+            before.sample();
+        }
+        before.peak.requests = by_bundle.len();
+
+        let mut after = ReservationModel::new(files);
+        let requests = work.windows.len();
+        let mut assembly = Assembly::new(work.chunks, work.remaining, &vec![false; files.len()]);
+        let mut steps = Vec::new();
+        for window in &work.windows {
+            for piece in &window.chunks {
+                steps.clear();
+                assembly.land(piece.chunk, &mut steps);
+                for step in &steps {
+                    match *step {
+                        Step::Write(to) => {
+                            after.write(to, piece.target_size);
+                        }
+                        Step::Copy { to, len, .. } => {
+                            after.write(to, len);
+                        }
+                        Step::Commit(file) => after.commit(file),
+                    }
+                }
+            }
+            after.sample();
+        }
+        after.peak.requests = requests;
+        (before.peak, after.peak)
+    }
+
+    /// Cliente sintético con la forma de uno real: fragmentos de 8 a 60 KiB (unos 28 KiB de
+    /// promedio, como el manifiesto real), los fragmentos nuevos de cada versión guardados en sus
+    /// propios bundles en orden de ruta, un tercio de los fragmentos cambiados en cada versión,
+    /// un índice del manifiesto que no sigue la ruta y un bloque compartido por todos los archivos.
+    fn synthetic_client() -> Vec<InstallFile> {
+        const FILES: usize = 48;
+        const CHUNKS: usize = 40;
+        const VERSIONS: usize = 4;
+        const BUNDLE_LIMIT: u32 = 1024 * 1024;
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut random = move |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        // Tamaño de cada fragmento y versión en la que cambió por última vez.
+        let sizes = (0..FILES * CHUNKS)
+            .map(|_| (8 + random(53) as u32) * 1024)
+            .collect::<Vec<_>>();
+        // Versiones en las que cambió cada fragmento: en la 0 son todos nuevos.
+        let mut changed_at = vec![vec![0]; FILES * CHUNKS];
+        for version in 1..VERSIONS {
+            for versions in &mut changed_at {
+                if random(3) == 0 {
+                    versions.push(version);
+                }
+            }
+        }
+        let shared = BundleChunk {
+            bundle_id: 0xFFFF,
+            bundle_offset: 0,
+            bundle_size: 2 * 1024,
+            target_size: 4 * 1024,
+        };
+        // Cada versión empaca sus fragmentos nuevos en orden de ruta; los que una versión
+        // posterior reemplazó quedan como huecos en sus bundles.
+        let mut chunks = vec![None; FILES * CHUNKS];
+        let mut bundle_id = 0x1000;
+        for version in 0..VERSIONS {
+            let mut offset = 0;
+            for (slot, versions) in changed_at.iter().enumerate() {
+                if !versions.contains(&version) {
+                    continue;
+                }
+                let bundle_size = sizes[slot] / 2;
+                if offset + bundle_size > BUNDLE_LIMIT {
+                    bundle_id += 1;
+                    offset = 0;
+                }
+                if versions.last() == Some(&version) {
+                    chunks[slot] = Some(BundleChunk {
+                        bundle_id,
+                        bundle_offset: offset,
+                        bundle_size,
+                        target_size: sizes[slot],
+                    });
+                }
+                offset += bundle_size;
+            }
+            bundle_id += 1;
+        }
+        // El índice del manifiesto no sigue la ruta.
+        let mut order = (0..FILES).collect::<Vec<_>>();
+        for index in (1..FILES).rev() {
+            order.swap(index, random(index as u64 + 1) as usize);
+        }
+        order
+            .into_iter()
+            .enumerate()
+            .map(|(index, by_path)| {
+                let mut file_chunks = (0..CHUNKS)
+                    .map(|position| chunks[by_path * CHUNKS + position].clone().unwrap())
+                    .collect::<Vec<_>>();
+                file_chunks.push(shared.clone());
+                InstallFile {
+                    index,
+                    path: format!("DATA/FINAL/{by_path:03}.wad.client"),
+                    filesize: file_chunks.iter().map(|chunk| chunk.target_size).sum(),
+                    chunks: file_chunks,
+                }
+            })
+            .collect()
+    }
+
     fn run<F: Future>(future: F) -> F::Output {
         tauri::async_runtime::block_on(future)
     }
@@ -3725,9 +5149,12 @@ mod tests {
         /// Ruta → `Location` de un 302.
         redirects: Mutex<HashMap<String, String>>,
         requests: AtomicUsize,
+        /// Ruta de cada petición recibida, antes de retenerla.
+        paths: Mutex<Vec<String>>,
         /// Fallos inducidos: vale el primero cuyo fragmento aparece en la ruta y aún tiene usos.
         faults: Mutex<Vec<Fault>>,
-        /// Mientras tiene un fragmento, las peticiones cuya ruta lo contiene esperan.
+        /// Mientras tiene un fragmento, las peticiones que lo contienen esperan. Se compara con
+        /// `<ruta>#<inicio del rango>#`, así que puede retener un solo rango.
         hold: Mutex<Option<String>>,
         hold_changed: Condvar,
         held_requests: AtomicUsize,
@@ -3816,6 +5243,22 @@ mod tests {
             self.state.requests.load(Ordering::SeqCst)
         }
 
+        /// Peticiones recibidas (retenidas incluidas) cuya ruta contiene `fragment`.
+        fn hits(&self, fragment: &str) -> usize {
+            self.state
+                .paths
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|path| path.contains(fragment))
+                .count()
+        }
+
+        /// Peticiones retenidas ahora mismo.
+        fn held(&self) -> usize {
+            self.state.held_requests.load(Ordering::SeqCst)
+        }
+
         fn fault(&self, fragment: &str, remaining: Option<usize>, kind: FaultKind) {
             self.state.faults.lock().unwrap().push(Fault {
                 fragment: fragment.to_string(),
@@ -3843,7 +5286,8 @@ mod tests {
             self.fault(fragment, Some(times), FaultKind::Stall);
         }
 
-        /// Retiene las peticiones cuya ruta contiene `fragment` hasta soltar el guardia.
+        /// Retiene las peticiones cuya ruta (o `<ruta>#<inicio>#`) contiene `fragment` hasta
+        /// soltar el guardia.
         fn hold(&self, fragment: &str) -> Held<'_> {
             *self.state.hold.lock().unwrap() = Some(fragment.to_string());
             Held(&self.state)
@@ -3951,6 +5395,7 @@ mod tests {
         }
 
         state.requests.fetch_add(1, Ordering::SeqCst);
+        state.paths.lock().unwrap().push(path.clone());
         let redirect = state.redirects.lock().unwrap().get(&path).cloned();
         if let Some(location) = redirect {
             let mut stream = stream;
@@ -3963,9 +5408,10 @@ mod tests {
         }
 
         {
+            let key = format!("{path}#{}#", range.map_or(0, |(from, _)| from));
             let retained = |hold: &Option<String>| {
                 hold.as_deref()
-                    .is_some_and(|fragment| path.contains(fragment))
+                    .is_some_and(|fragment| key.contains(fragment))
             };
             let mut hold = state.hold.lock().unwrap();
             if retained(&hold) {

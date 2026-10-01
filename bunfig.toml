@@ -1,0 +1,3 @@
+[install]
+# Solo paquetes publicados hace al menos 7 días (604 800 s): la misma regla que FairTranslator.
+minimumReleaseAge = 604800

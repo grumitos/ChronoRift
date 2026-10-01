@@ -2,7 +2,11 @@
 ; Solo cambia lo siguiente, y cada cambio lleva la marca "ChronoRift:":
 ;   - MUI_ABORTWARNING: Cancelar pide confirmación.
 ;   - Los textos de las páginas del asistente, del instalador y del desinstalador, salen de los
-;     LangString "chrono*" de spanish.nsh (español neutro, en tú) en lugar de los de fábrica de NSIS.
+;     LangString "chrono*" de spanish.nsh (español neutro, en tú) y de english.nsh en lugar de los
+;     de fábrica de NSIS.
+;   - Dos idiomas (Spanish y English, en tauri.conf.json) con selector al iniciar: siempre se
+;     pregunta (MUI_LANGDLL_ALWAYSSHOW), con el idioma del sistema preseleccionado igual que en la
+;     app (.onInit), y el diálogo es bilingüe porque se muestra antes de elegir idioma.
 ; El resto es idéntico: instalación por usuario, WebView2, accesos directos y desinstalador.
 ; Al actualizar Tauri, compara esta plantilla con la suya y vuelve a aplicar esos cambios.
 
@@ -171,6 +175,12 @@ VIAddVersionKey "ProductVersion" "${VERSION}"
 !define MUI_LANGDLL_REGISTRY_ROOT "HKCU"
 !define MUI_LANGDLL_REGISTRY_KEY "${MANUPRODUCTKEY}"
 !define MUI_LANGDLL_REGISTRY_VALUENAME "Installer Language"
+; ChronoRift: el selector sale siempre, no solo la primera vez: sin esto, con el idioma ya guardado
+; en el registro no se vuelve a preguntar. El idioma guardado queda preseleccionado.
+!define MUI_LANGDLL_ALWAYSSHOW
+; ChronoRift: se muestra antes de elegir idioma, así que no puede usar $(...): va en los dos.
+!define MUI_LANGDLL_WINDOWTITLE "Idioma / Language"
+!define MUI_LANGDLL_INFO "Elige el idioma del instalador. / Choose the installer language."
 
 ; ChronoRift: Cancelar pide confirmación antes de salir de la instalación.
 !define MUI_ABORTWARNING
@@ -545,7 +555,26 @@ Function .onInit
   ${EndIf}
 
   !if "${DISPLAYLANGUAGESELECTOR}" == "true"
-    !insertmacro MUI_LANGDLL_DISPLAY
+    ; ChronoRift: idioma por defecto igual que el de la app: español si el idioma de la interfaz
+    ; de Windows es el español (cualquier variante: es-MX, es-ES...) e inglés en cualquier otro
+    ; caso. Vale también para la instalación silenciosa. Si ya se instaló antes, el macro lo
+    ; reemplaza por el idioma guardado en el registro.
+    System::Call 'kernel32::GetUserDefaultUILanguage() i .r0'
+    IntOp $0 $0 & 0x3FF
+    ${If} $0 = 0x0A
+      StrCpy $LANGUAGE ${LANG_SPANISH}
+    ${Else}
+      StrCpy $LANGUAGE ${LANG_ENGLISH}
+    ${EndIf}
+    ; ChronoRift: en modo pasivo no se pregunta: se usa el idioma guardado, si hay.
+    ${If} $PassiveMode = 1
+      ReadRegStr $0 "${MUI_LANGDLL_REGISTRY_ROOT}" "${MUI_LANGDLL_REGISTRY_KEY}" "${MUI_LANGDLL_REGISTRY_VALUENAME}"
+      ${If} $0 != ""
+        StrCpy $LANGUAGE $0
+      ${EndIf}
+    ${Else}
+      !insertmacro MUI_LANGDLL_DISPLAY
+    ${EndIf}
   !endif
 
   !insertmacro SetContext

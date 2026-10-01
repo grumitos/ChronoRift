@@ -1,20 +1,31 @@
 //! Caché en disco de DataDragon y CommunityDragon. La interfaz pide imágenes y datos por el
-//! esquema `lolasset`: cada archivo se descarga una vez y después se sirve desde disco.
+//! esquema `lolasset`: cada archivo se descarga una vez y después se sirve desde disco. La
+//! precarga baja una lista entera de una vez, con sus propios turnos de descarga.
 
 use crate::client::{same_origin_redirects, USER_AGENT};
+use serde::Serialize;
 use std::{
     collections::HashMap,
     fmt::{self, Display},
     fs, io,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tauri::http::{header, HeaderValue, Response, StatusCode};
-use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tauri::{
+    async_runtime::JoinHandle,
+    http::{header, HeaderValue, Response, StatusCode},
+};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Semaphore, SemaphorePermit};
 
 /// En Windows la interfaz lo usa como `http://lolasset.localhost/<origen>/<ruta>`.
 pub const SCHEME: &str = "lolasset";
+
+/// Evento con el avance de la precarga (`PrefetchProgress`).
+pub const PREFETCH_PROGRESS_EVENT: &str = "asset-prefetch-progress";
 
 /// Política de cada respuesta del esquema. `lolasset.localhost` cuenta como origen local y sirve
 /// SVG de terceros: abierto como documento, uno de ellos no ejecuta código y `sandbox` le da un
@@ -59,7 +70,18 @@ const TEMP_SUFFIX: &str = ".tmp";
 /// otra instancia de la app que está escribiendo.
 const STALE_TEMP_AGE: Duration = Duration::from_secs(10 * 60);
 const MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Descargas a la vez de las peticiones de la interfaz (abrir una partida).
 const MAX_DOWNLOADS: usize = 6;
+/// Cada archivo tarda unos 300–400 ms en responder aunque el ancho de banda sobre, así que la
+/// precarga necesita muchas peticiones en vuelo. Tiene turnos propios y nunca toma los de
+/// `MAX_DOWNLOADS`: abrir una partida no espera a la precarga. CommunityDragon lo mantiene la
+/// comunidad y se le piden menos a la vez.
+const MAX_PREFETCH: usize = 24;
+const MAX_PREFETCH_COMMUNITY: usize = 8;
+/// Errores de red seguidos tras los cuales se da la red por caída y se corta la precarga.
+const PREFETCH_OFFLINE_ERRORS: usize = 12;
+/// Cada cuánto, como máximo, se avisa del avance de la precarga.
+const PREFETCH_NOTICE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_SEGMENTS: usize = 16;
 const MAX_SEGMENT_LEN: usize = 128;
 
@@ -88,6 +110,37 @@ impl From<io::Error> for AssetError {
     }
 }
 
+impl AssetRequest {
+    /// Plazo de lo que cambia; lo que lleva versión en la ruta no vence.
+    fn ttl(&self) -> Option<Duration> {
+        (!self.immutable).then_some(MUTABLE_TTL)
+    }
+}
+
+/// Avance de una precarga, también la carga de `asset-prefetch-progress`. `done` cuenta lo ya
+/// resuelto: `ok` (en disco, recién bajado o ya estaba), `missing` (el origen no lo tiene) y
+/// `errors`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefetchProgress {
+    pub done: usize,
+    pub total: usize,
+    pub ok: usize,
+    pub missing: usize,
+    pub errors: usize,
+}
+
+/// Resultado de `prefetch_assets`. `cancelled` si se detuvo o empezó otra precarga; `offline` si
+/// se cortó por errores de red seguidos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetPrefetchSummary {
+    #[serde(flatten)]
+    pub progress: PrefetchProgress,
+    pub cancelled: bool,
+    pub offline: bool,
+}
+
 pub struct CachedAsset {
     pub bytes: Vec<u8>,
     pub content_type: &'static str,
@@ -99,6 +152,8 @@ struct AssetRequest {
     upstream: String,
     file: PathBuf,
     immutable: bool,
+    /// CommunityDragon: la precarga le pide menos archivos a la vez.
+    community: bool,
     /// DataDragon (S3) responde 403, no 404, cuando falta un archivo: en una ruta versionada de
     /// ese origen, un 403 cuenta como faltante y se recuerda igual.
     forbidden_is_missing: bool,
@@ -110,9 +165,16 @@ pub struct AssetCache {
     /// `None` si no se pudo armar el cliente con la política de la caché: entonces no se descarga
     /// nada y solo se sirve lo que ya está en disco.
     client: Option<reqwest::Client>,
+    /// Turnos de las peticiones de la interfaz.
     downloads: Semaphore,
-    /// Un candado por archivo: las peticiones simultáneas esperan a la primera descarga.
+    /// Turnos de la precarga, aparte de `downloads`: uno para todo y otro para CommunityDragon.
+    prefetch_downloads: Semaphore,
+    prefetch_community: Semaphore,
+    /// Un candado por archivo: las peticiones simultáneas esperan a la primera descarga, también
+    /// la de la precarga y la de la interfaz por el mismo archivo.
     locks: Mutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>,
+    /// La precarga en curso: una sola a la vez.
+    prefetch_run: Mutex<Option<Arc<PrefetchRun>>>,
 }
 
 impl AssetCache {
@@ -139,25 +201,41 @@ impl AssetCache {
             origins,
             client,
             downloads: Semaphore::new(MAX_DOWNLOADS),
+            prefetch_downloads: Semaphore::new(MAX_PREFETCH),
+            prefetch_community: Semaphore::new(MAX_PREFETCH_COMMUNITY),
             locks: Mutex::default(),
+            prefetch_run: Mutex::default(),
         }
     }
 
     /// `path` es la ruta de la petición (`/ddragon/cdn/…`) con sus `%XX` tal como llegan.
     pub async fn get(&self, path: &str) -> Result<CachedAsset, AssetError> {
         let request = self.resolve(path)?;
+        self.locked(&request, Some(&self.downloads)).await
+    }
+
+    /// Resuelve el archivo con su candado. `downloads` limita la descarga; `None` si quien llama
+    /// ya tomó su turno antes de pedir el candado.
+    async fn locked(
+        &self,
+        request: &AssetRequest,
+        downloads: Option<&Semaphore>,
+    ) -> Result<CachedAsset, AssetError> {
         let lock = self.lock_for(&request.file);
         let result = {
             let _guard = lock.lock().await;
-            self.fetch(&request).await
+            self.fetch(request, downloads).await
         };
         self.release(&request.file, lock);
         result
     }
 
-    async fn fetch(&self, request: &AssetRequest) -> Result<CachedAsset, AssetError> {
-        let ttl = (!request.immutable).then_some(MUTABLE_TTL);
-        if let Some(bytes) = read_if_fresh(&request.file, ttl)? {
+    async fn fetch(
+        &self,
+        request: &AssetRequest,
+        downloads: Option<&Semaphore>,
+    ) -> Result<CachedAsset, AssetError> {
+        if let Some(bytes) = read_if_fresh(&request.file, request.ttl())? {
             return Ok(asset(request, bytes));
         }
         let missing = missing_marker(&request.file);
@@ -169,11 +247,10 @@ impl AssetCache {
         }
 
         let downloaded = {
-            let _permit = self
-                .downloads
-                .acquire()
-                .await
-                .map_err(|error| AssetError::Upstream(error.to_string()))?;
+            let _permit = match downloads {
+                Some(downloads) => Some(acquire(downloads).await?),
+                None => None,
+            };
             self.download(&request.upstream, request.forbidden_is_missing)
                 .await
         };
@@ -253,6 +330,7 @@ impl AssetCache {
             upstream: format!("{origin}/{}", encoded.join("/")),
             file,
             immutable,
+            community: source == "cdragon",
             // Por origen y no por URL: las pruebas apuntan `ddragon` a un servidor local.
             forbidden_is_missing: source == "ddragon" && immutable,
         })
@@ -274,6 +352,211 @@ impl AssetCache {
         // Solo el mapa y esta petición lo tienen: nadie más espera ese archivo.
         if Arc::strong_count(&lock) == 2 {
             locks.remove(file);
+        }
+    }
+
+    /// Baja `paths` (las mismas rutas que recibe `get`) para que la interfaz las encuentre en
+    /// disco, con hasta `MAX_PREFETCH` peticiones a la vez. Una sola precarga a la vez: empezar
+    /// otra corta la anterior, que vuelve con `cancelled`. `on_progress` recibe el avance como
+    /// máximo cada `PREFETCH_NOTICE_INTERVAL` y una vez al terminar, salvo si se cancela.
+    pub async fn prefetch(
+        self: &Arc<Self>,
+        paths: Vec<String>,
+        on_progress: impl Fn(PrefetchProgress) + Send + Sync + 'static,
+    ) -> AssetPrefetchSummary {
+        let workers = paths.len().min(MAX_PREFETCH);
+        let run = Arc::new(PrefetchRun::new(paths, Box::new(on_progress)));
+        let previous = self.current_prefetch().replace(Arc::clone(&run));
+        if let Some(previous) = previous {
+            previous.cancel();
+        }
+        // Cada tarea lleva un `Sender` que nunca envía: `recv` devuelve `None` cuando todas
+        // terminaron, también las que se cancelaron en pleno vuelo.
+        let (finished, mut all_finished) = mpsc::channel::<()>(1);
+        for _ in 0..workers {
+            let cache = Arc::clone(self);
+            let job = Arc::clone(&run);
+            let finished = finished.clone();
+            run.add_worker(tauri::async_runtime::spawn(async move {
+                let _finished = finished;
+                cache.prefetch_worker(&job).await;
+            }));
+        }
+        drop(finished);
+        while all_finished.recv().await.is_some() {}
+        {
+            let mut current = self.current_prefetch();
+            if current
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &run))
+            {
+                *current = None;
+            }
+        }
+        run.finish()
+    }
+
+    /// Detiene la precarga en curso, si hay una. Lo que ya está en disco se queda.
+    pub fn cancel_prefetch(&self) {
+        let run = self.current_prefetch().clone();
+        if let Some(run) = run {
+            run.cancel();
+        }
+    }
+
+    fn current_prefetch(&self) -> MutexGuard<'_, Option<Arc<PrefetchRun>>> {
+        self.prefetch_run
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    async fn prefetch_worker(&self, run: &PrefetchRun) {
+        while !run.stopped() {
+            let Some(path) = run.next_path() else { break };
+            let outcome = self.prefetch_one(path).await;
+            run.record(outcome);
+        }
+    }
+
+    /// Deja un archivo en disco sin leerlo ni devolverlo.
+    async fn prefetch_one(&self, path: &str) -> Result<(), AssetError> {
+        let request = self.resolve(path)?;
+        // Lo que ya está en disco no gasta turno ni candado: basta mirar sus metadatos.
+        if is_fresh(&request.file, request.ttl())? {
+            return Ok(());
+        }
+        // El turno se toma antes que el candado: esperarlo con el candado en la mano haría que
+        // la interfaz, al pedir ese mismo archivo, esperara detrás de la cola de la precarga.
+        let limit = if request.community {
+            &self.prefetch_community
+        } else {
+            &self.prefetch_downloads
+        };
+        let _turn = acquire(limit).await?;
+        self.locked(&request, None).await.map(drop)
+    }
+}
+
+/// Una precarga en curso. El estado, el aviso de avance y la cancelación comparten un mismo
+/// candado: tras `cancel` ya no sale ningún aviso de esta precarga, así que no se mezcla con el
+/// avance de la que la reemplaza.
+struct PrefetchRun {
+    paths: Vec<String>,
+    next: AtomicUsize,
+    state: Mutex<RunState>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+    on_progress: Box<dyn Fn(PrefetchProgress) + Send + Sync>,
+}
+
+#[derive(Default)]
+struct RunState {
+    ok: usize,
+    missing: usize,
+    errors: usize,
+    /// Errores de red desde el último archivo resuelto (o ausente).
+    network_errors: usize,
+    offline: bool,
+    cancelled: bool,
+    last_notice: Option<Instant>,
+}
+
+impl PrefetchRun {
+    fn new(paths: Vec<String>, on_progress: Box<dyn Fn(PrefetchProgress) + Send + Sync>) -> Self {
+        Self {
+            paths,
+            next: AtomicUsize::new(0),
+            state: Mutex::default(),
+            workers: Mutex::default(),
+            on_progress,
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, RunState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn progress(&self, state: &RunState) -> PrefetchProgress {
+        PrefetchProgress {
+            done: state.ok + state.missing + state.errors,
+            total: self.paths.len(),
+            ok: state.ok,
+            missing: state.missing,
+            errors: state.errors,
+        }
+    }
+
+    fn next_path(&self) -> Option<&str> {
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        self.paths.get(index).map(String::as_str)
+    }
+
+    fn stopped(&self) -> bool {
+        let state = self.state();
+        state.cancelled || state.offline
+    }
+
+    /// Un archivo resuelto. Solo los errores de red cuentan para dar la red por caída: una ruta
+    /// inválida o un fallo de disco no dicen nada de ella.
+    fn record(&self, outcome: Result<(), AssetError>) {
+        let mut state = self.state();
+        if state.cancelled {
+            return;
+        }
+        match outcome {
+            Ok(()) => {
+                state.ok += 1;
+                state.network_errors = 0;
+            }
+            Err(AssetError::NotFound) => {
+                state.missing += 1;
+                state.network_errors = 0;
+            }
+            Err(AssetError::Upstream(_)) => {
+                state.errors += 1;
+                state.network_errors += 1;
+                state.offline |= state.network_errors >= PREFETCH_OFFLINE_ERRORS;
+            }
+            Err(AssetError::InvalidPath | AssetError::Io(_)) => state.errors += 1,
+        }
+        let now = Instant::now();
+        if state
+            .last_notice
+            .is_none_or(|last| now.duration_since(last) >= PREFETCH_NOTICE_INTERVAL)
+        {
+            state.last_notice = Some(now);
+            (self.on_progress)(self.progress(&state));
+        }
+    }
+
+    /// Registra una tarea para poder cortarla. Si la precarga ya se canceló, la corta al instante.
+    fn add_worker(&self, worker: JoinHandle<()>) {
+        let mut workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.state().cancelled {
+            worker.abort();
+        }
+        workers.push(worker);
+    }
+
+    /// Corta las descargas en vuelo. Es seguro: `write_atomic` no tiene puntos de espera, así que
+    /// una tarea cortada nunca deja un archivo a medias.
+    fn cancel(&self) {
+        self.state().cancelled = true;
+        let workers = self.workers.lock().unwrap_or_else(PoisonError::into_inner);
+        for worker in workers.iter() {
+            worker.abort();
+        }
+    }
+
+    fn finish(&self) -> AssetPrefetchSummary {
+        let state = self.state();
+        let progress = self.progress(&state);
+        if !state.cancelled {
+            (self.on_progress)(progress);
+        }
+        AssetPrefetchSummary {
+            progress,
+            cancelled: state.cancelled,
+            offline: state.offline,
         }
     }
 }
@@ -354,11 +637,12 @@ fn asset(request: &AssetRequest, bytes: Vec<u8>) -> CachedAsset {
     }
 }
 
-fn read_if_fresh(file: &Path, ttl: Option<Duration>) -> io::Result<Option<Vec<u8>>> {
+/// Si el archivo existe y no venció, mirando solo sus metadatos: no lo lee.
+fn is_fresh(file: &Path, ttl: Option<Duration>) -> io::Result<bool> {
     let metadata = match fs::metadata(file) {
         Ok(metadata) if metadata.is_file() => metadata,
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
     if let Some(ttl) = ttl {
@@ -367,10 +651,25 @@ fn read_if_fresh(file: &Path, ttl: Option<Duration>) -> io::Result<Option<Vec<u8
             .ok()
             .and_then(|modified| SystemTime::now().duration_since(modified).ok());
         if age.is_none_or(|age| age > ttl) {
-            return Ok(None);
+            return Ok(false);
         }
     }
-    fs::read(file).map(Some)
+    Ok(true)
+}
+
+fn read_if_fresh(file: &Path, ttl: Option<Duration>) -> io::Result<Option<Vec<u8>>> {
+    if is_fresh(file, ttl)? {
+        fs::read(file).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+async fn acquire(semaphore: &Semaphore) -> Result<SemaphorePermit<'_>, AssetError> {
+    semaphore
+        .acquire()
+        .await
+        .map_err(|error| AssetError::Upstream(error.to_string()))
 }
 
 /// Escribe en un temporal y lo renombra: una descarga cortada nunca deja un archivo a medias.
@@ -560,11 +859,15 @@ mod tests {
         fs::File,
         io::{BufRead, BufReader, Write},
         net::{TcpListener, TcpStream},
-        sync::atomic::{AtomicBool, Ordering},
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
         thread,
     };
 
-    /// Origen HTTP local: rutas fijas, peticiones contadas por ruta y un modo sin red.
+    /// Origen HTTP local: rutas fijas, peticiones contadas por ruta, un modo sin red y una
+    /// compuerta que retiene las rutas con `/Stall` mientras esté cerrada.
     #[derive(Clone, Default)]
     struct Origin {
         routes: Arc<Mutex<HashMap<String, Vec<u8>>>>,
@@ -574,6 +877,11 @@ mod tests {
         statuses: Arc<Mutex<HashMap<String, &'static str>>>,
         hits: Arc<Mutex<HashMap<String, usize>>>,
         offline: Arc<AtomicBool>,
+        /// Mientras sea `true`, las rutas con `/Stall` no responden.
+        stalled: Arc<AtomicBool>,
+        /// Peticiones que el origen tiene abiertas ahora y el máximo que llegaron a ser a la vez.
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
     }
 
     impl Origin {
@@ -620,6 +928,14 @@ mod tests {
             self.hits.lock().unwrap().values().sum()
         }
 
+        fn active(&self) -> usize {
+            self.active.load(Ordering::SeqCst)
+        }
+
+        fn peak(&self) -> usize {
+            self.peak.load(Ordering::SeqCst)
+        }
+
         fn serve(&self, stream: TcpStream) {
             let Ok(reader_stream) = stream.try_clone() else {
                 return;
@@ -652,6 +968,11 @@ mod tests {
                 );
                 return;
             }
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            while path.contains("/Stall") && self.stalled.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(5));
+            }
             // Respuesta lenta a propósito para que las peticiones simultáneas se solapen.
             thread::sleep(Duration::from_millis(60));
             let fixed = self.statuses.lock().unwrap().get(&path).copied();
@@ -665,6 +986,9 @@ mod tests {
                     None => ("404 Not Found", Vec::new()),
                 }
             };
+            // Antes de responder: así quien recibe la respuesta nunca ve abiertas más peticiones
+            // de las que tiene.
+            self.active.fetch_sub(1, Ordering::SeqCst);
             let mut stream = stream;
             let _ = write!(
                 stream,
@@ -969,6 +1293,165 @@ mod tests {
         assert!(fresh.exists());
         assert!(folder.join("3020.png").is_file());
         assert!(missing_marker(&root.join(format!("cdragon{perks}"))).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Espera a que se cumpla algo que ocurre en otras tareas, sin suponer cuánto tardan.
+    fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let limit = Instant::now() + Duration::from_secs(20);
+        while !condition() {
+            assert!(Instant::now() < limit, "timed out waiting for {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// La precarga baja muchas imágenes a la vez, más que las que pide la interfaz, y sin tomar
+    /// los turnos de esta: abrir una partida no espera a la precarga, y si pide un archivo que la
+    /// precarga ya está bajando, comparten esa descarga. Lo ya cacheado no cuesta una petición, lo
+    /// que el origen no tiene se cuenta como faltante, una nueva precarga corta la anterior y la
+    /// red caída corta la precarga. El origen retiene las rutas `/Stall` para que nada dependa de
+    /// cuánto tarde cada tarea.
+    #[test]
+    fn prefetches_in_parallel_without_blocking_on_demand_requests() {
+        let (origin, base) = Origin::start();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("chronorift-prefetch-{unique}"));
+        let cache = Arc::new(cache_over(&root, &base));
+        let champion = |name: &str| format!("/cdn/16.18.1/img/champion/{name}.png");
+        let item = "/cdn/16.18.1/img/item/3020.png";
+        origin.route(item, b"item-png");
+        let cached = "/cdn/16.18.1/img/item/1001.png";
+        origin.route(cached, b"cached-png");
+        let stalled = (0..40)
+            .map(|number| champion(&format!("Stall{number}")))
+            .collect::<Vec<_>>();
+        for path in &stalled {
+            origin.route(path, b"champion-png");
+        }
+        run(cache.get(&format!("/ddragon{cached}"))).unwrap();
+        origin.stalled.store(true, Ordering::SeqCst);
+
+        // Cuarenta archivos retenidos, uno que el origen no tiene y uno que ya está en disco.
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut paths = vec![
+            format!("/ddragon{}", champion("Gone")),
+            format!("/ddragon{cached}"),
+        ];
+        paths.extend(stalled.iter().map(|path| format!("/ddragon{path}")));
+        let prefetch = {
+            let (cache, events) = (Arc::clone(&cache), Arc::clone(&events));
+            tauri::async_runtime::spawn(async move {
+                cache
+                    .prefetch(paths, move |progress| events.lock().unwrap().push(progress))
+                    .await
+            })
+        };
+
+        // Las 24 peticiones de la precarga se abren juntas (más que las 6 de la interfaz), no
+        // pasan de 24 aunque quede cola, y la interfaz conserva todos sus turnos.
+        wait_until("24 prefetch requests in flight", || {
+            origin.active() == MAX_PREFETCH
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(origin.peak(), MAX_PREFETCH);
+        assert_eq!(cache.downloads.available_permits(), MAX_DOWNLOADS);
+        assert_eq!(origin.hits(cached), 1);
+
+        // Con la precarga atascada, abrir una partida se resuelve igual. Y pedir un archivo que la
+        // precarga ya está bajando espera a esa descarga en lugar de repetirla.
+        let (sender, receiver) = mpsc::channel();
+        for path in [item.to_string(), stalled[0].clone()] {
+            let (cache, sender) = (Arc::clone(&cache), sender.clone());
+            tauri::async_runtime::spawn(async move {
+                let asset = cache.get(&format!("/ddragon{path}")).await;
+                let _ = sender.send((path, asset.map(|asset| asset.bytes)));
+            });
+        }
+        let (first, bytes) = receiver
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the on-demand request was queued behind the prefetch");
+        assert_eq!(
+            (first.as_str(), bytes.unwrap()),
+            (item, b"item-png".to_vec())
+        );
+        assert!(receiver.try_recv().is_err());
+
+        origin.stalled.store(false, Ordering::SeqCst);
+        let summary = run(prefetch).unwrap();
+        let (second, bytes) = receiver.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert_eq!(
+            (second.as_str(), bytes.unwrap()),
+            (stalled[0].as_str(), b"champion-png".to_vec())
+        );
+        assert_eq!(origin.hits(&stalled[0]), 1);
+        assert_eq!(origin.hits(cached), 1);
+        // La forma que recibe la interfaz.
+        assert_eq!(
+            serde_json::to_value(summary).unwrap(),
+            serde_json::json!({
+                "done": 42, "total": 42, "ok": 41, "missing": 1, "errors": 0,
+                "cancelled": false, "offline": false
+            })
+        );
+        // El último aviso es el resultado final y el avance nunca retrocede.
+        let events = events.lock().unwrap();
+        assert_eq!(events.last(), Some(&summary.progress));
+        assert!(events.windows(2).all(|pair| pair[0].done <= pair[1].done));
+        drop(events);
+
+        // Detenerla vuelve enseguida, con las peticiones todavía retenidas. Una nueva precarga
+        // corta la anterior y no espera a lo que esa dejó en el origen.
+        origin.stalled.store(true, Ordering::SeqCst);
+        let stalled_run = |name: &str| {
+            let paths = (0..30)
+                .map(|number| format!("/ddragon{}", champion(&format!("Stall{name}{number}"))))
+                .collect::<Vec<_>>();
+            let cache = Arc::clone(&cache);
+            tauri::async_runtime::spawn(async move { cache.prefetch(paths, |_| {}).await })
+        };
+        let stopped = stalled_run("A");
+        wait_until("the first run to start", || {
+            origin.hits(&champion("StallA0")) == 1
+        });
+        cache.cancel_prefetch();
+        let stopped = run(stopped).unwrap();
+        assert!(stopped.cancelled && !stopped.offline);
+        assert_eq!((stopped.progress.done, stopped.progress.total), (0, 30));
+
+        let replaced = stalled_run("B");
+        wait_until("the second run to start", || {
+            origin.hits(&champion("StallB0")) == 1
+        });
+        let ordinary = (0..3)
+            .map(|number| {
+                let path = champion(&format!("Plain{number}"));
+                origin.route(&path, b"champion-png");
+                format!("/ddragon{path}")
+            })
+            .collect::<Vec<_>>();
+        let replacement = run(cache.prefetch(ordinary, |_| {}));
+        assert_eq!((replacement.progress.ok, replacement.cancelled), (3, false));
+        let replaced = run(replaced).unwrap();
+        assert!(replaced.cancelled && replaced.progress.done < 30);
+        origin.stalled.store(false, Ordering::SeqCst);
+
+        // Con la red caída, 12 errores seguidos cortan la precarga sin recorrer toda la lista.
+        origin.offline.store(true, Ordering::SeqCst);
+        let paths = (0..60)
+            .map(|number| {
+                let path = champion(&format!("Offline{number}"));
+                origin.route(&path, b"champion-png");
+                format!("/ddragon{path}")
+            })
+            .collect::<Vec<_>>();
+        let offline = run(cache.prefetch(paths, |_| {}));
+        assert!(offline.offline && !offline.cancelled);
+        assert!(offline.progress.done < offline.progress.total);
+        assert_eq!(offline.progress.errors, offline.progress.done);
+        assert!(!missing_marker(&root.join(format!("ddragon{}", champion("Offline0")))).exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -46,8 +46,12 @@
       "nsis": {
         "template": "windows/installer.nsi",
         "installMode": "currentUser",
-        "languages": ["Spanish"],
-        "customLanguageFiles": { "Spanish": "windows/spanish.nsh" },
+        "languages": ["Spanish", "English"],
+        "displayLanguageSelector": true,
+        "customLanguageFiles": {
+          "Spanish": "windows/spanish.nsh",
+          "English": "windows/english.nsh"
+        },
         "installerIcon": "icons/icon.ico"
       }
     }

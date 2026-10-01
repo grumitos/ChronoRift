@@ -183,9 +183,30 @@ export type LocalClientStatus = {
   totalInstallBytes: number | null;
 };
 
+export type Language = "es" | "en";
+
 export type AppSettings = {
   clientsRoot: string | null;
   downloadConnections?: number | null;
   /** Imágenes de los parches: de una vez (`true`) o al abrir cada partida (`false`); sin valor, sin preguntar. */
   assetPrefetch?: boolean | null;
+  /** Idioma elegido; `null` si nunca se eligió (se pregunta en la pantalla de inicio). */
+  language?: Language | null;
+  /** Idioma del sistema, para preseleccionar la pregunta y mientras no haya uno elegido. */
+  systemLanguage?: Language;
+};
+
+/** Avance de `prefetch_assets` (evento `asset-prefetch-progress`). */
+export type AssetPrefetchProgress = {
+  done: number;
+  total: number;
+  ok: number;
+  missing: number;
+  errors: number;
+};
+
+/** Resultado de `prefetch_assets`: cancelada con `cancel_asset_prefetch` o cortada sin conexión. */
+export type AssetPrefetchResult = AssetPrefetchProgress & {
+  cancelled: boolean;
+  offline: boolean;
 };

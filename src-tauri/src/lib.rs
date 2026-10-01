@@ -1,5 +1,6 @@
 mod asset_cache;
 mod client;
+mod i18n;
 mod launcher;
 mod library;
 mod rofl;
@@ -10,6 +11,7 @@ use rofl::ReplayInspection;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use tauri::{Emitter, Manager};
 
@@ -53,7 +55,12 @@ async fn launch_replay(
             let _ = app.emit(launcher::REPLAY_EXITED_EVENT, exited);
         })
         .map_err(|err| {
-            format!("El juego se inició, pero ChronoRift no podrá saber cuándo se cierra: {err}")
+            tr!(
+                format!(
+                    "El juego se inició, pero ChronoRift no podrá saber cuándo se cierra: {err}"
+                ),
+                format!("The game started, but ChronoRift will not know when it closes: {err}")
+            )
         })
     })
     .await
@@ -124,9 +131,14 @@ async fn list_clients(clients_root: String) -> Result<Vec<client::LocalClientSta
 }
 
 #[tauri::command]
-async fn get_settings(app: tauri::AppHandle) -> Result<settings::AppSettings, String> {
+async fn get_settings(app: tauri::AppHandle) -> Result<settings::SettingsView, String> {
     let file = settings_path(&app)?;
-    blocking(move || settings::load(&file).map_err(|err| err.to_string())).await
+    blocking(move || {
+        settings::load(&file)
+            .map(settings::SettingsView::from)
+            .map_err(|err| err.to_string())
+    })
+    .await
 }
 
 /// Guarda la carpeta de clientes. No crea la carpeta: eso solo ocurre al confirmar una instalación.
@@ -135,13 +147,14 @@ async fn get_settings(app: tauri::AppHandle) -> Result<settings::AppSettings, St
 async fn set_clients_root(
     app: tauri::AppHandle,
     path: String,
-) -> Result<settings::AppSettings, String> {
+) -> Result<settings::SettingsView, String> {
     let file = settings_path(&app)?;
     blocking(move || {
         let root = settings::normalize_clients_root(&path).map_err(|err| err.to_string())?;
         settings::update(&file, |settings| {
             settings.clients_root = Some(root.display().to_string());
         })
+        .map(settings::SettingsView::from)
         .map_err(|err| err.to_string())
     })
     .await
@@ -153,13 +166,55 @@ async fn set_clients_root(
 async fn set_asset_prefetch(
     app: tauri::AppHandle,
     enabled: bool,
-) -> Result<settings::AppSettings, String> {
+) -> Result<settings::SettingsView, String> {
     let file = settings_path(&app)?;
     blocking(move || {
         settings::update(&file, |settings| settings.asset_prefetch = Some(enabled))
+            .map(settings::SettingsView::from)
             .map_err(|err| err.to_string())
     })
     .await
+}
+
+/// Guarda el idioma de la app y lo aplica a los textos que el backend genera desde ese momento.
+/// Lo ya generado (los fallos de una biblioteca escaneada, por ejemplo) conserva el idioma con que
+/// se generó hasta volver a leerlo.
+#[tauri::command]
+async fn set_language(
+    app: tauri::AppHandle,
+    language: i18n::Language,
+) -> Result<settings::SettingsView, String> {
+    let file = settings_path(&app)?;
+    blocking(move || {
+        let saved = settings::update(&file, |settings| settings.language = Some(language))
+            .map_err(|err| err.to_string())?;
+        i18n::set(language);
+        Ok(settings::SettingsView::from(saved))
+    })
+    .await
+}
+
+/// Baja de una vez las imágenes y datos de `paths` (las rutas del esquema `lolasset`) a la caché
+/// en disco. Avisa con `asset-prefetch-progress`; vuelve al terminar, al cancelarla o si la red cae.
+#[tauri::command]
+async fn prefetch_assets(
+    app: tauri::AppHandle,
+    paths: Vec<String>,
+    cache: tauri::State<'_, Arc<asset_cache::AssetCache>>,
+) -> Result<asset_cache::AssetPrefetchSummary, String> {
+    let cache = Arc::clone(cache.inner());
+    Ok(cache
+        .prefetch(paths, move |progress| {
+            // Si la app se está cerrando, no queda a quién avisar.
+            let _ = app.emit(asset_cache::PREFETCH_PROGRESS_EVENT, progress);
+        })
+        .await)
+}
+
+/// Detiene la precarga en curso: la llamada a `prefetch_assets` vuelve con `cancelled`.
+#[tauri::command]
+fn cancel_asset_prefetch(cache: tauri::State<'_, Arc<asset_cache::AssetCache>>) {
+    cache.cancel_prefetch();
 }
 
 /// Los comandos sincrónicos corren en el hilo principal: el trabajo de disco va al pool bloqueante
@@ -169,14 +224,24 @@ async fn blocking<T: Send + 'static>(
 ) -> Result<T, String> {
     tauri::async_runtime::spawn_blocking(work)
         .await
-        .map_err(|error| format!("Falló una tarea interna: {error}"))?
+        .map_err(|error| {
+            tr!(
+                format!("Falló una tarea interna: {error}"),
+                format!("An internal task failed: {error}")
+            )
+        })?
 }
 
 fn settings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
         .map(|dir| dir.join(settings::SETTINGS_FILE))
-        .map_err(|err| format!("Sin carpeta de configuración: {err}"))
+        .map_err(|err| {
+            tr!(
+                format!("Sin carpeta de configuración: {err}"),
+                format!("No settings folder: {err}")
+            )
+        })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -187,11 +252,19 @@ pub fn run() {
         .manage(client::CancelSignal::default())
         .manage(library::ReplayCache::default())
         .setup(|app| {
+            // Con el archivo ilegible o sin idioma elegido todavía rige el del sistema. Nunca se
+            // devuelve ese error: la app tiene que abrir igual.
+            let saved = settings_path(app.handle())
+                .ok()
+                .and_then(|file| settings::load(&file).ok())
+                .and_then(|settings| settings.language);
+            i18n::set(saved.unwrap_or_else(i18n::system_language));
             let root = app.path().app_cache_dir()?.join("assets");
             // Temporales de una escritura cortada en una ejecución anterior, sin frenar el inicio.
             let stale = root.clone();
             tauri::async_runtime::spawn_blocking(move || asset_cache::remove_stale_temps(&stale));
-            app.manage(asset_cache::AssetCache::new(root));
+            // Con `Arc` porque la precarga reparte la caché entre tareas.
+            app.manage(Arc::new(asset_cache::AssetCache::new(root)));
             Ok(())
         })
         // Asíncrono: una descarga nunca bloquea el hilo principal.
@@ -207,7 +280,7 @@ pub fn run() {
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
                 tauri::async_runtime::spawn(async move {
-                    let result = match app.try_state::<asset_cache::AssetCache>() {
+                    let result = match app.try_state::<Arc<asset_cache::AssetCache>>() {
                         Some(cache) => cache.get(&path).await,
                         None => Err(asset_cache::AssetError::Upstream(
                             "asset cache not ready".to_string(),
@@ -229,7 +302,10 @@ pub fn run() {
             list_clients,
             get_settings,
             set_clients_root,
-            set_asset_prefetch
+            set_asset_prefetch,
+            set_language,
+            prefetch_assets,
+            cancel_asset_prefetch
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -27,6 +27,14 @@
         opacity: 0;
       }
 
+      /* Los botones de la ventana quedan por encima de la pantalla de inicio desde la primera
+         pintura (sus iconos ya vienen en el HTML): se puede minimizar, maximizar o cerrar mientras
+         carga y durante la primera configuración. */
+      .window-controls {
+        position: relative;
+        z-index: 31;
+      }
+
       /* El logo queda en el mismo sitio al pasar de la carga a la pregunta o al progreso. */
       .splash__logo {
         position: absolute;
@@ -100,37 +108,47 @@
         <path d="M17.65 7.9V16.1L12.65 12Z" />
       </svg>
       <div class="splash__body">
-        <span class="dots" id="splash-dots" role="status" aria-label="Cargando"><span></span><span></span><span></span></span>
+        <span class="dots" id="splash-dots" role="status" aria-label="Cargando" data-i18n-aria="loading"><span></span><span></span><span></span></span>
         <section class="splash__panel" id="splash-ask" role="dialog" aria-labelledby="splash-ask-title" hidden>
-          <h1 class="splash__title" id="splash-ask-title">¿Descargar todas las imágenes ahora?</h1>
-          <p class="splash__data mono" id="splash-ask-data"></p>
-          <div class="splash__actions">
-            <button type="button" class="button" id="prefetch-later">Al abrir cada partida</button>
-            <button type="button" class="button button--primary" id="prefetch-all">
-              <span data-icon="download" class="icon icon--sm"></span>
-              Descargar todo
-            </button>
+          <div class="splash__language" id="setup-language">
+            <span class="splash__label" id="setup-language-label" data-i18n="setupLanguage">Idioma</span>
+            <div class="segmented splash__languages" role="group" aria-labelledby="setup-language-label" id="setup-languages">
+              <button type="button" data-language="es" lang="es" aria-pressed="false">Español</button>
+              <button type="button" data-language="en" lang="en" aria-pressed="false">English</button>
+            </div>
+          </div>
+          <button type="button" class="button button--primary splash__continue" id="setup-continue" data-i18n="continue" hidden>Continuar</button>
+          <div class="splash__images" id="setup-images">
+            <h1 class="splash__title" id="splash-ask-title" data-i18n="askImages">¿Descargar todas las imágenes ahora?</h1>
+            <p class="splash__data mono" id="splash-ask-data"></p>
+            <div class="splash__actions">
+              <button type="button" class="button" id="prefetch-later" data-i18n="prefetchOnOpen">Al abrir cada partida</button>
+              <button type="button" class="button button--primary" id="prefetch-all">
+                <span data-icon="download" class="icon icon--sm"></span>
+                <span data-i18n="prefetchAll">Descargar todo</span>
+              </button>
+            </div>
           </div>
         </section>
         <section class="splash__panel" id="splash-progress" role="dialog" aria-labelledby="splash-progress-title" hidden>
-          <h1 class="splash__label" id="splash-progress-title">Descargando imágenes</h1>
+          <h1 class="splash__label" id="splash-progress-title" data-i18n="downloadingImages">Descargando imágenes</h1>
           <span class="splash__percent" id="splash-percent" role="status">0 %</span>
           <span class="meter splash__meter" role="progressbar" aria-labelledby="splash-progress-title" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="splash-track"><span class="meter__fill" id="splash-bar"></span></span>
           <p class="splash__data mono" id="splash-patches"></p>
-          <button type="button" class="button splash__continue" id="prefetch-continue">Continuar</button>
+          <button type="button" class="button splash__continue" id="prefetch-continue" data-i18n="continue">Continuar</button>
         </section>
       </div>
     </div>
-    <a class="skip-link" href="#main-content">Ir al contenido</a>
+    <a class="skip-link" href="#main-content" data-i18n="skipToContent">Ir al contenido</a>
     <div class="app">
       <header class="appbar" data-tauri-drag-region>
         <div class="brand" data-tauri-drag-region>
           <span data-icon="logo" class="brand__mark"></span>
           <span class="brand__name" translate="no">ChronoRift</span>
         </div>
-        <nav class="appbar__nav" aria-label="Secciones">
-          <button type="button" class="nav-item" data-view="library">Biblioteca</button>
-          <button type="button" class="nav-item" data-view="clients">Clientes</button>
+        <nav class="appbar__nav" aria-label="Secciones" data-i18n-aria="sections">
+          <button type="button" class="nav-item" data-view="library" data-i18n="library">Biblioteca</button>
+          <button type="button" class="nav-item" data-view="clients" data-i18n="clients">Clientes</button>
         </nav>
         <div class="appbar__end">
           <button type="button" class="activity" id="activity" data-action="show-progress" hidden>
@@ -139,6 +157,7 @@
             <span class="mono" id="activity-build">—</span>
             <span class="meter meter--mini" aria-hidden="true"><span class="meter__fill" id="activity-bar"></span></span>
             <span class="activity__percent mono" id="activity-percent">—</span>
+            <span class="activity__speed mono" id="activity-speed" hidden>—</span>
           </button>
           <button type="button" class="storage-chip" id="storage-chip" data-view="clients">
             <span data-icon="drive" class="icon icon--sm"></span>
@@ -146,49 +165,50 @@
           </button>
         </div>
         <div class="window-controls">
-          <button type="button" class="window-control" id="window-minimize" aria-label="Minimizar" title="Minimizar">
-            <span data-icon="minimize"></span>
+          <!-- Iconos en línea (los mismos de dom.ts): se ven antes de que cargue la interfaz. -->
+          <button type="button" class="window-control" id="window-minimize" aria-label="Minimizar" title="Minimizar" data-i18n-aria="minimize" data-i18n-title="minimize">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14" /></svg>
           </button>
           <button type="button" class="window-control" id="window-maximize" aria-label="Maximizar" title="Maximizar">
-            <span data-icon="maximize"></span>
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5.5" y="5.5" width="13" height="13" rx="1.5" /></svg>
           </button>
-          <button type="button" class="window-control window-control--close" id="window-close" aria-label="Cerrar" title="Cerrar">
-            <span data-icon="close"></span>
+          <button type="button" class="window-control window-control--close" id="window-close" aria-label="Cerrar" title="Cerrar" data-i18n-aria="close" data-i18n-title="close">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
           </button>
         </div>
       </header>
 
       <div class="view view--library" id="library-view">
-        <aside class="library" aria-label="Biblioteca">
+        <aside class="library" aria-label="Biblioteca" data-i18n-aria="library">
           <div class="library__head">
             <div class="library__title">
-              <h2>Biblioteca</h2>
+              <h2 data-i18n="library">Biblioteca</h2>
               <span class="count mono" id="replay-count" hidden>0</span>
               <div class="library__tools">
-                <button type="button" class="icon-button" id="refresh-library" aria-label="Actualizar" title="Actualizar" disabled>
+                <button type="button" class="icon-button" id="refresh-library" aria-label="Actualizar" title="Actualizar" data-i18n-aria="refresh" data-i18n-title="refresh" disabled>
                   <span data-icon="refresh"></span>
                 </button>
-                <button type="button" class="icon-button" id="open-library" aria-label="Abrir carpeta" title="Abrir carpeta">
+                <button type="button" class="icon-button" id="open-library" aria-label="Abrir carpeta" title="Abrir carpeta" data-i18n-aria="openFolder" data-i18n-title="openFolder">
                   <span data-icon="folder"></span>
                 </button>
               </div>
             </div>
             <div class="library__path mono" id="folder-path" hidden></div>
             <label class="search">
-              <span class="sr-only">Buscar</span>
+              <span class="sr-only" data-i18n="search">Buscar</span>
               <span data-icon="search" class="search__icon"></span>
-              <input id="replay-search" type="search" placeholder="Buscar" autocomplete="off" spellcheck="false" disabled />
+              <input id="replay-search" type="search" placeholder="Buscar" data-i18n-placeholder="search" autocomplete="off" spellcheck="false" disabled />
             </label>
-            <div class="segmented" role="group" aria-label="Resultado" id="result-filter" hidden>
-              <button type="button" data-filter="all" aria-pressed="true">Todas <span class="mono" data-count="all">0</span></button>
-              <button type="button" data-filter="win" aria-pressed="false">Victorias <span class="mono" data-count="win">0</span></button>
-              <button type="button" data-filter="loss" aria-pressed="false">Derrotas <span class="mono" data-count="loss">0</span></button>
+            <div class="segmented" role="group" aria-label="Resultado" data-i18n-aria="result" id="result-filter" hidden>
+              <button type="button" data-filter="all" aria-pressed="true"><span class="segmented__label" data-i18n="filterAll">Todas</span> <span class="mono" data-count="all">0</span></button>
+              <button type="button" data-filter="win" aria-pressed="false"><span class="segmented__label" data-i18n="filterWins">Victorias</span> <span class="mono" data-count="win">0</span></button>
+              <button type="button" data-filter="loss" aria-pressed="false"><span class="segmented__label" data-i18n="filterLosses">Derrotas</span> <span class="mono" data-count="loss">0</span></button>
             </div>
           </div>
           <div class="library__list" id="library-list" hidden></div>
           <div class="library__empty" id="library-empty">
             <p id="library-empty-text">Sin carpeta</p>
-            <button type="button" class="button button--primary" data-action="open-library">Abrir carpeta</button>
+            <button type="button" class="button button--primary" data-action="open-library" data-i18n="openFolder">Abrir carpeta</button>
           </div>
           <footer class="library__foot">
             <span class="library__owner" id="library-owner" hidden>
@@ -216,26 +236,26 @@
                   <h1 class="score" id="score">
                     <span class="score__team">
                       <span class="score__value" id="blue-score">0</span>
-                      <span class="score__label score__label--blue">AZUL</span>
+                      <span class="score__label score__label--blue" data-i18n="blueUpper">AZUL</span>
                     </span>
                     <span class="score__dash" aria-hidden="true">–</span>
                     <span class="score__team">
                       <span class="score__value" id="red-score">0</span>
-                      <span class="score__label score__label--red">ROJO</span>
+                      <span class="score__label score__label--red" data-i18n="redUpper">ROJO</span>
                     </span>
                   </h1>
                 </div>
 
                 <dl class="facts">
-                  <div><dt>Descargada</dt><dd class="mono" id="match-date">—</dd></div>
-                  <div><dt>Duración</dt><dd class="mono" id="duration">—</dd></div>
-                  <div><dt>Parche</dt><dd class="mono" id="patch">—</dd></div>
-                  <div><dt>Región</dt><dd class="mono" id="region">—</dd></div>
+                  <div><dt data-i18n="downloaded">Descargada</dt><dd class="mono" id="match-date">—</dd></div>
+                  <div><dt data-i18n="duration">Duración</dt><dd class="mono" id="duration">—</dd></div>
+                  <div><dt data-i18n="patch">Parche</dt><dd class="mono" id="patch">—</dd></div>
+                  <div><dt data-i18n="region">Región</dt><dd class="mono" id="region">—</dd></div>
                   <div>
-                    <dt>Partida</dt>
+                    <dt data-i18n="match">Partida</dt>
                     <dd class="mono facts__id">
                       <button type="button" class="facts__link" id="match-id" disabled>—</button>
-                      <button type="button" class="icon-button icon-button--xs" id="copy-match-id" aria-label="Copiar ID de partida" title="Copiar ID de partida">
+                      <button type="button" class="icon-button icon-button--xs" id="copy-match-id" aria-label="Copiar ID de partida" title="Copiar ID de partida" data-i18n-aria="copyMatchId" data-i18n-title="copyMatchId">
                         <span data-icon="copy"></span>
                       </button>
                     </dd>
@@ -245,35 +265,38 @@
 
               <div class="client-strip">
                 <div class="client-strip__item client-strip__item--status">
-                  <span class="client-strip__label">Estado</span>
+                  <span class="client-strip__label" data-i18n="status">Estado</span>
                   <span class="client-strip__status" id="client-status" role="status">
                     <span class="glyph" id="client-glyph" data-state="missing"></span>
                     <span id="client-status-text">—</span>
-                    <span class="meter meter--mini" id="client-progress" aria-hidden="true" hidden><span class="meter__fill" id="client-progress-bar"></span></span>
+                    <span class="client-strip__progress" id="client-progress" aria-hidden="true" hidden>
+                      <span class="meter meter--mini"><span class="meter__fill" id="client-progress-bar"></span></span>
+                      <span class="client-strip__speed mono" id="client-speed"></span>
+                    </span>
                   </span>
                 </div>
                 <div class="client-strip__item">
                   <span class="client-strip__label">Build</span>
                   <span class="client-strip__build">
                     <span class="client-strip__value mono" id="version">—</span>
-                    <span class="chip chip--outline chip--sm is-warn" id="version-inexact" hidden>no exacta</span>
+                    <span class="chip chip--outline chip--sm is-warn" id="version-inexact" data-i18n="notExact" hidden>no exacta</span>
                   </span>
                 </div>
                 <div class="client-strip__item client-strip__item--location">
-                  <span class="client-strip__label">Ubicación</span>
+                  <span class="client-strip__label" data-i18n="location">Ubicación</span>
                   <span class="client-strip__path">
                     <span class="client-strip__location mono ellipsis" id="client-location">—</span>
-                    <button type="button" class="icon-button icon-button--xs" id="reveal-client" aria-label="Abrir carpeta" title="Abrir carpeta" hidden>
+                    <button type="button" class="icon-button icon-button--xs" id="reveal-client" aria-label="Abrir carpeta" title="Abrir carpeta" data-i18n-aria="openFolder" data-i18n-title="openFolder" hidden>
                       <span data-icon="folder" class="icon--sm"></span>
                     </button>
                   </span>
                 </div>
                 <div class="client-strip__item">
-                  <span class="client-strip__label">Idioma</span>
+                  <span class="client-strip__label" data-i18n="language">Idioma</span>
                   <span class="client-strip__value mono" id="client-locale">—</span>
                 </div>
                 <div class="client-strip__actions">
-                  <button type="button" class="button button--square" id="choose-executable" aria-label="Elegir ejecutable" title="Elegir ejecutable">
+                  <button type="button" class="button button--square" id="choose-executable" aria-label="Elegir ejecutable" title="Elegir ejecutable" data-i18n-aria="chooseExecutable" data-i18n-title="chooseExecutable">
                     <span data-icon="exe"></span>
                   </button>
                   <button type="button" class="button client-strip__action" id="client-action" hidden>
@@ -282,22 +305,23 @@
                   </button>
                   <button type="button" class="button button--brand button--play" id="play-replay" disabled>
                     <span data-icon="play"></span>
-                    Reproducir
+                    <span data-i18n="play">Reproducir</span>
                   </button>
                 </div>
               </div>
               <p class="client-error mono" id="client-error" role="alert" hidden></p>
+              <p class="client-note" id="client-note" role="status" hidden></p>
 
-              <nav class="tabs" aria-label="Vistas de la partida">
-                <button type="button" class="tab" data-tab="board" aria-pressed="true">Marcador</button>
-                <button type="button" class="tab" data-tab="stats" aria-pressed="false">Estadísticas</button>
-                <button type="button" class="tab" data-tab="file" aria-pressed="false">Archivo</button>
+              <nav class="tabs" aria-label="Vistas de la partida" data-i18n-aria="matchViews">
+                <button type="button" class="tab" data-tab="board" aria-pressed="true" data-i18n="scoreboard">Marcador</button>
+                <button type="button" class="tab" data-tab="stats" aria-pressed="false" data-i18n="stats">Estadísticas</button>
+                <button type="button" class="tab" data-tab="file" aria-pressed="false" data-i18n="file">Archivo</button>
                 <div class="replay-caption">
                   <span data-icon="file" class="replay-caption__icon"></span>
                   <span class="replay-caption__name mono ellipsis" id="file-name">—</span>
                   <span aria-hidden="true">·</span>
                   <span class="replay-caption__size mono" id="file-size">—</span>
-                  <button type="button" class="icon-button icon-button--sm" data-action="reveal-replay" aria-label="Mostrar en carpeta" title="Mostrar en carpeta">
+                  <button type="button" class="icon-button icon-button--sm" data-action="reveal-replay" aria-label="Mostrar en carpeta" title="Mostrar en carpeta" data-i18n-aria="showInFolder" data-i18n-title="showInFolder">
                     <span data-icon="folder" class="icon--sm"></span>
                   </button>
                 </div>
@@ -305,58 +329,58 @@
             </header>
 
             <div class="match__body">
-              <section class="scoreboard" id="panel-board" aria-label="Marcador">
+              <section class="scoreboard" id="panel-board" aria-label="Marcador" data-i18n-aria="scoreboard">
                 <div class="sb-row sb-row--head" aria-hidden="true">
                   <span></span>
-                  <span>Jugador</span>
+                  <span data-i18n="player">Jugador</span>
                   <span class="sb-col--loadout"></span>
                   <span>KDA</span>
                   <span class="sb-col--kp num">KP</span>
-                  <span>Daño</span>
-                  <span class="num">Oro</span>
+                  <span data-i18n="damage">Daño</span>
+                  <span class="num" data-i18n="gold">Oro</span>
                   <span class="num">CS</span>
-                  <span class="sb-col--vision num">Visión</span>
-                  <span>Objetos</span>
+                  <span class="sb-col--vision num" data-i18n="vision">Visión</span>
+                  <span data-i18n="items">Objetos</span>
                 </div>
                 <div id="teams"></div>
               </section>
 
-              <section class="stats" id="panel-stats" aria-label="Estadísticas" hidden>
+              <section class="stats" id="panel-stats" aria-label="Estadísticas" data-i18n-aria="stats" hidden>
                 <p class="muted" id="stats-empty" hidden>Sin estadísticas</p>
                 <div class="stats__top" id="stats-top">
                   <div class="stats__panel">
-                    <h3>Equipos</h3>
-                    <div class="compare-head" aria-hidden="true"><span></span><span class="num">AZUL</span><span></span><span>ROJO</span></div>
+                    <h3 data-i18n="teams">Equipos</h3>
+                    <div class="compare-head" aria-hidden="true"><span></span><span class="num" data-i18n="blueUpper">AZUL</span><span></span><span data-i18n="redUpper">ROJO</span></div>
                     <div id="team-compare"></div>
                   </div>
                   <div class="stats__panel">
                     <div class="stats__panel-head">
-                      <h3>Daño a campeones</h3>
-                      <ul class="legend" aria-label="Leyenda">
-                        <li><span class="swatch swatch--physical"></span>Físico</li>
-                        <li><span class="swatch swatch--magic"></span>Mágico</li>
-                        <li><span class="swatch swatch--true"></span>Verdadero</li>
+                      <h3 data-i18n="damageToChampions">Daño a campeones</h3>
+                      <ul class="legend" aria-label="Leyenda" data-i18n-aria="legend">
+                        <li><span class="swatch swatch--physical"></span><span data-i18n="physical">Físico</span></li>
+                        <li><span class="swatch swatch--magic"></span><span data-i18n="magic">Mágico</span></li>
+                        <li><span class="swatch swatch--true"></span><span data-i18n="trueDamage">Verdadero</span></li>
                       </ul>
                     </div>
                     <div id="damage-chart"></div>
                   </div>
                 </div>
                 <div class="stats__panel" id="stats-players">
-                  <h3>Jugadores</h3>
+                  <h3 data-i18n="players">Jugadores</h3>
                   <div class="ptable" id="player-table"></div>
                 </div>
               </section>
 
-              <section class="file-panel" id="panel-file" aria-label="Archivo" hidden>
+              <section class="file-panel" id="panel-file" aria-label="Archivo" data-i18n-aria="file" hidden>
                 <dl class="file-facts" id="file-facts"></dl>
                 <div class="file-panel__actions">
                   <button type="button" class="button" data-action="reveal-replay">
                     <span data-icon="folder" class="icon icon--sm"></span>
-                    Mostrar en carpeta
+                    <span data-i18n="showInFolder">Mostrar en carpeta</span>
                   </button>
                   <button type="button" class="button" id="copy-path">
                     <span data-icon="copy" class="icon icon--sm"></span>
-                    Copiar ruta
+                    <span data-i18n="copyPath">Copiar ruta</span>
                   </button>
                 </div>
               </section>
@@ -370,7 +394,7 @@
                 <h2 id="drawer-title">Preparar cliente</h2>
                 <span class="muted" id="drawer-subtitle"></span>
               </div>
-              <button type="button" class="icon-button" id="drawer-close" aria-label="Cerrar" title="Cerrar">
+              <button type="button" class="icon-button" id="drawer-close" aria-label="Cerrar" title="Cerrar" data-i18n-aria="close" data-i18n-title="close">
                 <span data-icon="close"></span>
               </button>
             </header>
@@ -386,23 +410,23 @@
               <div id="plan-view">
                 <dl class="kv">
                   <div class="kv__row kv__row--stack">
-                    <dt>Destino</dt>
+                    <dt data-i18n="destination">Destino</dt>
                     <dd class="kv__inline">
                       <span class="mono ellipsis" id="plan-destination">—</span>
-                      <button type="button" class="button button--sm" id="plan-change-root">Cambiar…</button>
+                      <button type="button" class="button button--sm" id="plan-change-root" data-i18n="change">Cambiar…</button>
                     </dd>
                   </div>
                   <div class="kv__row kv__row--stack">
-                    <dt><label for="locale">Idioma</label></dt>
+                    <dt><label for="locale" data-i18n="language">Idioma</label></dt>
                     <dd class="select-field">
                       <select id="locale" class="select mono"></select>
                       <span data-icon="chevron" class="select-field__icon"></span>
                     </dd>
                   </div>
-                  <div class="kv__row"><dt>Archivos</dt><dd class="mono" id="plan-file-count">—</dd></div>
-                  <div class="kv__row"><dt>Descarga</dt><dd class="mono" id="plan-download-size">—</dd></div>
-                  <div class="kv__row"><dt>En disco</dt><dd class="mono" id="plan-install-size">—</dd></div>
-                  <div class="kv__row"><dt>Fuente</dt><dd class="mono" id="plan-source">—</dd></div>
+                  <div class="kv__row"><dt data-i18n="files">Archivos</dt><dd class="mono" id="plan-file-count">—</dd></div>
+                  <div class="kv__row"><dt data-i18n="download">Descarga</dt><dd class="mono" id="plan-download-size">—</dd></div>
+                  <div class="kv__row"><dt data-i18n="onDisk">En disco</dt><dd class="mono" id="plan-install-size">—</dd></div>
+                  <div class="kv__row"><dt data-i18n="source">Fuente</dt><dd class="mono" id="plan-source">—</dd></div>
                 </dl>
               </div>
 
@@ -410,36 +434,39 @@
                 <div class="progress">
                   <div class="progress__line">
                     <span class="progress__percent" id="progress-percent" role="status">—</span>
-                    <span class="mono muted" id="progress-bytes"></span>
+                    <span class="progress__numbers mono muted">
+                      <span id="progress-bytes"></span>
+                      <span id="progress-rate"></span>
+                    </span>
                   </div>
-                  <div class="meter" role="progressbar" aria-label="Progreso de la descarga" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-track">
+                  <div class="meter" role="progressbar" aria-label="Progreso de la descarga" data-i18n-aria="downloadProgress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-track">
                     <span class="meter__fill" id="progress-bar"></span>
                   </div>
                   <span class="progress__file mono muted ellipsis" id="progress-file"></span>
                 </div>
                 <ol class="stages" id="stages">
-                  <li data-stage="resolve">Resolver versión</li>
-                  <li data-stage="manifest">Leer manifiesto</li>
-                  <li data-stage="plan">Comparar archivos</li>
-                  <li data-stage="download">Descargar</li>
-                  <li data-stage="complete">Listo</li>
+                  <li data-stage="resolve" data-i18n="stageResolve">Resolver versión</li>
+                  <li data-stage="manifest" data-i18n="stageManifest">Leer manifiesto</li>
+                  <li data-stage="plan" data-i18n="stagePlan">Comparar archivos</li>
+                  <li data-stage="download" data-i18n="stageDownload">Descargar</li>
+                  <li data-stage="complete" data-i18n="stageComplete">Listo</li>
                 </ol>
                 <dl class="kv kv--compact">
-                  <div class="kv__row"><dt>Destino</dt><dd class="mono ellipsis" id="progress-destination">—</dd></div>
-                  <div class="kv__row"><dt>Idioma</dt><dd class="mono" id="progress-locale">—</dd></div>
+                  <div class="kv__row"><dt data-i18n="destination">Destino</dt><dd class="mono ellipsis" id="progress-destination">—</dd></div>
+                  <div class="kv__row"><dt data-i18n="language">Idioma</dt><dd class="mono" id="progress-locale">—</dd></div>
                 </dl>
               </div>
               <p class="drawer__error" id="plan-error" role="alert" hidden></p>
             </div>
             <footer class="drawer__foot">
-              <button type="button" class="button" id="cancel-client-action">Cancelar</button>
+              <button type="button" class="button" id="cancel-client-action" data-i18n="cancel">Cancelar</button>
               <button type="button" class="button button--brand" id="confirm-client-action" disabled>
                 <span class="button__icon" id="confirm-icon"><span data-icon="download" class="icon icon--sm"></span></span>
                 <span id="confirm-label">Descargar</span>
               </button>
               <button type="button" class="button" id="stop-client-action" hidden>
                 <span data-icon="stop" class="icon icon--sm"></span>
-                Detener
+                <span data-i18n="stop">Detener</span>
               </button>
             </footer>
           </div>
@@ -448,47 +475,56 @@
 
       <div class="view view--clients" id="clients-view" hidden>
         <main class="clients" id="clients-content" tabindex="-1">
-          <h1>Clientes</h1>
+          <h1 data-i18n="clients">Clientes</h1>
           <section class="card storage" aria-labelledby="clients-root-label">
             <div class="storage__main">
-              <label id="clients-root-label" for="install-folder">Carpeta de descargas</label>
+              <label id="clients-root-label" for="install-folder" data-i18n="downloadsFolder">Carpeta de descargas</label>
               <div class="storage__field">
                 <input id="install-folder" class="input mono" type="text" autocomplete="off" spellcheck="false" />
-                <button type="button" class="button" id="choose-install-folder">Cambiar…</button>
+                <button type="button" class="button" id="choose-install-folder" data-i18n="change">Cambiar…</button>
                 <button type="button" class="button" id="reveal-clients-root">
                   <span data-icon="folder" class="icon icon--sm"></span>
-                  Abrir
+                  <span data-i18n="open">Abrir</span>
                 </button>
               </div>
               <p class="storage__error" id="clients-root-error" role="alert" hidden></p>
-              <p class="muted">No modifica tu instalación de League of Legends.</p>
+              <p class="muted" data-i18n="noInstallChanges">No modifica tu instalación de League of Legends.</p>
             </div>
             <dl class="storage__stats">
-              <div><dt>Instalados</dt><dd class="mono" id="clients-installed">—</dd></div>
-              <div><dt>En disco</dt><dd class="mono" id="clients-bytes">—</dd></div>
+              <div><dt data-i18n="installed">Instalados</dt><dd class="mono" id="clients-installed">—</dd></div>
+              <div><dt data-i18n="onDisk">En disco</dt><dd class="mono" id="clients-bytes">—</dd></div>
             </dl>
           </section>
 
-          <section class="card assets" aria-labelledby="assets-label">
-            <span class="assets__label" id="assets-label">Imágenes de las partidas</span>
-            <div class="segmented assets__choice" role="group" aria-labelledby="assets-label" id="asset-prefetch">
-              <button type="button" data-prefetch="all" aria-pressed="false">Descargar todo</button>
-              <button type="button" data-prefetch="open" aria-pressed="false">Al abrir cada partida</button>
+          <section class="card prefs">
+            <div class="assets">
+              <span class="assets__label" id="language-label" data-i18n="appLanguage">Idioma de la app</span>
+              <div class="segmented assets__choice" role="group" aria-labelledby="language-label" id="app-language">
+                <button type="button" data-language="es" lang="es" aria-pressed="false">Español</button>
+                <button type="button" data-language="en" lang="en" aria-pressed="false">English</button>
+              </div>
+            </div>
+            <div class="assets">
+              <span class="assets__label" id="assets-label" data-i18n="matchImages">Imágenes de las partidas</span>
+              <div class="segmented assets__choice" role="group" aria-labelledby="assets-label" id="asset-prefetch">
+                <button type="button" data-prefetch="all" aria-pressed="false" data-i18n="prefetchAll">Descargar todo</button>
+                <button type="button" data-prefetch="open" aria-pressed="false" data-i18n="prefetchOnOpen">Al abrir cada partida</button>
+              </div>
             </div>
           </section>
 
           <section class="card builds" aria-labelledby="builds-title">
             <div class="builds__head">
-              <h2 id="builds-title">Builds</h2>
+              <h2 id="builds-title" data-i18n="builds">Builds</h2>
               <span class="count mono" id="builds-count">0</span>
             </div>
             <div class="builds__row builds__row--head" aria-hidden="true">
               <span>Build</span>
-              <span>Parche</span>
-              <span class="num">Repeticiones</span>
-              <span>Idioma</span>
-              <span class="num">Tamaño</span>
-              <span>Estado</span>
+              <span data-i18n="patch">Parche</span>
+              <span class="num" data-i18n="replays">Repeticiones</span>
+              <span data-i18n="language">Idioma</span>
+              <span class="num" data-i18n="size">Tamaño</span>
+              <span data-i18n="status">Estado</span>
               <span></span>
             </div>
             <div id="builds-list"></div>

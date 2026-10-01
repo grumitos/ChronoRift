@@ -5,38 +5,46 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import { h, hydrateIcons, icon, must, type IconName } from "./dom";
 import {
+  downloadPercent,
   formatBytes,
   formatClock,
   formatDate,
   formatDateLong,
   formatDecimal,
+  formatDownloadPercent,
   formatDuration,
+  formatEta,
   formatInt,
   formatPercent,
+  formatSpeed,
   formatThousands,
   kdaRatio,
   progressPercent,
 } from "./format";
 import {
   AVERAGE_ICON_BYTES,
+  cachedAssetPath,
   cachedAssetUrl,
   loadCommunityDragonAssets,
   loadDataDragonAssets,
   normalizeKey,
   patchImages,
-  storeInCache,
   type CommunityDragonAssets,
   type DataDragonAssets,
   type MatchAsset,
 } from "./game-assets";
+import { currentLanguage, plural, setLanguage, systemLanguageGuess, t, translateStatic, type MessageKey } from "./i18n";
 import type {
   AppSettings,
+  AssetPrefetchProgress,
+  AssetPrefetchResult,
   ClientInstallPlan,
   ClientInstallResult,
   ClientRequest,
   ConfirmedPlan,
   ClientWorkMode,
   DownloadProgress,
+  Language,
   LibraryPlayer,
   LocalClientStatus,
   PlayerItem,
@@ -75,6 +83,8 @@ type InstallRun = {
   done: boolean;
   /** El usuario pulsó Detener: la interfaz ya la muestra detenida mientras el backend la cierra. */
   stopped: boolean;
+  /** Bytes descargados en los últimos segundos, para la velocidad y el tiempo restante. */
+  samples: Array<{ time: number; bytes: number }>;
   /** Se cumple cuando `install_client` termina, bien o mal. */
   settled: Promise<void> | null;
 };
@@ -92,12 +102,17 @@ type PrefetchRun = {
   cancelled: boolean;
 };
 
+/** Lo que ofrece la pregunta por las imágenes: parches, cuántas imágenes y cuánto pesan. */
+type AskImages = { patches: string[]; images: number; bytes: number };
+
 type SplashPhase = "boot" | "wait" | "ask" | "progress" | "hidden";
 
 // Estado de la barra del cliente para la repetición abierta.
 type ClientView = {
   glyph: GlyphState;
   text: string;
+  /** Velocidad de la descarga en curso, junto a su barra. */
+  speed: string;
   /** Color del estado: listo, incompleto o bloqueado, descargando; sin tono, neutro. */
   tone: Tone | null;
   /** Compilación que se usa; `inexact` si es otra del mismo parche. */
@@ -116,6 +131,8 @@ type ClientView = {
   /** Idioma que se muestra; sin build no hay cliente al que aplicarlo. */
   locale: string;
   error: string | null;
+  /** Aclaración neutra bajo la barra (tras Detener), si no hay un error que mostrar. */
+  note: string | null;
 };
 
 type ReplayExited = { replayPath: string; exitCode: number | null };
@@ -129,17 +146,15 @@ const GAME_EXE = "League of Legends.exe";
 const SPLASH_BOOT_TIMEOUT_MS = 5_000;
 // Espera máxima por los datos de los parches antes de preguntar; los que falten no se cuentan.
 const ASK_WAIT_MS = 4_000;
-// Descargas de imágenes a la vez. La caché admite 6; en segundo plano se deja lugar para las
-// imágenes de la partida que se está viendo.
-const PREFETCH_WORKERS = { foreground: 6, background: 3 };
-// Tantos errores seguidos (sin conexión, o una red que no responde) cortan la descarga de imágenes
-// sin avisar nada: se retoma al volver a leer la carpeta.
-const PREFETCH_MAX_ERRORS = 12;
+// Ventana de la velocidad de descarga: el promedio de los últimos segundos, no el último evento.
+const SPEED_WINDOW_MS = 5_000;
+// Con menos tiempo medido la velocidad todavía no dice nada: se muestra al pasar este margen.
+const SPEED_MIN_SPAN_MS = 1_000;
+// Cada cuánto se repite la última muestra cuando no llegan bytes.
+const SPEED_PULSE_MS = 1_000;
 // Imágenes de la biblioteca que se decodifican a la vez y cuántas se guardan en memoria.
 const WARM_WORKERS = 2;
 const WARM_LIMIT = 3_000;
-// Nota que el backend pone en toda repetición ROFL2: informa, no explica una partida sin datos.
-const INFORMATIONAL_NOTES = new Set(["Metadatos ROFL2 leídos del bloque final"]);
 const DATA_DRAGON = "https://ddragon.leagueoflegends.com";
 // Plataforma de Riot (del nombre del archivo) → región en las URL de League of Graphs.
 const LEAGUE_OF_GRAPHS_REGIONS: Record<string, string> = {
@@ -158,10 +173,6 @@ const POSITIONS: Record<string, string> = {
   BOTTOM: "BOT",
   UTILITY: "SUP",
 };
-// Idioma de los nombres de campeones, objetos y runas (la interfaz está en español).
-const NAMES_LOCALE = (typeof navigator !== "undefined" && navigator.language?.toLowerCase() === "es-es")
-  ? "es_ES"
-  : "es_MX";
 const LOCALES: Array<[string, string]> = [
   ["cs_CZ", "Čeština"], ["de_DE", "Deutsch"], ["el_GR", "Ελληνικά"],
   ["en_AU", "English (Australia)"], ["en_GB", "English (UK)"], ["en_PH", "English (Philippines)"],
@@ -229,7 +240,14 @@ const state = {
   // Pantalla de inicio: cargando, esperando los datos para preguntar, preguntando, descargando
   // imágenes u oculta. Mientras se ve, el resto de la app queda inerte.
   splash: "boot" as SplashPhase,
+  // Primera configuración: si muestra el idioma y qué ofrece la pregunta por las imágenes (sin
+  // pregunta, `null`). Solo vale la de la biblioteca más reciente.
+  setupLanguage: false,
+  ask: null as AskImages | null,
   prefetch: null as PrefetchRun | null,
+  // Compilación detenida a pedido en esta sesión: bajo la barra se aclara que Reanudar sigue desde
+  // lo descargado, hasta el próximo intento.
+  stopNote: null as null | { gameVersion: string },
 };
 
 const dataDragonCache = new Map<string, Promise<DataDragonAssets>>();
@@ -261,7 +279,18 @@ let stoppedInstall: Promise<void> | null = null;
 let firstSelection: Promise<void> | null = null;
 // Pregunta por las imágenes: solo vale la de la biblioteca más reciente.
 let askRun = 0;
-let pendingAsk: string[] | null = null;
+// Idioma elegido en esta sesión. Manda sobre la configuración aunque no se haya podido guardar, y
+// ya no se vuelve a preguntar.
+let sessionLanguage: Language | null = null;
+// La configuración ya se leyó (o falló): antes no se sabe si el idioma se eligió, y la salida de
+// respaldo de la pantalla de inicio no lo pregunta.
+let settingsRead = false;
+// Llamada a `prefetch_assets` en curso y la descarga a la que pertenece: el backend corre una a la
+// vez, y sus avances no dicen de cuál son.
+let prefetchCall: Promise<unknown> | null = null;
+let prefetchActive: PrefetchRun | null = null;
+// Rehace el botón de maximizar (icono y nombre) con el estado de la ventana y el idioma actual.
+let syncMaximize: (() => Promise<void>) | null = null;
 // Parches ya intentados en esta biblioteca: un fallo de red no se reintenta en bucle, sino al
 // volver a leer la carpeta.
 const attemptedPatches = new Set<string>();
@@ -275,7 +304,11 @@ const el = {
   splash: must("#splash", HTMLElement),
   splashDots: must("#splash-dots", HTMLElement),
   splashAsk: must("#splash-ask", HTMLElement),
+  setupLanguage: must("#setup-language", HTMLElement),
+  setupContinue: must("#setup-continue", HTMLButtonElement),
+  setupImages: must("#setup-images", HTMLElement),
   splashAskData: must("#splash-ask-data", HTMLElement),
+  languageButtons: [...document.querySelectorAll<HTMLButtonElement>("[data-language]")],
   prefetchAll: must("#prefetch-all", HTMLButtonElement),
   prefetchLater: must("#prefetch-later", HTMLButtonElement),
   splashProgress: must("#splash-progress", HTMLElement),
@@ -293,6 +326,7 @@ const el = {
   activityBuild: must("#activity-build", HTMLElement),
   activityBar: must("#activity-bar", HTMLElement),
   activityPercent: must("#activity-percent", HTMLElement),
+  activitySpeed: must("#activity-speed", HTMLElement),
   storageChip: must("#storage-chip", HTMLButtonElement),
   storageRoot: must("#storage-root", HTMLElement),
   libraryView: must("#library-view", HTMLElement),
@@ -342,7 +376,9 @@ const el = {
   clientLocale: must("#client-locale", HTMLElement),
   clientProgress: must("#client-progress", HTMLElement),
   clientProgressBar: must("#client-progress-bar", HTMLElement),
+  clientSpeed: must("#client-speed", HTMLElement),
   clientError: must("#client-error", HTMLElement),
+  clientNote: must("#client-note", HTMLElement),
   tabs: [...document.querySelectorAll<HTMLButtonElement>(".tab")],
   panelBoard: must("#panel-board", HTMLElement),
   boardHead: must("#panel-board .sb-row--head", HTMLElement),
@@ -377,6 +413,7 @@ const el = {
   progressBytes: must("#progress-bytes", HTMLElement),
   progressTrack: must("#progress-track", HTMLElement),
   progressBar: must("#progress-bar", HTMLElement),
+  progressRate: must("#progress-rate", HTMLElement),
   progressFile: must("#progress-file", HTMLElement),
   stages: [...document.querySelectorAll<HTMLElement>("#stages li")],
   progressDestination: must("#progress-destination", HTMLElement),
@@ -401,11 +438,14 @@ const el = {
 setAppInert(true);
 hydrateIcons();
 initializeLocales();
+// Hasta leer la configuración, el idioma del sistema según el visor.
+applyLanguage(systemLanguageGuess());
 bindEvents();
 renderAll();
 if (import.meta.env.PROD) blockReloads();
 if ("__TAURI_INTERNALS__" in window) {
   void listen<DownloadProgress>("download-progress", ({ payload }) => onProgress(payload));
+  void listen<AssetPrefetchProgress>("asset-prefetch-progress", ({ payload }) => onPrefetchProgress(payload));
   void listen<ReplayExited>("replay-exited", ({ payload }) => onReplayExited(payload));
   window.addEventListener("focus", onWindowFocus);
   bindWindowControls();
@@ -458,7 +498,7 @@ function bindWindowControls() {
   const sync = async () => {
     try {
       const maximized = await current.isMaximized();
-      const label = maximized ? "Restaurar" : "Maximizar";
+      const label = t(maximized ? "restore" : "maximize");
       maximize.replaceChildren(icon(maximized ? "restore" : "maximize"));
       maximize.setAttribute("aria-label", label);
       maximize.title = label;
@@ -466,6 +506,7 @@ function bindWindowControls() {
       // Sin estado de la ventana se conserva el icono actual.
     }
   };
+  syncMaximize = sync;
   void sync();
   current.onResized(() => void sync()).catch(() => undefined);
 }
@@ -473,7 +514,7 @@ function bindWindowControls() {
 async function boot() {
   // Respaldo: si la configuración o la carpeta tardan demasiado, la app se muestra igual.
   const backup = window.setTimeout(() => {
-    if (state.splash === "boot") hideSplash();
+    if (state.splash === "boot") leaveSplash();
   }, SPLASH_BOOT_TIMEOUT_MS);
   try {
     void refreshVanguard();
@@ -489,8 +530,8 @@ async function boot() {
   } finally {
     window.clearTimeout(backup);
     // Biblioteca cargada, fallida o sin carpeta recordada: sale la pantalla de inicio, salvo que
-    // esté preguntando por las imágenes.
-    if (state.splash === "boot") hideSplash();
+    // esté preguntando por las imágenes o falte elegir el idioma.
+    if (state.splash === "boot") leaveSplash();
   }
 }
 
@@ -516,12 +557,41 @@ function showSplash(phase: Exclude<SplashPhase, "boot" | "hidden">) {
   renderSplash();
 }
 
+/** Sale la pantalla de inicio; si falta elegir el idioma, antes pregunta solo eso. */
+function leaveSplash() {
+  if (needsLanguageQuestion()) showSetup(null);
+  else hideSplash();
+}
+
+/** El idioma nunca se eligió (ni en esta sesión): la primera configuración lo pregunta. */
+function needsLanguageQuestion() {
+  return settingsRead && sessionLanguage == null && state.settings.language == null;
+}
+
+/**
+ * Primera configuración en la pantalla de inicio: el idioma, si falta elegirlo, y la pregunta por
+ * las imágenes, si hay una. Solo con el idioma, "Continuar" la cierra; con las imágenes, cualquiera
+ * de sus dos respuestas.
+ */
+function showSetup(ask: AskImages | null) {
+  state.ask = ask;
+  state.setupLanguage = needsLanguageQuestion();
+  showSplash("ask");
+  (ask ? el.prefetchAll : el.setupContinue).focus();
+}
+
+/** Al terminar la primera configuración se guarda el idioma a la vista, aunque no se tocara. */
+function confirmSetupLanguage() {
+  if (needsLanguageQuestion()) void chooseLanguage(currentLanguage());
+}
+
 /** Sale con un fundido breve; sin transición en curso se oculta en el acto. */
 function hideSplash() {
   if (state.splash === "hidden") return;
   const focused = el.splash.contains(document.activeElement);
   state.splash = "hidden";
-  pendingAsk = null;
+  state.ask = null;
+  state.setupLanguage = false;
   setAppInert(false);
   const exit = ++splashExit;
   el.splash.classList.add("is-leaving");
@@ -545,13 +615,109 @@ function renderSplash() {
   el.splashDots.hidden = phase !== "boot" && phase !== "wait";
   el.splashAsk.hidden = phase !== "ask";
   el.splashProgress.hidden = phase !== "progress";
+  if (phase === "ask") {
+    const ask = state.ask;
+    el.setupLanguage.hidden = !state.setupLanguage;
+    el.setupImages.hidden = !ask;
+    el.setupContinue.hidden = !!ask;
+    setAttribute(el.splashAsk, "aria-labelledby", ask ? "splash-ask-title" : "setup-language-label");
+    if (ask) setText(el.splashAskData, askText(ask));
+  }
   const run = state.prefetch;
   if (phase !== "progress" || !run) return;
   const percent = prefetchPercent(run);
   setText(el.splashPercent, formatPercent(percent));
   el.splashBar.style.width = `${percent}%`;
   el.splashTrack.setAttribute("aria-valuenow", String(percent));
-  setText(el.splashPatches, `${Math.min(run.index, run.patches.length)}/${run.patches.length} parches`);
+  setText(el.splashPatches, t("patchesDone", { done: Math.min(run.index, run.patches.length), total: run.patches.length }));
+}
+
+/** "2 parches · 2326 imágenes · ~24,5 MiB", en el idioma actual. */
+function askText(ask: AskImages) {
+  return t("askImagesData", {
+    patches: plural(ask.patches.length, "patchesOne", "patchesOther", formatInt(ask.patches.length)),
+    images: plural(ask.images, "imagesOne", "imagesOther", formatInt(ask.images)),
+    size: formatBytes(ask.bytes),
+  });
+}
+
+// ——— Idioma ———
+
+/** Idioma de la interfaz: el elegido en esta sesión, el guardado o, si nunca se eligió, el del sistema. */
+function effectiveLanguage(): Language {
+  return sessionLanguage ?? state.settings.language ?? state.settings.systemLanguage ?? systemLanguageGuess();
+}
+
+/**
+ * Cambia el idioma en el acto, sin recargar: textos fijos y pintados, formatos, el botón de
+ * maximizar y los nombres de campeones, objetos y runas de la partida abierta y de la lista.
+ */
+function applyLanguage(language: Language) {
+  const changed = language !== currentLanguage();
+  setLanguage(language);
+  translateStatic();
+  for (const button of el.languageButtons) setAttribute(button, "aria-pressed", String(button.dataset.language === language));
+  if (!changed) return;
+  void syncMaximize?.();
+  reloadLocalizedData();
+  renderAll();
+  renderSplash();
+}
+
+/** Elige el idioma: se ve en el acto y se guarda. Si no se puede guardar, vale para esta sesión. */
+async function chooseLanguage(language: Language) {
+  sessionLanguage = language;
+  applyLanguage(language);
+  try {
+    const saved = await invoke<AppSettings>("set_language", { language });
+    // Solo el idioma: otra elección guardada a la vez (las imágenes) puede volver en otro orden.
+    state.settings = { ...state.settings, language: saved.language, systemLanguage: saved.systemLanguage };
+  } catch {
+    // Sin guardar, la elección sigue en memoria (`sessionLanguage`).
+    return;
+  }
+  rereadReplayNotes();
+}
+
+/**
+ * Las notas de una repetición (por qué no tiene estadísticas) llegan del backend en su idioma: las
+ * leídas antes del cambio se vuelven a leer, la de la partida abierta en el acto y las demás al
+ * elegirlas.
+ */
+function rereadReplayNotes() {
+  for (const [path, replay] of state.inspections) if (replay.notes.length) state.inspections.delete(path);
+  const replay = state.replay;
+  if (!replay?.notes.length) return;
+  const generation = state.libraryRun;
+  invoke<ReplayInspection>("inspect_replay", { path: replay.path }).then(
+    (fresh) => {
+      if (generation === state.libraryRun) state.inspections.set(fresh.path, fresh);
+      if (state.replay?.path === fresh.path) showReplay(fresh);
+    },
+    () => undefined,
+  );
+}
+
+/**
+ * Los datos de DataDragon y CommunityDragon se piden por idioma (sus claves lo incluyen): la partida
+ * abierta y la lista los vuelven a leer. Mientras llegan siguen los nombres anteriores; las
+ * imágenes no dependen del idioma.
+ */
+function reloadLocalizedData() {
+  const replay = state.replay;
+  if (replay) {
+    const ready = readyAssets(replay);
+    if (ready.data && ready.community) {
+      state.dataDragon = ready.data;
+      state.communityDragon = ready.community;
+    } else {
+      void enrichMatch(replay, true);
+    }
+  }
+  if (state.library) {
+    warmPatchData(state.library);
+    void loadChampionNames(state.library);
+  }
 }
 
 // ——— Eventos ———
@@ -573,6 +739,18 @@ function bindEvents() {
   el.prefetchAll.addEventListener("click", () => answerPrefetch(true));
   el.prefetchLater.addEventListener("click", () => answerPrefetch(false));
   el.prefetchContinue.addEventListener("click", continuePrefetchInBackground);
+  // El mismo control en la primera configuración y en Clientes.
+  for (const button of el.languageButtons) {
+    button.addEventListener("click", () => {
+      const language = button.dataset.language as Language;
+      if (language !== currentLanguage() || needsLanguageQuestion()) void chooseLanguage(language);
+    });
+  }
+  el.setupContinue.addEventListener("click", () => {
+    if (state.splash !== "ask" || state.ask) return;
+    confirmSetupLanguage();
+    hideSplash();
+  });
   for (const button of el.assetPrefetch.querySelectorAll<HTMLButtonElement>("[data-prefetch]")) {
     button.addEventListener("click", () => void chooseAssetPrefetch(button.dataset.prefetch === "all"));
   }
@@ -663,6 +841,8 @@ async function loadSettings() {
   } catch (error) {
     state.clientsError = errorText(error);
   }
+  settingsRead = true;
+  applyLanguage(effectiveLanguage());
   renderAll();
 }
 
@@ -953,10 +1133,12 @@ function showReplay(replay: ReplayInspection) {
     dropPlan();
   }
   const ready = readyAssets(replay);
-  state.dataDragon = ready.data;
-  state.communityDragon = ready.community;
+  // La misma partida releída (otro idioma) conserva los nombres que ya tenía hasta que lleguen los
+  // nuevos: sin un cuadro con los identificadores de Riot.
+  state.dataDragon = ready.data ?? (same ? state.dataDragon : null);
+  state.communityDragon = ready.community ?? (same ? state.communityDragon : null);
   renderAll();
-  if (!ready.data || !ready.community) void enrichMatch(replay);
+  if (!ready.data || !ready.community) void enrichMatch(replay, same);
 }
 
 /**
@@ -965,11 +1147,7 @@ function showReplay(replay: ReplayInspection) {
  */
 async function prefetchLibrary(library: ReplayLibrary) {
   const run = ++state.libraryRun;
-  const patches = new Set(library.entries.map((entry) => entry.patch).filter((patch): patch is string => !!patch));
-  for (const patch of patches) {
-    dataDragon(`${patch}.1`).catch(() => undefined);
-    communityDragon(patch).catch(() => undefined);
-  }
+  warmPatchData(library);
   const queue = [...library.entries];
   const worker = async () => {
     for (let entry = queue.shift(); entry && run === state.libraryRun; entry = queue.shift()) {
@@ -986,10 +1164,29 @@ async function prefetchLibrary(library: ReplayLibrary) {
   if (run === state.libraryRun) void warmLibraryImages();
 }
 
+/** Pide de antemano los datos de cada parche de la biblioteca, en el idioma actual. */
+function warmPatchData(library: ReplayLibrary) {
+  const patches = new Set(library.entries.map((entry) => entry.patch).filter((patch): patch is string => !!patch));
+  for (const patch of patches) {
+    dataDragon(`${patch}.1`).catch(() => undefined);
+    communityDragon(patch).catch(() => undefined);
+  }
+}
+
+/**
+ * Idioma de los nombres de campeones, objetos y runas: el de la interfaz. En español, el de España
+ * con un sistema en es-ES y el de Latinoamérica con cualquier otro.
+ */
+function namesLocale() {
+  if (currentLanguage() === "en") return "en_US";
+  return typeof navigator !== "undefined" && navigator.language?.toLowerCase() === "es-es" ? "es_ES" : "es_MX";
+}
+
 function assetKeys(replay: ReplayInspection) {
+  const locale = namesLocale();
   return {
-    data: `${replay.dataDragonVersion ?? `${replay.patch}.1`}:${NAMES_LOCALE}`,
-    community: `${replay.patch}:${NAMES_LOCALE}`,
+    data: `${replay.dataDragonVersion ?? `${replay.patch}.1`}:${locale}`,
+    community: `${replay.patch}:${locale}`,
   };
 }
 
@@ -1003,10 +1200,11 @@ function readyAssets(replay: ReplayInspection) {
 }
 
 function dataDragon(version: string) {
-  const key = `${version}:${NAMES_LOCALE}`;
+  const locale = namesLocale();
+  const key = `${version}:${locale}`;
   let entry = dataDragonCache.get(key);
   if (!entry) {
-    entry = loadDataDragonAssets(version, NAMES_LOCALE);
+    entry = loadDataDragonAssets(version, locale);
     dataDragonCache.set(key, entry);
     // Un fallo de red no queda en caché: el próximo intento vuelve a consultar.
     entry.then(
@@ -1018,10 +1216,11 @@ function dataDragon(version: string) {
 }
 
 function communityDragon(patch: string) {
-  const key = `${patch}:${NAMES_LOCALE}`;
+  const locale = namesLocale();
+  const key = `${patch}:${locale}`;
   let entry = communityDragonCache.get(key);
   if (!entry) {
-    entry = loadCommunityDragonAssets(patch, NAMES_LOCALE);
+    entry = loadCommunityDragonAssets(patch, locale);
     communityDragonCache.set(key, entry);
     entry.then(
       (assets) => readyCommunityDragon.set(key, assets),
@@ -1031,7 +1230,11 @@ function communityDragon(patch: string) {
   return entry;
 }
 
-async function enrichMatch(replay: ReplayInspection) {
+/**
+ * Datos del parche de la partida a la vista. Al cambiar de idioma (`keep`), un lado que no llega
+ * conserva los nombres del idioma anterior en lugar de quedarse con los identificadores de Riot.
+ */
+async function enrichMatch(replay: ReplayInspection, keep = false) {
   if (replay.status !== "parsed" || !replay.patch) return;
   const run = ++state.assetRun;
   const [data, community] = await Promise.allSettled([
@@ -1039,8 +1242,8 @@ async function enrichMatch(replay: ReplayInspection) {
     communityDragon(replay.patch),
   ]);
   if (run !== state.assetRun || state.replay?.path !== replay.path) return;
-  state.dataDragon = data.status === "fulfilled" ? data.value : null;
-  state.communityDragon = community.status === "fulfilled" ? community.value : null;
+  state.dataDragon = data.status === "fulfilled" ? data.value : keep ? state.dataDragon : null;
+  state.communityDragon = community.status === "fulfilled" ? community.value : keep ? state.communityDragon : null;
   renderMatchBody();
 }
 
@@ -1054,9 +1257,10 @@ function libraryPatches(library: ReplayLibrary | null) {
 
 /** Datos del parche ya en memoria: DataDragon, CommunityDragon, ambos o ninguno. */
 function readyPatchAssets(patch: string) {
+  const locale = namesLocale();
   return {
-    data: readyDataDragon.get(`${patch}.1:${NAMES_LOCALE}`) ?? null,
-    community: readyCommunityDragon.get(`${patch}:${NAMES_LOCALE}`) ?? null,
+    data: readyDataDragon.get(`${patch}.1:${locale}`) ?? null,
+    community: readyCommunityDragon.get(`${patch}:${locale}`) ?? null,
   };
 }
 
@@ -1068,7 +1272,8 @@ async function loadPatchAssets(patch: string) {
 
 /**
  * Primera biblioteca con parches y sin elección guardada: antes de mostrarla se pregunta si se
- * descargan de una vez todas las imágenes de sus parches, con cuántas son y cuánto pesan.
+ * descargan de una vez todas las imágenes de sus parches, con cuántas son y cuánto pesan. Si
+ * todavía no se eligió el idioma, la misma pantalla lo pregunta arriba.
  */
 async function askPrefetch(library: ReplayLibrary) {
   const run = ++askRun;
@@ -1077,7 +1282,7 @@ async function askPrefetch(library: ReplayLibrary) {
     cancelAsk();
     return;
   }
-  pendingAsk = null;
+  state.ask = null;
   showSplash("wait");
   await Promise.race([Promise.allSettled(patches.map(loadPatchAssets)), delay(ASK_WAIT_MS)]);
   if (run !== askRun || state.splash !== "wait") return;
@@ -1092,29 +1297,26 @@ async function askPrefetch(library: ReplayLibrary) {
   });
   // Sin datos de ningún parche (sin conexión) no hay nada que ofrecer: se pregunta otro día.
   if (!available.length) {
-    hideSplash();
+    leaveSplash();
     return;
   }
-  pendingAsk = available;
-  const patchCount = `${available.length} ${available.length === 1 ? "parche" : "parches"}`;
-  setText(el.splashAskData, `${patchCount} · ${formatInt(count)} imágenes · ~${formatBytes(bytes)}`);
-  showSplash("ask");
-  el.prefetchAll.focus();
+  showSetup({ patches: available, images: count, bytes });
 }
 
 /** Una biblioteca sin parches, o que no se pudo leer, deja sin efecto la pregunta pendiente. */
 function cancelAsk() {
   askRun++;
-  if (state.splash === "wait" || state.splash === "ask") hideSplash();
+  if (state.splash === "wait" || (state.splash === "ask" && state.ask)) leaveSplash();
 }
 
 function answerPrefetch(all: boolean) {
-  const patches = pendingAsk;
-  if (!patches || state.splash !== "ask") return;
+  const ask = state.ask;
+  if (!ask || state.splash !== "ask") return;
   askRun++;
-  pendingAsk = null;
+  state.ask = null;
+  confirmSetupLanguage();
   void saveAssetPrefetch(all);
-  if (all) startPrefetch(patches, true);
+  if (all) startPrefetch(ask.patches, true);
   else hideSplash();
 }
 
@@ -1135,7 +1337,9 @@ async function saveAssetPrefetch(enabled: boolean) {
   state.settings = { ...state.settings, assetPrefetch: enabled };
   renderClients();
   try {
-    state.settings = await invoke<AppSettings>("set_asset_prefetch", { enabled });
+    const saved = await invoke<AppSettings>("set_asset_prefetch", { enabled });
+    // Solo esta elección: el idioma se guarda aparte y su respuesta puede llegar en otro orden.
+    state.settings = { ...state.settings, assetPrefetch: saved.assetPrefetch };
   } catch {
     // Sin guardar, la elección sigue en memoria.
   }
@@ -1171,7 +1375,11 @@ function startPrefetch(patches: string[], foreground: boolean) {
   void runPrefetch(run);
 }
 
-/** Parche por parche; un error no detiene nada: ese parche se reintenta al volver a leer la carpeta. */
+/**
+ * Parche por parche, cada uno en una sola llamada al backend, que descarga sus imágenes a la caché
+ * en disco con su propio grupo de conexiones. Un error no detiene nada: ese parche se reintenta al
+ * volver a leer la carpeta.
+ */
 async function runPrefetch(run: PrefetchRun) {
   for (; run.index < run.patches.length && !run.cancelled; run.index++) {
     const patch = run.patches[run.index];
@@ -1185,8 +1393,20 @@ async function runPrefetch(run: PrefetchRun) {
       [...state.inspections.values()].filter((replay) => replay.patch === patch).flatMap(matchImageUrls),
     );
     const urls = patchImages(data, community).map((image) => image.url);
-    const clean = await storeAll(run, [...urls.filter((url) => used.has(url)), ...urls.filter((url) => !used.has(url))]);
-    if (clean && data && community && !run.cancelled) markPrefetched(patch);
+    const paths = [...urls.filter((url) => used.has(url)), ...urls.filter((url) => !used.has(url))]
+      .map(cachedAssetPath)
+      .filter((path): path is string => !!path);
+    if (!paths.length) continue;
+    const result = await prefetchPaths(run, paths);
+    if (result?.cancelled) run.cancelled = true;
+    if (run.cancelled) break;
+    // Sin conexión (o sin respuesta del backend) no tiene sentido seguir, y no se avisa nada: los
+    // parches que falten se retoman al volver a leer la carpeta.
+    if (!result || result.offline) {
+      run.cancelled = true;
+      break;
+    }
+    if (result.errors === 0 && result.done === result.total && data && community) markPrefetched(patch);
   }
   if (state.prefetch === run) state.prefetch = null;
   if (run.foreground && state.splash === "progress") hideSplash();
@@ -1195,29 +1415,34 @@ async function runPrefetch(run: PrefetchRun) {
   if (!run.cancelled) prefetchLibraryPatches();
 }
 
-/** Guarda cada imagen en la caché con unas pocas descargas a la vez; dice si no hubo errores. */
-async function storeAll(run: PrefetchRun, urls: string[]) {
-  let next = 0;
-  let done = 0;
-  let clean = true;
-  let errors = 0;
-  const worker = async (slot: number) => {
-    // En segundo plano quedan menos a la vez: sobra lugar para la partida que se está viendo.
-    const limit = () => (run.foreground ? PREFETCH_WORKERS.foreground : PREFETCH_WORKERS.background);
-    while (!run.cancelled && next < urls.length && slot < limit()) {
-      const url = urls[next++];
-      const result = await storeInCache(url);
-      clean &&= result !== "error";
-      errors = result === "error" ? errors + 1 : 0;
-      // Sin red no tiene sentido seguir: los parches que falten se retoman otro día.
-      if (errors >= PREFETCH_MAX_ERRORS) run.cancelled = true;
-      done++;
-      run.fraction = done / urls.length;
-      schedulePrefetchRender();
+/**
+ * Una llamada a `prefetch_assets`. El backend corre una a la vez: si la de una descarga cancelada
+ * todavía no volvió, primero se espera. Sin respuesta (un error del comando), `null`.
+ */
+async function prefetchPaths(run: PrefetchRun, paths: string[]) {
+  while (prefetchCall) await prefetchCall.then(() => undefined, () => undefined);
+  if (run.cancelled) return null;
+  const call = invoke<AssetPrefetchResult>("prefetch_assets", { paths });
+  prefetchCall = call;
+  prefetchActive = run;
+  try {
+    return await call;
+  } catch {
+    return null;
+  } finally {
+    if (prefetchCall === call) {
+      prefetchCall = null;
+      prefetchActive = null;
     }
-  };
-  await Promise.all(Array.from({ length: PREFETCH_WORKERS.foreground }, (_, slot) => worker(slot)));
-  return clean && done === urls.length;
+  }
+}
+
+/** Avance del parche en curso; los de una llamada cancelada que lleguen tarde no cuentan. */
+function onPrefetchProgress(progress: AssetPrefetchProgress) {
+  const run = prefetchActive;
+  if (!run || run.cancelled || state.prefetch !== run || !(progress.total > 0)) return;
+  run.fraction = Math.min(1, progress.done / progress.total);
+  schedulePrefetchRender();
 }
 
 /** "Continuar": la pantalla de inicio sale y la descarga sigue en la barra superior. */
@@ -1231,6 +1456,8 @@ function cancelPrefetch() {
   if (!run) return;
   run.cancelled = true;
   state.prefetch = null;
+  // La llamada en curso vuelve con `cancelled: true`; la próxima espera a que vuelva.
+  if (prefetchActive === run) invoke("cancel_asset_prefetch").catch(() => undefined);
   renderPrefetch();
 }
 
@@ -1241,7 +1468,7 @@ function prefetchPercent(run: PrefetchRun) {
 
 let prefetchFrame = 0;
 
-/** Una imagen por vez sería demasiado: se pinta una vez por cuadro. */
+/** Un avance por evento sería demasiado: se pinta una vez por cuadro. */
 function schedulePrefetchRender() {
   if (prefetchFrame) return;
   prefetchFrame = requestAnimationFrame(() => {
@@ -1439,6 +1666,7 @@ async function confirmInstall() {
   // Se pide exactamente el plan que se vio, con su idioma.
   const request: ClientRequest = { ...confirmed, locale: plan.locale };
   state.installError = null;
+  state.stopNote = null;
   const run: InstallRun = {
     gameVersion: version,
     build: plan.gameBuild,
@@ -1455,6 +1683,7 @@ async function confirmInstall() {
     percent: 0,
     done: false,
     stopped: false,
+    samples: [],
     settled: null,
   };
   state.install = run;
@@ -1468,6 +1697,13 @@ async function confirmInstall() {
     () => undefined,
     () => undefined,
   );
+  // Sin bytes nuevos el backend no avisa: un pulso por segundo repite la última muestra, así en un
+  // reintento la velocidad baja y el tiempo restante no queda congelado.
+  const pulse = setInterval(() => {
+    if (state.install !== run || run.done || run.stage !== "download" || !run.samples.length) return;
+    recordSample(run, run.downloaded);
+    renderInstall();
+  }, SPEED_PULSE_MS);
   try {
     const result = await pending;
     // También si se pulsó Detener justo cuando terminaba: el cliente quedó listo y así se ve.
@@ -1504,6 +1740,8 @@ async function confirmInstall() {
         void selectReplay(run.replayPath);
       }
     }
+  } finally {
+    clearInterval(pulse);
   }
   renderAll();
   await refreshClientStatuses();
@@ -1531,6 +1769,8 @@ function stopInstall() {
   });
   stoppedInstall = settled;
   showStoppedStatus(run);
+  // Lo descargado queda en disco desde la etapa de descarga: Reanudar sigue desde ahí.
+  if (STAGES.indexOf(run.stage) >= STAGES.indexOf("download")) state.stopNote = { gameVersion: run.gameVersion };
   // El panel seguía la descarga: se cierra con ella.
   state.drawerOpen = false;
   state.drawerMode = "plan";
@@ -1541,6 +1781,7 @@ function stopInstall() {
     stoppedInstall = null;
     run.stopped = false;
     state.install = run;
+    state.stopNote = null;
     dropPlan();
     state.drawerMode = "progress";
     state.installError = { gameVersion: run.gameVersion, build: run.build, message: errorText(error) };
@@ -1603,6 +1844,7 @@ function onProgress(progress: DownloadProgress) {
       install.total = progress.totalBytes ?? install.total;
       install.percent = progress.percent ?? install.percent;
       install.done = install.done || progress.done;
+      if (progress.stage === "download") recordSample(install, progress.downloadedBytes);
     }
   } else if (stoppedInstall) {
     // Avances de la descarga detenida mientras el backend la cierra: ya no se muestran.
@@ -1618,6 +1860,37 @@ function onProgress(progress: DownloadProgress) {
     progressFrame = 0;
     renderInstall();
   });
+}
+
+/**
+ * Guarda los bytes de un avance y descarta los que quedan fuera de la ventana, salvo el último de
+ * antes de ella, que marca su comienzo. Un avance que retrocede reinicia la medición.
+ */
+function recordSample(install: InstallRun, bytes: number) {
+  const time = Date.now();
+  const samples = install.samples;
+  if (samples.length && bytes < samples[samples.length - 1].bytes) samples.length = 0;
+  samples.push({ time, bytes });
+  while (samples.length > 2 && samples[1].time <= time - SPEED_WINDOW_MS) samples.shift();
+}
+
+/**
+ * Velocidad (bytes por segundo, promedio de los últimos ~5 s) y tiempo restante, ya formateados.
+ * Hasta tener un segundo medido, vacíos. Al reanudar, `downloadedBytes` parte de lo ya guardado y
+ * lo que falta es `totalBytes - downloadedBytes`.
+ */
+function installRate(install: InstallRun) {
+  const samples = install.samples;
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const span = first && last ? last.time - first.time : 0;
+  if (install.done || span < SPEED_MIN_SPAN_MS) return { speed: "", eta: "" };
+  const speed = Math.max(0, (last.bytes - first.bytes) / (span / 1000));
+  const remaining = install.total == null ? null : Math.max(0, install.total - install.downloaded);
+  return {
+    speed: formatSpeed(speed),
+    eta: speed > 0 && remaining ? formatEta(remaining / speed) : "",
+  };
 }
 
 /** Todo lo que muestra la descarga en curso: barra superior, panel, barra del cliente y Clientes. */
@@ -1648,7 +1921,7 @@ async function chooseExecutable() {
     state.manualExecutables.set(replay.path, selected);
     if (state.actionError?.path === replay.path) state.actionError = null;
   } else {
-    state.actionError = { path: replay.path, message: `No es ${GAME_EXE}: ${selected}` };
+    state.actionError = { path: replay.path, message: t("notGameExecutable", { exe: GAME_EXE, path: selected }) };
   }
   // Se ve el resultado de la última acción: el error de un inicio anterior deja de mostrarse.
   if (state.launch?.path === replay.path && state.launch.state === "error") state.launch = null;
@@ -1730,6 +2003,7 @@ function clientView(): ClientView | null {
   // Mientras se descarga otra compilación no se puede empezar esta.
   const plan = (kind: "install" | "resume") => ({ run: () => void openClientPlan(kind), disabled: !!install });
   const none: Omit<ClientView, "glyph" | "text" | "location"> = {
+    speed: "",
     build: version ?? "—",
     inexact: false,
     locationMuted: false,
@@ -1739,42 +2013,43 @@ function clientView(): ClientView | null {
     progress: null,
     locale: clientLocale(),
     error: null,
+    note: null,
     tone: null,
   };
   let view: ClientView;
 
   if (install && install.gameVersion === version) {
-    const percent = progressPercent(install.percent, install.done);
     view = {
       ...none,
       glyph: "busy",
       text: installStateText(install),
+      speed: installRate(install).speed,
       build: install.build,
       inexact: !install.exactBuild,
       location: install.destination,
       reveal: install.destination,
-      action: { label: "Progreso", icon: "download", run: showProgress },
-      progress: percent,
+      action: { label: t("progress"), icon: "download", run: showProgress },
+      progress: downloadPercent(install.percent, install.done),
     };
   } else if (manual) {
-    view = { ...none, glyph: "ready", text: "Ejecutable elegido", location: manual, reveal: manual, executable: manual };
+    view = { ...none, glyph: "ready", text: t("chosenExecutable"), location: manual, reveal: manual, executable: manual };
   } else if (replay.status !== "parsed" || !replay.patch) {
-    view = { ...none, glyph: "missing", text: "Sin build", location: "—", locationMuted: true, locale: "—" };
+    view = { ...none, glyph: "missing", text: t("noBuild"), location: "—", locationMuted: true, locale: "—" };
   } else if (!state.settings.clientsRoot) {
     view = {
       ...none,
       glyph: "missing",
-      text: "Sin carpeta de clientes",
+      text: t("noClientsFolder"),
       location: "—",
       locationMuted: true,
-      action: { label: "Elegir carpeta", icon: "folder", run: () => void chooseClientsRoot() },
+      action: { label: t("chooseFolder"), icon: "folder", run: () => void chooseClientsRoot() },
     };
   } else if (state.statusesError) {
     // Carpeta de clientes inaccesible: no se sabe si hay cliente, así que no se ofrece nada.
     view = {
       ...none,
       glyph: "unknown",
-      text: "No disponible",
+      text: t("unavailable"),
       location: "—",
       locationMuted: true,
       error: state.statusesError,
@@ -1788,7 +2063,7 @@ function clientView(): ClientView | null {
     view = {
       ...none,
       glyph: "ready",
-      text: "Listo",
+      text: t("ready"),
       build: status.gameBuild,
       inexact: status.exactBuild === false,
       location: status.destinationPath,
@@ -1796,40 +2071,39 @@ function clientView(): ClientView | null {
       executable,
     };
   } else if (status?.state === "partial") {
-    const percent = status.totalInstallBytes
-      ? progressPercent((status.installedBytes / status.totalInstallBytes) * 100, false)
-      : null;
     view = {
       ...none,
       glyph: "partial",
-      text: `Incompleto${percent == null ? "" : ` · ${formatPercent(percent)}`}`,
+      text: partialStateText(status),
       build: status.gameBuild,
       inexact: status.exactBuild === false,
       location: status.destinationPath,
       reveal: status.destinationPath,
-      action: { label: "Reanudar", icon: "download", ...plan("resume") },
+      action: { label: t("resume"), icon: "download", ...plan("resume") },
+      // Tras Detener: lo descargado sigue en disco y Reanudar continúa desde ahí.
+      note: state.stopNote?.gameVersion === version ? t("stoppedNote") : null,
     };
   } else {
     view = {
       ...none,
       glyph: "missing",
-      text: "No instalado",
+      text: t("notInstalled"),
       location: status?.destinationPath ?? "—",
       locationMuted: true,
-      action: { label: "Preparar cliente", icon: "download", ...plan("install") },
+      action: { label: t("prepareClient"), icon: "download", ...plan("install") },
     };
   }
 
   const launch = state.launch?.path === replay.path ? state.launch : null;
   let launchFailed = false;
-  if (launch?.state === "launching") view.text = "Abriendo…";
+  if (launch?.state === "launching") view.text = t("opening");
   else if (view.executable && state.vanguard === "running") {
     // Con Vanguard activo el juego no abre: eso manda sobre "Reproduciendo".
     view.glyph = "blocked";
-    view.text = "Vanguard activo";
-  } else if (view.executable && isPlaying(replay.path)) view.text = "Reproduciendo";
+    view.text = t("vanguardActive");
+  } else if (view.executable && isPlaying(replay.path)) view.text = t("playing");
   else if (launch?.state === "error") {
-    view.text = "No se pudo reproducir";
+    view.text = t("playFailed");
     launchFailed = true;
   }
   // El tono sigue a la marca; un inicio fallido queda neutro y su motivo va en rojo debajo.
@@ -1846,7 +2120,17 @@ function clientView(): ClientView | null {
     ?? (state.actionError?.path === replay.path ? state.actionError.message : null)
     ?? view.error
     ?? download;
+  // Una sola línea bajo la barra: un error manda sobre la nota.
+  if (view.error) view.note = null;
   return view;
+}
+
+/** "Incompleto · 20,4 %": lo que hay en disco (con lo guardado a medias) sobre el total. */
+function partialStateText(status: LocalClientStatus) {
+  const percent = status.totalInstallBytes
+    ? downloadPercent((status.installedBytes / status.totalInstallBytes) * 100, false)
+    : null;
+  return percent == null ? t("incomplete") : t("incompletePercent", { percent: formatDownloadPercent(percent) });
 }
 
 /**
@@ -1888,20 +2172,26 @@ function renderAppBar() {
   const install = state.install;
   const images = !install && state.prefetch && !state.prefetch.foreground ? state.prefetch : null;
   el.activity.hidden = !install && !images;
+  // La velocidad solo es de la descarga del cliente; su ancho queda reservado desde el comienzo.
+  el.activitySpeed.hidden = !install;
   if (install) {
-    const percent = progressPercent(install.percent, install.done);
-    setText(el.activityLabel, "Descargando");
+    const percent = downloadPercent(install.percent, install.done);
+    setText(el.activityLabel, t("downloading"));
     setText(el.activityBuild, install.build);
     el.activityBar.style.width = `${percent}%`;
-    setText(el.activityPercent, formatPercent(percent));
+    setText(el.activityPercent, formatDownloadPercent(percent));
+    setText(el.activitySpeed, installRate(install).speed || "—");
+    // El tiempo restante no cabe en la barra: queda en el panel y aquí, al pasar el puntero.
+    el.activity.title = rateText(install);
   } else if (images) {
+    el.activity.title = "";
     const percent = prefetchPercent(images);
-    setText(el.activityLabel, "Imágenes");
+    setText(el.activityLabel, t("images"));
     setText(el.activityBuild, images.patches[Math.min(images.index, images.patches.length - 1)] ?? "—");
     el.activityBar.style.width = `${percent}%`;
     setText(el.activityPercent, formatPercent(percent));
   }
-  el.storageRoot.textContent = state.settings.clientsRoot ?? "Sin carpeta";
+  el.storageRoot.textContent = state.settings.clientsRoot ?? t("noFolder");
   el.storageChip.title = state.settings.clientsRoot ?? "";
 }
 
@@ -1944,14 +2234,14 @@ function renderLibrary() {
   const openButton = el.libraryEmpty.querySelector<HTMLButtonElement>("button");
   if (openButton) openButton.hidden = state.libraryBusy || (!!library && !state.libraryError);
   el.libraryEmptyText.textContent = state.libraryBusy
-    ? "Cargando…"
+    ? t("loadingEllipsis")
     : state.libraryError
-      ? `No se pudo cargar la carpeta. ${state.libraryError}`
+      ? t("folderLoadFailed", { error: state.libraryError })
       : !library
-        ? "Sin carpeta"
+        ? t("noFolder")
         : total === 0
-          ? "Sin repeticiones"
-          : "Sin resultados";
+          ? t("noReplays")
+          : t("noResults");
 
   el.libraryOwner.hidden = !state.owner;
   el.libraryOwnerName.textContent = state.owner ?? "";
@@ -1959,11 +2249,12 @@ function renderLibrary() {
   const versions = new Set(library?.entries.map((entry) => entry.gameVersion).filter(Boolean) as string[]);
   const known = [...versions].every((version) => state.statusVersions.has(version));
   const ready = [...versions].filter((version) => state.statuses.get(version)?.state === "ready").length;
-  const failures = library?.failures.length ? ` · ${library.failures.length} con error` : "";
+  const failures = library?.failures.length ? t("failedFiles", { count: library.failures.length }) : "";
   // La cuenta de builds listos espera a que se lean los estados.
-  el.librarySummary.textContent = library && state.settings.clientsRoot && versions.size && known
-    ? `${ready}/${versions.size} builds${failures}`
-    : failures.replace(/^ · /, "");
+  const builds = library && state.settings.clientsRoot && versions.size && known
+    ? t("buildsReady", { ready, total: versions.size })
+    : "";
+  el.librarySummary.textContent = [builds, failures].filter(Boolean).join(" · ");
 }
 
 function renderRows(entries: ReplayLibraryEntry[], failures: ReplayLibrary["failures"]) {
@@ -2046,7 +2337,8 @@ function replayRow(entry: ReplayLibraryEntry) {
   const scored = parsed && entry.players.length > 0;
   const kda = owner ? `${owner.kills}/${owner.deaths}/${owner.assists}` : scored ? `${entry.blueKills} – ${entry.redKills}` : "—";
   const portrait = owner ? libraryChampionIcon(owner.champion, entry.patch) : null;
-  const content = [owner?.name ?? "", name, kda, portrait ?? ""].join("\n");
+  // Con el idioma: la fecha, "Perfecto" y la letra del resultado cambian con él.
+  const content = [owner?.name ?? "", name, kda, portrait ?? "", currentLanguage()].join("\n");
   if (record.entry !== entry || record.content !== content) {
     record.entry = entry;
     record.content = content;
@@ -2060,11 +2352,11 @@ function replayRow(entry: ReplayLibraryEntry) {
     record.element,
     "aria-label",
     [
-      owner ? (owner.win ? "Victoria" : "Derrota") : null,
+      owner ? t(owner.win ? "victory" : "defeat") : null,
       name,
-      parsed ? (scored ? kda : null) : "no válida",
+      parsed ? (scored ? kda : null) : t("invalid"),
       entry.gameDurationMs == null ? null : formatDuration(entry.gameDurationMs),
-      entry.patch ? `parche ${entry.patch}` : null,
+      entry.patch ? t("patchNamed", { patch: entry.patch }) : null,
       entry.gameVersion ? glyphLabel(glyph) : null,
     ].filter(Boolean).join(", "),
   );
@@ -2084,7 +2376,7 @@ function replayRowContent(
       "span",
       {},
       owner
-        ? h("span", { class: `result-badge ${owner.win ? "is-win" : "is-loss"}`, text: owner.win ? "V" : "D" })
+        ? h("span", { class: `result-badge ${owner.win ? "is-win" : "is-loss"}`, text: t(owner.win ? "winLetter" : "lossLetter") })
         : null,
     ),
     owner
@@ -2131,14 +2423,15 @@ function glyphFor(version: string | null): GlyphState {
 }
 
 function glyphLabel(glyph: GlyphState) {
-  return {
-    ready: "cliente listo",
-    partial: "cliente incompleto",
-    missing: "cliente no instalado",
-    busy: "descargando",
-    blocked: "Vanguard activo",
+  const key = ({
+    ready: "glyphReady",
+    partial: "glyphPartial",
+    missing: "glyphMissing",
+    busy: "glyphBusy",
+    blocked: "glyphBlocked",
     unknown: null,
-  }[glyph];
+  } as const)[glyph];
+  return key ? t(key) : null;
 }
 
 function glyphElement(glyph: GlyphState) {
@@ -2153,10 +2446,10 @@ function renderMatch() {
   el.workspace.setAttribute("aria-busy", String(state.replayLoading));
   if (!replay) {
     el.emptyTitle.textContent = state.replayLoading
-      ? "Cargando…"
+      ? t("loadingEllipsis")
       : state.replayError
-        ? "No se pudo abrir la repetición"
-        : "Sin repetición seleccionada";
+        ? t("replayOpenFailed")
+        : t("noReplaySelected");
     el.emptyDetail.textContent = state.replayLoading ? "" : state.replayError ?? "";
     return;
   }
@@ -2171,11 +2464,11 @@ function renderMatch() {
   const blueWon = replay.winningTeam === "Blue";
   const redWon = replay.winningTeam === "Red";
   if (owner) {
-    setChip(el.resultChip, owner.win ? "Victoria" : "Derrota", owner.win ? "win" : "loss");
+    setChip(el.resultChip, t(owner.win ? "victory" : "defeat"), owner.win ? "win" : "loss");
     el.resultSide.textContent = owner.team === "Blue" || owner.team === "Red" ? sideLabel(owner.team) : "";
     setTeam(el.resultSide, owner.team);
   } else {
-    setChip(el.resultChip, blueWon ? "Gana azul" : redWon ? "Gana rojo" : "Sin resultado", blueWon || redWon ? "solid" : "outline");
+    setChip(el.resultChip, t(blueWon ? "blueWins" : redWon ? "redWins" : "noResult"), blueWon || redWon ? "solid" : "outline");
     el.resultSide.textContent = "";
     setTeam(el.resultSide, null);
   }
@@ -2189,7 +2482,9 @@ function renderMatch() {
   el.redScore.classList.toggle("is-winner", redWon);
   el.score.setAttribute(
     "aria-label",
-    scored ? `${el.resultChip.textContent}. Azul ${replay.blueKills}, rojo ${replay.redKills}` : el.resultChip.textContent ?? "",
+    scored
+      ? t("scoreLabel", { result: el.resultChip.textContent ?? "", blue: replay.blueKills, red: replay.redKills })
+      : el.resultChip.textContent ?? "",
   );
   el.duration.textContent = formatDuration(replay.gameDurationMs);
   el.patch.textContent = replay.patch ?? "—";
@@ -2197,7 +2492,7 @@ function renderMatch() {
   const matchPage = matchPageUrl(replay);
   el.matchId.replaceChildren(replay.matchId ?? "—", matchPage ? icon("external") : "");
   el.matchId.disabled = !matchPage;
-  el.matchId.title = matchPage ? "Abrir en League of Graphs" : "";
+  el.matchId.title = matchPage ? t("openInLeagueOfGraphs") : "";
   // Sin ID no hay nada que copiar.
   el.copyMatchId.hidden = !replay.matchId;
 
@@ -2226,7 +2521,7 @@ function renderClientStrip() {
   setTone(el.clientStatus, view.tone);
   setText(el.clientText, view.text);
   setText(el.version, view.build);
-  el.version.title = view.inexact && state.replay?.gameVersion ? `Repetición: ${state.replay.gameVersion}` : "";
+  el.version.title = view.inexact && state.replay?.gameVersion ? t("replayVersion", { version: state.replay.gameVersion }) : "";
   el.versionInexact.hidden = !view.inexact;
   setText(el.clientLocation, view.location);
   el.clientLocation.title = view.location === "—" ? "" : view.location;
@@ -2245,19 +2540,20 @@ function renderClientStrip() {
   el.play.disabled = !view.executable || state.launch?.state === "launching";
   el.clientProgress.hidden = view.progress == null;
   el.clientProgressBar.style.width = `${view.progress ?? 0}%`;
+  setText(el.clientSpeed, view.speed);
   el.clientError.hidden = !view.error;
   setText(el.clientError, view.error ?? "");
   el.clientError.title = view.error ?? "";
+  el.clientNote.hidden = !view.note;
+  setText(el.clientNote, view.note ?? "");
 }
 
 // ——— Marcador ———
 
 /** Sin jugadores: una repetición que no se pudo analizar dice por qué (notas del backend). */
 function emptyMatchText(replay: ReplayInspection) {
-  // Las notas explican una lectura fallida o estadísticas omitidas (más de 32 jugadores); la que
-  // solo dice de dónde salieron los metadatos no explica nada.
-  const reasons = replay.notes.filter((note) => !INFORMATIONAL_NOTES.has(note));
-  return reasons.length ? reasons.join(" ") : "Sin estadísticas";
+  // Las notas explican una lectura fallida o estadísticas omitidas (más de 32 jugadores).
+  return replay.notes.length ? replay.notes.join(" ") : t("noStats");
 }
 
 function renderScoreboard(replay: ReplayInspection) {
@@ -2278,12 +2574,12 @@ function renderScoreboard(replay: ReplayInspection) {
       const label = sideLabel(side);
       return h(
         "section",
-        { class: "sb-team", attrs: { "aria-label": `${label}, ${win ? "victoria" : "derrota"}` } },
+        { class: "sb-team", attrs: { "aria-label": t("teamResult", { side: label, result: t(win ? "victoryLower" : "defeatLower") }) } },
         h(
           "div",
           { class: "sb-team__head" },
           h("h3", { class: "side-label", text: label, dataset: teamData(side) }),
-          chip(win ? "Victoria" : "Derrota", win ? "win" : "loss", true),
+          chip(t(win ? "victory" : "defeat"), win ? "win" : "loss", true),
           summary ? objectives(summary) : null,
         ),
         ...players.map((player) => playerRow(player, kills, maxDamage, minutes, replay)),
@@ -2295,16 +2591,16 @@ function renderScoreboard(replay: ReplayInspection) {
 function objectives(team: TeamSummary) {
   // Los asesinatos repiten el marcador de arriba: con poco ancho el CSS los quita primero.
   const pairs: Array<[string, string, string?]> = [
-    ["Asesinatos", String(team.kills), "objectives__kills"],
-    ["Torres", String(team.towers)],
-    ["Inhib.", String(team.inhibitors)],
-    ["Dragones", String(team.dragons)],
-    ["Barones", String(team.barons)],
-    ["Heraldos", String(team.heralds)],
-    ["Larvas", String(team.voidgrubs)],
+    [t("kills"), String(team.kills), "objectives__kills"],
+    [t("towers"), String(team.towers)],
+    [t("inhibShort"), String(team.inhibitors)],
+    [t("dragons"), String(team.dragons)],
+    [t("barons"), String(team.barons)],
+    [t("heralds"), String(team.heralds)],
+    [t("grubs"), String(team.voidgrubs)],
   ];
   if (team.atakhan) pairs.push(["Atakhan", String(team.atakhan)]);
-  pairs.push(["Oro", formatThousands(team.goldEarned)]);
+  pairs.push([t("gold"), formatThousands(team.goldEarned)]);
   return h(
     "dl",
     { class: "objectives" },
@@ -2323,14 +2619,14 @@ function playerRow(player: PlayerStats, teamKills: number, maxDamage: number, mi
       // Un div genérico no admite nombre accesible: como grupo, el resumen se anuncia al entrar.
       attrs: {
         role: "group",
-        "aria-label": `${player.name || "Jugador"}, ${champion}, ${player.kills}/${player.deaths}/${player.assists}`,
+        "aria-label": `${player.name || t("player")}, ${champion}, ${player.kills}/${player.deaths}/${player.assists}`,
       },
     },
     h(
       "div",
       { class: "sb-champ" },
       championTile(player.champion, replay.dataDragonVersion, player.championImageUrl),
-      player.level ? h("span", { class: "level", title: "Nivel", text: player.level }) : null,
+      player.level ? h("span", { class: "level", title: t("level"), text: player.level }) : null,
     ),
     h(
       "div",
@@ -2340,7 +2636,7 @@ function playerRow(player: PlayerStats, teamKills: number, maxDamage: number, mi
         { class: "sb-name__line" },
         h("span", { class: "sb-name__id", text: player.gameName || player.name || "—", title: player.name }),
         player.tagLine ? h("span", { class: "sb-name__tag", text: `#${player.tagLine}` }) : null,
-        owner ? h("span", { class: "owner-tag", text: "Tú" }) : null,
+        owner ? h("span", { class: "owner-tag", text: t("you") }) : null,
       ),
       h("span", { class: "sb-name__sub", text: [POSITIONS[player.position], champion].filter(Boolean).join(" · ") }),
     ),
@@ -2413,7 +2709,7 @@ function itemIconUrl(item: PlayerItem, data = state.dataDragon) {
 function items(player: PlayerStats, roleSlot: boolean) {
   return itemSlots(player, roleSlot).map(({ slot, item }) => {
     const asset = item ? state.dataDragon?.items.get(item.id) : undefined;
-    const label = item ? asset?.name ?? `Objeto ${item.id}` : "";
+    const label = item ? asset?.name ?? t("itemNamed", { id: item.id }) : "";
     const classes = ["slot", "slot--item"];
     if (slot === 7) classes.push("slot--role");
     if (!item) classes.push("slot--empty");
@@ -2448,15 +2744,15 @@ function renderTeamCompare(replay: ReplayInspection) {
     return;
   }
   const rows: Array<[string, number, number, (value: number) => string]> = [
-    ["Asesinatos", blue.kills, red.kills, String],
-    ["Oro", blue.goldEarned, red.goldEarned, formatThousands],
-    ["Daño a campeones", blue.damageToChampions, red.damageToChampions, formatThousands],
-    ["Torres", blue.towers, red.towers, String],
-    ["Inhibidores", blue.inhibitors, red.inhibitors, String],
-    ["Dragones", blue.dragons, red.dragons, String],
-    ["Barones", blue.barons, red.barons, String],
-    ["Heraldos", blue.heralds, red.heralds, String],
-    ["Larvas del Vacío", blue.voidgrubs, red.voidgrubs, String],
+    [t("kills"), blue.kills, red.kills, String],
+    [t("gold"), blue.goldEarned, red.goldEarned, formatThousands],
+    [t("damageToChampions"), blue.damageToChampions, red.damageToChampions, formatThousands],
+    [t("towers"), blue.towers, red.towers, String],
+    [t("inhibitors"), blue.inhibitors, red.inhibitors, String],
+    [t("dragons"), blue.dragons, red.dragons, String],
+    [t("barons"), blue.barons, red.barons, String],
+    [t("heralds"), blue.heralds, red.heralds, String],
+    [t("voidgrubs"), blue.voidgrubs, red.voidgrubs, String],
     ["Atakhan", blue.atakhan, red.atakhan, String],
   ];
   el.teamCompare.replaceChildren(
@@ -2467,7 +2763,7 @@ function renderTeamCompare(replay: ReplayInspection) {
         const tone = (side: "left" | "right") => (lead === "tie" ? "is-tie" : lead === side ? "is-lead" : "is-trail");
         return h(
           "div",
-          { class: "compare-row", attrs: { role: "group", "aria-label": `${label}: azul ${format(left)}, rojo ${format(right)}` } },
+          { class: "compare-row", attrs: { role: "group", "aria-label": t("compareLabel", { label, blue: format(left), red: format(right) }) } },
           h("span", { class: "compare-row__label", text: label }),
           h("span", { class: `compare-row__value num${lead === "left" ? " is-lead" : ""}`, text: format(left) }),
           h(
@@ -2492,9 +2788,9 @@ function renderDamage(replay: ReplayInspection) {
         .map((player) => {
           const owner = player.name === state.owner;
           const segments: Array<[string, number, string]> = [
-            ["physical", player.physicalDamageToChampions, "Físico"],
-            ["magic", player.magicDamageToChampions, "Mágico"],
-            ["true", player.trueDamageToChampions, "Verdadero"],
+            ["physical", player.physicalDamageToChampions, t("physical")],
+            ["magic", player.magicDamageToChampions, t("magic")],
+            ["true", player.trueDamageToChampions, t("trueDamage")],
           ];
           const champion = championName(player.champion);
           return h(
@@ -2532,18 +2828,18 @@ function renderDamage(replay: ReplayInspection) {
 function renderPlayerTable(replay: ReplayInspection) {
   const minutes = Math.max(1 / 60, (replay.gameDurationMs ?? 0) / 60_000);
   const columns: Array<[string, (player: PlayerStats) => number, (value: number) => string]> = [
-    ["Oro/min", (player) => player.goldEarned / minutes, (value) => formatInt(value)],
-    ["Daño recibido", (player) => player.damageTaken, formatInt],
-    ["Daño mitigado", (player) => player.damageSelfMitigated, formatInt],
-    ["Curación y escudos", (player) => player.healShieldOnTeammates, formatInt],
-    ["Tiempo muerto", (player) => player.timeDeadSeconds, formatClock],
+    [t("goldPerMinute"), (player) => player.goldEarned / minutes, (value) => formatInt(value)],
+    [t("damageTaken"), (player) => player.damageTaken, formatInt],
+    [t("damageMitigated"), (player) => player.damageSelfMitigated, formatInt],
+    [t("healShield"), (player) => player.healShieldOnTeammates, formatInt],
+    [t("timeDead"), (player) => player.timeDeadSeconds, formatClock],
   ];
   const maxima = columns.map(([, value]) => Math.max(...replay.players.map(value), 0));
   el.playerTable.replaceChildren(
     h(
       "div",
       { class: "ptable__row ptable__row--head", attrs: { "aria-hidden": "true" } },
-      h("span", { text: "Jugador" }),
+      h("span", { text: t("player") }),
       ...columns.map(([label]) => h("span", { class: "num", text: label })),
     ),
     ...teamSides(replay).flatMap((side) => [
@@ -2580,14 +2876,14 @@ function renderPlayerTable(replay: ReplayInspection) {
 function renderFile(replay: ReplayInspection) {
   const entry = state.library?.entries.find((item) => item.path === replay.path);
   const facts: Array<[string, string]> = [
-    ["Ruta", replay.path],
-    ["Formato", formatLabel(replay.format)],
-    ["Tamaño", entry ? formatBytes(entry.fileSize) : "—"],
+    [t("path"), replay.path],
+    [t("format"), formatLabel(replay.format)],
+    [t("size"), entry ? formatBytes(entry.fileSize) : "—"],
     // Fecha del archivo (cuando se descargó o guardó), no la de la partida: igual que en el resumen.
-    ["Descargada", formatDateLong(entry?.modifiedAtMs ?? null)],
+    [t("downloaded"), formatDateLong(entry?.modifiedAtMs ?? null)],
     ["Build", replay.gameVersion ?? "—"],
-    ["Región", replay.region ?? "—"],
-    ["ID de partida", replay.matchId ?? "—"],
+    [t("region"), replay.region ?? "—"],
+    [t("matchId"), replay.matchId ?? "—"],
   ];
   el.fileFacts.replaceChildren(
     ...facts.flatMap(([label, value]) => [h("dt", { text: label }), h("dd", { text: value, title: value })]),
@@ -2660,9 +2956,12 @@ function renderDrawer() {
   const version = install?.gameVersion ?? replay?.gameVersion;
   const downloadError = state.installError && state.installError.gameVersion === version ? state.installError.message : null;
 
-  // Un plan de "Reanudar" que resulta nuevo (no quedó nada) se titula como tal.
-  const resume = plan ? plan.mode === "resume" : state.planKind === "resume";
-  setText(el.drawerTitle, progress ? "Descargando" : resume ? "Reanudar" : "Preparar cliente");
+  // Mientras llega el plan, el modo que se espera según el disco: el botón dice "Reanudar" desde el
+  // comienzo y no cambia al llegar. Un plan de "Reanudar" que resulta nuevo (no quedó nada) se
+  // titula como tal.
+  const status = replay?.gameVersion ? state.statuses.get(replay.gameVersion) : undefined;
+  const mode = plan?.mode ?? expectedMode(status);
+  setText(el.drawerTitle, t(progress ? "downloading" : mode === "resume" ? "resume" : "prepareClient"));
   // Durante la descarga, lo que se descarga, aunque la partida abierta sea otra.
   setText(
     el.drawerSubtitle,
@@ -2673,11 +2972,11 @@ function renderDrawer() {
         : "",
   );
   setText(el.planVersion, install?.build ?? plan?.gameBuild ?? replay?.gameVersion ?? "—");
-  const mode = install
-    ? "Descargando"
+  const modeText = install
+    ? t("downloading")
     : plan ? modeLabel(plan.mode) : state.planning ? stageLabel(state.planStage) : "—";
   // Nueva y la descarga en curso informan; reanudar y reparar avisan; lista, en verde.
-  setChip(el.planMode, mode, install ? "info" : plan ? MODE_TONES[plan.mode] : "outline");
+  setChip(el.planMode, modeText, install ? "info" : plan ? MODE_TONES[plan.mode] : "outline");
   const focused = document.activeElement;
   el.planView.hidden = progress;
   el.progressView.hidden = !progress;
@@ -2690,15 +2989,18 @@ function renderDrawer() {
   }
 
   if (install) {
-    const percent = progressPercent(install.percent, install.done);
+    const percent = downloadPercent(install.percent, install.done);
     // Solo el porcentaje es región viva; el archivo en curso cambia demasiado para anunciarlo.
-    setText(el.progressPercent, formatPercent(percent));
+    setText(el.progressPercent, formatDownloadPercent(percent));
     setText(
       el.progressBytes,
-      install.total ? `${formatBytes(install.downloaded)} de ${formatBytes(install.total)}` : "",
+      install.total ? t("amountOf", { done: formatBytes(install.downloaded), total: formatBytes(install.total) }) : "",
     );
     el.progressBar.style.width = `${percent}%`;
     el.progressTrack.setAttribute("aria-valuenow", String(percent));
+    // Velocidad y tiempo restante en su línea reservada, bajo los bytes: llegan tras el primer
+    // segundo medido.
+    setText(el.progressRate, rateText(install));
     setText(el.progressFile, install.detail);
     el.progressFile.title = install.detail;
     const current = STAGES.indexOf(install.stage);
@@ -2720,7 +3022,6 @@ function renderDrawer() {
   el.planError.hidden = !planErrors;
   setText(el.planError, planErrors);
 
-  const status = replay?.gameVersion ? state.statuses.get(replay.gameVersion) : undefined;
   const destination = plan?.destinationPath ?? status?.destinationPath ?? "—";
   el.planDestination.textContent = destination;
   el.planDestination.title = destination;
@@ -2731,17 +3032,28 @@ function renderDrawer() {
   el.locale.disabled = state.planning;
   el.planChangeRoot.disabled = state.planning;
   const pending = state.planning ? "…" : "—";
-  el.planFileCount.textContent = plan ? `${formatInt(plan.affectedFileCount)} de ${formatInt(plan.fileCount)}` : pending;
+  el.planFileCount.textContent = plan
+    ? t("amountOf", { done: formatInt(plan.affectedFileCount), total: formatInt(plan.fileCount) })
+    : pending;
   el.planDownloadSize.textContent = plan ? formatBytes(plan.downloadBytes) : pending;
   el.planInstallSize.textContent = plan ? formatBytes(plan.totalInstallBytes) : pending;
   el.planSource.textContent = plan
-    ? [plan.source === "sieve" ? "Riot Sieve" : "riot-manifests", plan.exactBuild ? null : "no exacta"].filter(Boolean).join(" · ")
+    ? [plan.source === "sieve" ? "Riot Sieve" : "riot-manifests", plan.exactBuild ? null : t("notExact")].filter(Boolean).join(" · ")
     : pending;
   el.planSource.title = plan?.manifestUrl ?? "";
-  el.confirmLabel.textContent = plan ? confirmLabel(plan.mode) : "Descargar";
+  el.confirmLabel.textContent = confirmLabel(mode);
   // Usar un cliente listo no descarga nada.
-  el.confirmIcon.hidden = plan?.mode === "ready";
+  el.confirmIcon.hidden = mode === "ready";
   el.confirmClient.disabled = !plan || state.planning;
+}
+
+/**
+ * Modo que tendrá el plan según lo que hay en disco, para rotular el panel mientras se calcula:
+ * una compilación incompleta (o un plan pedido para reanudar) se reanuda y una lista se usa.
+ */
+function expectedMode(status: LocalClientStatus | undefined): ClientWorkMode {
+  if (state.planKind === "resume" || status?.state === "partial") return "resume";
+  return status?.state === "ready" ? "ready" : "install";
 }
 
 // ——— Clientes ———
@@ -2768,7 +3080,7 @@ function renderClients() {
   el.buildsList.replaceChildren(
     ...(rows.length
       ? rows.map(buildRow)
-      : [h("p", { class: "builds__empty", text: state.library ? "Sin builds" : "Sin biblioteca" })]),
+      : [h("p", { class: "builds__empty", text: t(state.library ? "noBuilds" : "noLibrary") })]),
   );
   if (focused) {
     const button = [...el.buildsList.querySelectorAll("button")].find((item) => buildActionKey(item) === focused);
@@ -2791,12 +3103,20 @@ function renderInstallRow() {
     const text = row.querySelector<HTMLElement>(".builds__state-text");
     if (text) setText(text, installStateText(install));
     const fill = row.querySelector<HTMLElement>(".builds__meter .meter__fill");
-    if (fill) fill.style.width = `${progressPercent(install.percent, install.done)}%`;
+    if (fill) fill.style.width = `${downloadPercent(install.percent, install.done)}%`;
+    const rate = row.querySelector<HTMLElement>(".builds__rate");
+    if (rate) setText(rate, installRate(install).speed);
   }
 }
 
 function installStateText(install: InstallRun) {
-  return `Descargando · ${formatPercent(progressPercent(install.percent, install.done))}`;
+  return t("downloadingPercent", { percent: formatDownloadPercent(downloadPercent(install.percent, install.done)) });
+}
+
+/** "6,1 MB/s · quedan 56 min", lo que se sepa. */
+function rateText(install: InstallRun) {
+  const { speed, eta } = installRate(install);
+  return [speed, eta].filter(Boolean).join(" · ");
 }
 
 type BuildRow = {
@@ -2839,37 +3159,40 @@ function buildRow(row: BuildRow) {
   const install = state.install;
   const installing = install?.build === row.build;
   const statusState: GlyphState = installing ? "busy" : !row.known ? "unknown" : row.status?.state ?? "missing";
-  const percent = row.status?.totalInstallBytes
-    ? progressPercent((row.status.installedBytes / row.status.totalInstallBytes) * 100, false)
-    : null;
   const stateText = install && installing
     ? installStateText(install)
     : statusState === "unknown"
       ? "—"
       : statusState === "ready"
-        ? "Listo"
-        : statusState === "partial"
-          ? `Incompleto${percent == null ? "" : ` · ${formatPercent(percent)}`}`
-          : "No instalado";
-  const size = statusState === "ready"
-    ? formatBytes(row.status?.installedBytes ?? 0)
-    : row.status?.totalInstallBytes
-      ? formatBytes(row.status.totalInstallBytes)
-      : "—";
+        ? t("ready")
+        : statusState === "partial" && row.status
+          ? partialStateText(row.status)
+          : t("notInstalled");
+  // Lista: lo que ocupa. Incompleta: lo que ya hay en disco (con lo guardado a medias) de su total.
+  const total = row.status?.totalInstallBytes;
+  const size: Array<Node | string> = statusState === "ready"
+    ? [formatBytes(row.status?.installedBytes ?? 0)]
+    : statusState === "partial" && total
+      ? [
+        h("span", { text: formatBytes(row.status?.installedBytes ?? 0) }),
+        " ",
+        h("small", { text: t("ofTotal", { total: formatBytes(total) }) }),
+      ]
+      : ["—"];
   const actions: HTMLButtonElement[] = [];
   const version = row.version;
   // Una descarga a la vez: mientras corre otra, las de esta compilación esperan.
   const busy = !!install;
   if (installing) {
-    actions.push(actionButton("Progreso", showProgress));
+    actions.push(actionButton(t("progress"), showProgress));
   } else if (row.known) {
     if (version && statusState !== "ready") {
       const kind = statusState === "partial" ? "resume" : "install";
-      actions.push(actionButton(kind === "resume" ? "Reanudar" : "Descargar", () => void goToBuild(version, kind), true, busy));
+      actions.push(actionButton(t(kind === "resume" ? "resume" : "confirmInstall"), () => void goToBuild(version, kind), true, busy));
     }
-    if (version && statusState === "ready") actions.push(actionButton("Verificar", () => void goToBuild(version, "install"), false, busy));
+    if (version && statusState === "ready") actions.push(actionButton(t("verify"), () => void goToBuild(version, "install"), false, busy));
     const path = row.status?.state === "ready" ? row.status.executablePath : row.status?.state === "partial" ? row.status.destinationPath : null;
-    if (path) actions.push(actionButton("Abrir", () => void reveal(path, "clients")));
+    if (path) actions.push(actionButton(t("open"), () => void reveal(path, "clients")));
   }
   return h(
     "div",
@@ -2883,18 +3206,24 @@ function buildRow(row: BuildRow) {
     h("span", { class: "builds__cell", text: row.patch }),
     h("span", { class: "builds__cell num", text: row.replays }),
     h("span", { class: "builds__cell", text: row.status?.locale ?? "—" }),
-    h("span", { class: "builds__cell num", text: size }),
+    h("span", { class: "builds__cell builds__size num" }, ...size),
     h(
       "span",
       { class: "builds__state", dataset: GLYPH_TONES[statusState] ? { tone: GLYPH_TONES[statusState] } : {} },
       glyphElement(statusState),
       h("span", { class: "builds__state-text", text: stateText }),
-      // Progreso de la descarga bajo el estado, fuera del flujo: la fila no cambia de alto.
+      // Progreso de la descarga bajo el estado, fuera del flujo: la fila no cambia de alto. A su
+      // lado, la velocidad (el tiempo restante no cabe en la columna: está en el panel).
       install && installing
         ? h(
           "span",
-          { class: "meter meter--mini builds__meter", attrs: { "aria-hidden": "true" } },
-          h("span", { class: "meter__fill", style: { width: `${progressPercent(install.percent, install.done)}%` } }),
+          { class: "builds__progress", attrs: { "aria-hidden": "true" } },
+          h(
+            "span",
+            { class: "meter meter--mini builds__meter" },
+            h("span", { class: "meter__fill", style: { width: `${downloadPercent(install.percent, install.done)}%` } }),
+          ),
+          h("span", { class: "builds__rate mono", text: installRate(install).speed }),
         )
         : null,
     ),
@@ -3028,7 +3357,7 @@ function teamSides(replay: ReplayInspection) {
 }
 
 function sideLabel(side: string) {
-  return side === "Blue" ? "Lado azul" : side === "Red" ? "Lado rojo" : side;
+  return side === "Blue" ? t("blueSide") : side === "Red" ? t("redSide") : side;
 }
 
 function formatLabel(format: ReplayInspection["format"]) {
@@ -3036,16 +3365,24 @@ function formatLabel(format: ReplayInspection["format"]) {
 }
 
 function modeLabel(mode: ClientWorkMode) {
-  return { install: "Nueva", resume: "Reanudar", repair: "Reparar", ready: "Lista" }[mode];
+  const keys: Record<ClientWorkMode, MessageKey> = { install: "modeInstall", resume: "modeResume", repair: "modeRepair", ready: "modeReady" };
+  return t(keys[mode]);
 }
 
 function confirmLabel(mode: ClientWorkMode) {
-  return { install: "Descargar", resume: "Reanudar", repair: "Reparar", ready: "Usar cliente" }[mode];
+  const keys: Record<ClientWorkMode, MessageKey> = {
+    install: "confirmInstall",
+    resume: "confirmResume",
+    repair: "confirmRepair",
+    ready: "confirmReady",
+  };
+  return t(keys[mode]);
 }
 
 function stageLabel(stage: string | null) {
-  if (!stage) return "…";
-  return { resolve: "Resolviendo", manifest: "Manifiesto", plan: "Comparando" }[stage] ?? "…";
+  const keys: Record<string, MessageKey> = { resolve: "resolving", manifest: "manifest", plan: "comparing" };
+  const key = stage ? keys[stage] : undefined;
+  return key ? t(key) : "…";
 }
 
 function initializeLocales() {
@@ -3063,7 +3400,7 @@ function fileNameOf(path: string) {
 }
 
 function replaysLabel(count: number) {
-  return `${count} ${count === 1 ? "repetición" : "repeticiones"}`;
+  return plural(count, "replaysOne", "replaysOther", formatInt(count));
 }
 
 /** Escribe el texto solo si cambió (evita volver a anunciar regiones vivas y trabajo de más). */
@@ -3112,8 +3449,8 @@ async function reveal(path: string, from: "match" | "clients") {
       renderClients();
     }
   } catch (error) {
-    // El detalle viene del sistema o del complemento: la acción fallida se nombra en español.
-    const message = `No se pudo abrir la carpeta. ${errorText(error)}`;
+    // El detalle viene del sistema o del complemento: la acción fallida se nombra en el idioma de la interfaz.
+    const message = t("folderOpenFailed", { error: errorText(error) });
     if (replay) {
       state.actionError = { path: replay, message };
       // Se ve el error de la última acción: el de un inicio anterior deja de mostrarse.
@@ -3148,5 +3485,5 @@ async function copyText(text: string, button: HTMLButtonElement) {
 
 function errorText(error: unknown) {
   const detail = String(error).replace(/^Error:\s*/i, "").trim();
-  return detail && detail !== "[object Object]" ? detail : "Error desconocido";
+  return detail && detail !== "[object Object]" ? detail : t("unknownError");
 }

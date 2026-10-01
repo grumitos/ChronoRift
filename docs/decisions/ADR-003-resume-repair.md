@@ -54,3 +54,33 @@ Deferred. It would require a verified hash contract or another dependency and wo
 - Repair is visible and distinguishable from installation.
 - A plan can become stale and must then be reviewed again.
 - Same-size corruption remains a known limitation.
+
+## Update 2026-09-30: resume inside each file
+
+Resume granularity is now the chunk, not the file. Stopping a 23.7 GiB download after a minute used to keep nothing: hundreds of files were half written, and their `.part` files were deleted ([ADR-005](ADR-005-bundle-range-downloads.md)).
+
+- **What is kept.** Stop, a failure after the retries, and a crash keep the `.part` files.
+- **The journal.** `.chronorift/journal.json` records which ranges of each `.part` reached the disk. It also records the plan it belongs to (manifest URL, resolved version, locale, destination) and, for each file:
+  - its size;
+  - its `.part` name, built from its stable position in the manifest selection;
+  - whether it is sparse;
+  - the `.part` creation time.
+- **Durability.**
+  - A checkpoint runs at least every 10 s and when the download stops or fails.
+  - It flushes (`sync_data`) every `.part` written since the previous checkpoint. Only then does it replace the journal: the journal is written aside, flushed, and renamed over the old one.
+  - So the journal never claims bytes that are not on disk, and a power cut loses at most the last 10 s.
+  - A complete file is flushed before it is renamed into place, so after a power cut a file with the right size has no holes.
+- **Trust.** A journal entry is used only when all of these hold:
+  - the plan matches;
+  - the manifest path, size, and `.part` name match the pending file;
+  - the ranges are ordered and inside the file;
+  - the `.part` still exists with the recorded creation time;
+  - its length is the full size (sparse) or covers the ranges (not sparse).
+  - Any other `.part` or journal is removed when a plan is confirmed. The journal is read again once the destination's lock is taken, and a change since planning requires a new review.
+- **The resume plan.**
+  - A placement fully covered by a trusted range is done.
+  - `downloadBytes` counts only chunks that still have a missing placement, so a chunk shared with a done placement is fetched again.
+  - `installBytes` is what is left to write.
+  - A destination with only kept `.part` files is a `resume`, while `repair` still wins when a target has the wrong size.
+- **Progress.** Progress starts from the compressed size of the chunks already on disk. `client_statuses` adds the journaled bytes to `installedBytes`.
+- **Unchanged.** Committed files are still validated by path and size only. Kept `.part` data is trusted through the journal rules above, not by content.
