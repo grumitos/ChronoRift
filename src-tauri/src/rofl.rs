@@ -27,6 +27,12 @@ const ROFL2_VERSION_OFFSET: usize = 14;
 /// El id de la partida ocupa los primeros 8 bytes de la cabecera de la carga útil clásica.
 const MATCH_ID_BYTES: u32 = 8;
 const POSITIONS: [&str; 5] = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"];
+/// Plataformas de Riot que se reconocen en los metadatos y en el nombre del archivo. Un valor fuera
+/// de la lista no da región: se usa para elegir servidor y para armar enlaces, no se adivina.
+const KNOWN_PLATFORMS: [&str; 17] = [
+    "BR1", "EUN1", "EUW1", "JP1", "KR", "LA1", "LA2", "ME1", "NA1", "OC1", "PH2", "RU", "SG2",
+    "TH2", "TR1", "TW2", "VN2",
+];
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -281,7 +287,7 @@ pub fn inspect_file(path: impl Into<PathBuf>) -> Result<ReplayInspection, Inspec
             "gameServerRegion",
         ],
     )
-    .map(|value| value.to_ascii_uppercase());
+    .and_then(|value| known_platform(&value));
     let suggested_locale = region.as_deref().and_then(suggest_locale_for_region);
     let game_duration_ms = get_u64(
         &metadata,
@@ -847,20 +853,30 @@ fn find_ascii_version(bytes: &[u8]) -> Option<String> {
     None
 }
 
+fn known_platform(value: &str) -> Option<String> {
+    let upper = value.trim().to_ascii_uppercase();
+    KNOWN_PLATFORMS.contains(&upper.as_str()).then_some(upper)
+}
+
+/// Lee `<lo que sea>-<PLATAFORMA>-<dígitos>` o `<PLATAFORMA>-<dígitos>` (sin importar mayúsculas)
+/// desde la derecha, así que un prefijo con guiones no confunde la región. Sin una plataforma
+/// conocida y un id numérico, no hay ni región ni partida.
 fn region_and_match_from_file_name(file_name: &str) -> (Option<String>, Option<String>) {
     let stem = Path::new(file_name)
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or(file_name);
-    let Some((region, match_id)) = stem.split_once('-') else {
+    let Some((rest, match_id)) = stem.rsplit_once('-') else {
         return (None, None);
     };
-
-    (
-        (!region.is_empty()).then(|| region.to_ascii_uppercase()),
-        (!match_id.is_empty() && match_id.chars().all(|ch| ch.is_ascii_digit()))
-            .then(|| match_id.to_string()),
-    )
+    if match_id.is_empty() || !match_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return (None, None);
+    }
+    let platform = rest.rsplit_once('-').map_or(rest, |(_, platform)| platform);
+    match known_platform(platform) {
+        Some(region) => (Some(region), Some(match_id.to_string())),
+        None => (None, None),
+    }
 }
 
 fn suggest_locale_for_region(region: &str) -> Option<String> {
@@ -870,7 +886,10 @@ fn suggest_locale_for_region(region: &str) -> Option<String> {
         "JP1" => "ja_JP",
         "KR" => "ko_KR",
         "LA1" | "LA2" => "es_MX",
-        "NA1" | "OC1" | "PH2" | "SG2" => "en_US",
+        "NA1" => "en_US",
+        "OC1" => "en_AU",
+        "PH2" => "en_PH",
+        "SG2" => "en_SG",
         "RU" => "ru_RU",
         "TH2" => "th_TH",
         "TR1" => "tr_TR",
@@ -1017,6 +1036,45 @@ mod tests {
         let path = std::env::temp_dir().join(format!("chronorift-{label}-{unique}"));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// La región sale de una plataforma conocida en el nombre, leído desde la derecha, y su idioma
+    /// sugerido es el propio de la región. ME1 no sugiere nada: la interfaz no ofrece `ar_AE`.
+    #[test]
+    fn region_comes_only_from_a_known_platform_in_the_file_name() {
+        let root = temp_directory("platforms");
+        let metadata = metadata(
+            60_000,
+            &[player(("A", "B"), "Urgot", "100", "TOP", [1, 2, 3], true)],
+        );
+        // Nombre, región, partida e idioma sugerido.
+        let parsed = [
+            ("EUW1-123.rofl", "EUW1", "123", Some("en_GB")),
+            ("Replay-EUW1-123.rofl", "EUW1", "123", Some("en_GB")),
+            ("mis-partidas-la1-77.ROFL", "LA1", "77", Some("es_MX")),
+            ("OC1-5.rofl", "OC1", "5", Some("en_AU")),
+            ("PH2-5.rofl", "PH2", "5", Some("en_PH")),
+            ("SG2-5.rofl", "SG2", "5", Some("en_SG")),
+            ("ME1-5.rofl", "ME1", "5", None),
+        ];
+        for (name, region, match_id, locale) in parsed {
+            let path = root.join(name);
+            write_rofl2(&path, "16.17.810.4348", &metadata);
+            let replay = inspect_file(&path).unwrap();
+            assert_eq!(replay.region.as_deref(), Some(region), "{name}");
+            assert_eq!(replay.match_id.as_deref(), Some(match_id), "{name}");
+            assert_eq!(replay.suggested_locale.as_deref(), locale, "{name}");
+        }
+        // Plataforma desconocida o id que no es un número: ni región ni partida.
+        for name in ["PBE1-123.rofl", "EUW1-abc.rofl", "EUW1-.rofl", "123.rofl"] {
+            let path = root.join(name);
+            write_rofl2(&path, "16.17.810.4348", &metadata);
+            let replay = inspect_file(&path).unwrap();
+            assert_eq!(replay.region, None, "{name}");
+            assert_eq!(replay.match_id, None, "{name}");
+            assert_eq!(replay.suggested_locale, None, "{name}");
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1358,13 +1416,21 @@ mod tests {
                     .unwrap();
             let stats: Vec<Value> =
                 serde_json::from_str(trailer["statsJson"].as_str().unwrap()).unwrap();
+            // El nombre que baja el cliente es `<PLATAFORMA>-<dígitos>`: la región y la partida son
+            // sus dos partes. Un nombre con otra forma (renombrado a mano) no se contrasta aquí.
             let stem = entry.file_name.trim_end_matches(".rofl");
-            let (region, match_id) = stem.split_once('-').unwrap();
+            let plain_name = stem.split_once('-').filter(|(region, match_id)| {
+                KNOWN_PLATFORMS.contains(region)
+                    && !match_id.is_empty()
+                    && match_id.bytes().all(|byte| byte.is_ascii_digit())
+            });
 
             assert_eq!(replay.game_version.as_deref(), Some(version), "{context}");
             assert_eq!(replay.patch, entry.patch, "{context}");
-            assert_eq!(replay.region.as_deref(), Some(region), "{context}");
-            assert_eq!(replay.match_id.as_deref(), Some(match_id), "{context}");
+            if let Some((region, match_id)) = plain_name {
+                assert_eq!(replay.region.as_deref(), Some(region), "{context}");
+                assert_eq!(replay.match_id.as_deref(), Some(match_id), "{context}");
+            }
             assert_eq!(
                 replay.game_duration_ms,
                 trailer["gameLength"].as_u64(),

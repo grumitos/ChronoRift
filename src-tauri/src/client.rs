@@ -1,5 +1,5 @@
 use crate::{settings, tr};
-use cdragon_rman::{BundleChunk, Rman};
+use cdragon_rman::{BundleChunk, FileFlagEntry, Rman};
 use reqwest::{header, redirect, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1762,18 +1762,110 @@ fn parse_install_files(
     .unwrap_or(Err(ClientInstallError::CorruptManifest))
 }
 
-fn select_install_files(rman: &Rman, locale: &str) -> Result<Vec<InstallFile>, ClientInstallError> {
-    let locale_markers = rman
-        .iter_flags()
-        .filter_map(|flag| normalize_locale(flag.flag))
-        .map(|flag| locale_asset_marker(&flag).to_string())
-        .collect::<Vec<_>>();
-    let marker = locale_asset_marker(locale);
-    if !locale_markers.iter().any(|flag| flag == marker) {
-        return Err(ClientInstallError::UnavailableLocale(locale.to_string()));
+/// Cómo se decide qué archivos del manifiesto se instalan para un idioma.
+enum FileSelection<'a> {
+    /// Las banderas RMAN de cada archivo, que es lo que Riot usa para filtrarlos: el idioma pedido
+    /// (tal cual, sin equivalencias) más la plataforma Windows.
+    Flags(Vec<FileFlagEntry<'a>>),
+    /// Manifiestos donde ningún archivo trae banderas: el idioma y la plataforma se deducen del
+    /// nombre (`Aatrox.es_MX.wad.client`).
+    PathMarkers(Vec<String>),
+}
+
+/// Las banderas del manifiesto, listas para leer la máscara de cada archivo. En RMAN 2.1 los ids
+/// empiezan en 1 y la máscara usa el bit `id - 1`, pero cdragon-rman 0.2 prueba el bit `id`: se le
+/// pasan ids desplazados. Un id fuera de 1..=64 no cabe en la máscara (y con 65 o más la
+/// biblioteca desbordaría el desplazamiento), así que se omite.
+fn mask_flags(rman: &Rman) -> Vec<FileFlagEntry<'_>> {
+    rman.iter_flags()
+        .filter(|flag| (1..=64).contains(&flag.id))
+        .map(|flag| FileFlagEntry {
+            id: flag.id - 1,
+            flag: flag.flag,
+        })
+        .collect()
+}
+
+/// Rutas completas de los directorios, igual que `Rman::dir_paths` pero sin sus fallos con
+/// manifiestos dañados: un ciclo de padres la haría girar para siempre (sin pánico que atrapar) y
+/// un padre inexistente la haría entrar en pánico.
+fn directory_paths(rman: &Rman) -> Result<HashMap<u64, String>, ClientInstallError> {
+    // Con ids repetidos la biblioteca busca al padre en el primero y deja el último en el mapa.
+    let mut known = HashMap::new();
+    for directory in rman.iter_directories() {
+        known
+            .entry(directory.id)
+            .or_insert((directory.parent_id, directory.name));
     }
 
-    let directories = rman.dir_paths();
+    let mut paths = HashMap::with_capacity(known.len());
+    for directory in rman.iter_directories() {
+        // Un directorio que se tiene a sí mismo de padre es la raíz.
+        let mut parent = directory.parent_id.filter(|id| *id != directory.id);
+        let mut parts = vec![directory.name];
+        while let Some(id) = parent {
+            // Una cadena sin ciclos pasa por cada directorio una sola vez.
+            if parts.len() >= known.len() {
+                return Err(ClientInstallError::CorruptManifest);
+            }
+            let &(next, name) = known.get(&id).ok_or(ClientInstallError::CorruptManifest)?;
+            parts.push(name);
+            parent = next.filter(|next| *next != id);
+        }
+        parts.reverse();
+        paths.insert(directory.id, parts.join("/"));
+    }
+    Ok(paths)
+}
+
+/// Un archivo con banderas de idioma se instala solo si trae el pedido, y uno con banderas de
+/// plataforma solo si trae Windows. Las banderas de otra clase no restringen nada.
+fn wanted_by_flags<'a>(file_flags: impl Iterator<Item = &'a str>, locale: &str) -> bool {
+    let (mut has_locale, mut for_locale) = (false, false);
+    let (mut has_platform, mut for_platform) = (false, false);
+    for flag in file_flags {
+        if PLATFORM_MARKERS.contains(&flag) {
+            has_platform = true;
+            for_platform |= flag == PLATFORM;
+        } else if let Some(flag_locale) = normalize_locale(flag) {
+            has_locale = true;
+            for_locale |= flag_locale == locale;
+        }
+    }
+    (!has_locale || for_locale) && (!has_platform || for_platform)
+}
+
+fn select_install_files(rman: &Rman, locale: &str) -> Result<Vec<InstallFile>, ClientInstallError> {
+    let flags = mask_flags(rman);
+    let uses_flags = rman.iter_files().any(|file| {
+        file.flags
+            .as_ref()
+            .is_some_and(|set| set.iter(flags.iter()).next().is_some())
+    });
+    let selection = if uses_flags {
+        let offered = flags
+            .iter()
+            .any(|flag| normalize_locale(flag.flag).is_some_and(|offered| offered == locale));
+        if !offered {
+            return Err(ClientInstallError::UnavailableLocale(locale.to_string()));
+        }
+        FileSelection::Flags(flags)
+    } else {
+        let locale_markers = rman
+            .iter_flags()
+            .filter_map(|flag| normalize_locale(flag.flag))
+            .map(|flag| locale_asset_marker(&flag).to_string())
+            .collect::<Vec<_>>();
+        if !locale_markers
+            .iter()
+            .any(|flag| flag == locale_asset_marker(locale))
+        {
+            return Err(ClientInstallError::UnavailableLocale(locale.to_string()));
+        }
+        FileSelection::PathMarkers(locale_markers)
+    };
+
+    let directories = directory_paths(rman)?;
     let chunks = rman.bundle_chunks();
     let mut files = Vec::new();
     for file in rman.iter_files() {
@@ -1786,7 +1878,16 @@ fn select_install_files(rman: &Rman, locale: &str) -> Result<Vec<InstallFile>, C
             }
             None => file.name.to_string(),
         };
-        if !path_matches_locale(&path, marker, &locale_markers) {
+        let wanted = match &selection {
+            FileSelection::Flags(flags) => match &file.flags {
+                Some(set) => wanted_by_flags(set.iter(flags.iter()), locale),
+                None => true,
+            },
+            FileSelection::PathMarkers(locale_markers) => {
+                path_matches_locale(&path, locale_asset_marker(locale), locale_markers)
+            }
+        };
+        if !wanted {
             continue;
         }
         let file_chunks = file
@@ -3599,6 +3700,151 @@ mod tests {
         assert_eq!(locale_asset_marker("en_GB"), "en_US");
     }
 
+    /// Manifiesto de un solo bundle con un fragmento por archivo. Cada archivo trae
+    /// `(directorio, nombre, ids de bandera)`; la máscara sigue la regla de Riot (bit `id - 1`),
+    /// escrita aquí aparte para que una lectura desplazada en producción no pase inadvertida.
+    fn flagged_manifest(
+        flags: &[(u8, &str)],
+        directories: &[(u64, Option<u64>, &str)],
+        files: &[(Option<u64>, &str, &[u8])],
+    ) -> Vec<u8> {
+        let chunks = (0..files.len())
+            .map(|index| (0x100 + index as u64, 5, 10))
+            .collect::<Vec<_>>();
+        let manifest_files = files
+            .iter()
+            .enumerate()
+            .map(|(index, &(directory, name, ids))| {
+                let mask = ids.iter().fold(0_u64, |mask, id| mask | 1 << (id - 1));
+                (
+                    index as u64 + 1,
+                    directory,
+                    name,
+                    10,
+                    vec![0x100 + index as u64],
+                    (!ids.is_empty()).then_some(mask),
+                )
+            })
+            .collect::<Vec<_>>();
+        encode_test_manifest(flags, directories, &[(1, chunks)], &manifest_files)
+    }
+
+    fn selected_paths(manifest: &[u8], locale: &str) -> Vec<String> {
+        parse_install_files(manifest, locale, None)
+            .expect("manifest should plan")
+            .into_iter()
+            .map(|file| file.path)
+            .collect()
+    }
+
+    /// La selección sale de las banderas RMAN de cada archivo, no de su nombre, y respeta el
+    /// idioma pedido tal cual: es_AR trae sus archivos propios además de los compartidos con es_MX.
+    #[test]
+    fn selects_files_by_rman_flags_not_by_name() {
+        // El id 70 no cabe en una máscara de 64 bits: se omite en vez de desbordar la lectura.
+        let flags = [
+            (1, "windows"),
+            (2, "macos"),
+            (3, "es_AR"),
+            (4, "es_MX"),
+            (5, "fr_FR"),
+            (6, "ko_KR"),
+            (70, "en_GB"),
+        ];
+        let manifest = flagged_manifest(
+            &flags,
+            &[(1, None, "DATA")],
+            &[
+                (None, GAME_EXE, &[]),
+                (Some(1), "Bootstrap.windows.wad.client", &[1]),
+                (Some(1), "Bootstrap.macos.wad.client", &[2]),
+                (Some(1), "Bootstrap.both.wad.client", &[1, 2]),
+                // Los nombres engañan a propósito: manda la bandera.
+                (Some(1), "Aatrox.fr_FR.wad.client", &[4]),
+                (Some(1), "Aatrox.es_MX.wad.client", &[5]),
+                (Some(1), "Shared.es_MX.wad.client", &[3, 4]),
+                (Some(1), "UI.es_AR.wad.client", &[3]),
+                (Some(1), "Voice.ko_KR.windows.wad.client", &[6, 1]),
+                (Some(1), "Voice.ko_KR.macos.wad.client", &[6, 2]),
+            ],
+        );
+
+        assert_eq!(
+            selected_paths(&manifest, "es_MX"),
+            [
+                GAME_EXE,
+                "DATA/Bootstrap.windows.wad.client",
+                "DATA/Bootstrap.both.wad.client",
+                "DATA/Aatrox.fr_FR.wad.client",
+                "DATA/Shared.es_MX.wad.client",
+            ]
+        );
+        assert_eq!(
+            selected_paths(&manifest, "es_AR"),
+            [
+                GAME_EXE,
+                "DATA/Bootstrap.windows.wad.client",
+                "DATA/Bootstrap.both.wad.client",
+                "DATA/Shared.es_MX.wad.client",
+                "DATA/UI.es_AR.wad.client",
+            ]
+        );
+        assert_eq!(
+            selected_paths(&manifest, "ko_KR"),
+            [
+                GAME_EXE,
+                "DATA/Bootstrap.windows.wad.client",
+                "DATA/Bootstrap.both.wad.client",
+                "DATA/Voice.ko_KR.windows.wad.client",
+            ]
+        );
+        // Con banderas, un idioma que el manifiesto no ofrece no se sustituye por otro.
+        for locale in ["ja_JP", "en_GB"] {
+            assert!(
+                matches!(
+                    parse_install_files(&manifest, locale, None),
+                    Err(ClientInstallError::UnavailableLocale(_))
+                ),
+                "{locale}"
+            );
+        }
+    }
+
+    /// Las rutas de directorio coinciden con las de la biblioteca (incluida una raíz sin nombre),
+    /// y un árbol dañado es un manifiesto corrupto: antes un ciclo dejaba el proceso girando.
+    #[test]
+    fn directory_paths_match_the_library_and_reject_broken_trees() {
+        let flags = [(1, "windows"), (2, "es_MX")];
+        let file: [(Option<u64>, &str, &[u8]); 1] = [(Some(1), "a.wad.client", &[2])];
+
+        let healthy = flagged_manifest(
+            &flags,
+            &[(3, Some(2), "FINAL"), (2, Some(1), "DATA"), (1, None, "")],
+            &file,
+        );
+        let rman = read_rman_manifest(&healthy).unwrap();
+        assert_eq!(directory_paths(&rman).unwrap(), rman.dir_paths());
+        assert_eq!(directory_paths(&rman).unwrap()[&3], "/DATA/FINAL");
+
+        for (label, directories) in [
+            ("ciclo", vec![(1, Some(2), "A"), (2, Some(1), "B")]),
+            ("padre inexistente", vec![(1, Some(9), "A")]),
+        ] {
+            let broken = flagged_manifest(&flags, &directories, &file);
+            assert!(
+                matches!(
+                    parse_install_files(&broken, "es_MX", None),
+                    Err(ClientInstallError::CorruptManifest)
+                ),
+                "{label}"
+            );
+        }
+
+        // Un directorio que es su propio padre es la raíz.
+        let selfish = flagged_manifest(&flags, &[(1, Some(1), "DATA")], &file);
+        assert_eq!(selected_paths(&selfish, "es_MX"), ["DATA/a.wad.client"]);
+    }
+
     #[test]
     fn rejects_unsafe_paths_and_manifests_outside_riot_cdn() {
         let root = Path::new("D:/Clients/16.13");
@@ -4686,11 +4932,12 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Con un manifiesto real (CHRONORIFT_MANIFEST_SAMPLE), contrasta la selección por rutas con
-    /// las banderas RMAN de cada archivo e informa los totales, las peticiones del plan y la
-    /// reserva de más estimada en NTFS con el orden por bundle de antes y con el de ahora.
+    /// Con un manifiesto real (CHRONORIFT_MANIFEST_SAMPLE), comprueba que la selección por banderas
+    /// instala todo archivo que lleva el idioma pedido en el nombre, la contrasta con la regla por
+    /// rutas de antes e informa los totales, las peticiones del plan y la reserva de más estimada
+    /// en NTFS con el orden por bundle de antes y con el de ahora.
     #[test]
-    fn real_manifest_selection_matches_rman_flags() {
+    fn real_manifest_flag_selection_keeps_named_locale_files() {
         let Ok(path) = std::env::var("CHRONORIFT_MANIFEST_SAMPLE") else {
             eprintln!("skipped: set CHRONORIFT_MANIFEST_SAMPLE to a Riot lol-game-client manifest");
             return;
@@ -4703,58 +4950,49 @@ mod tests {
         assert!(files.len() > 100);
 
         let rman = read_rman_manifest(&bytes).unwrap();
-        // En RMAN 2.1 los ids de bandera empiezan en 1 y la máscara usa el bit `id - 1`;
-        // cdragon-rman 0.2 prueba el bit `id`, así que se le pasan ids desplazados.
-        let flags = rman
+        let directories = directory_paths(&rman).unwrap();
+        let locale_markers = rman
             .iter_flags()
-            .map(|flag| cdragon_rman::FileFlagEntry {
-                id: flag.id.saturating_sub(1),
-                flag: flag.flag,
-            })
+            .filter_map(|flag| normalize_locale(flag.flag))
+            .map(|flag| locale_asset_marker(&flag).to_string())
             .collect::<Vec<_>>();
-        let directories = rman.dir_paths();
+        let marker = locale_asset_marker(&locale);
         let selected = files
             .iter()
             .map(|file| file.path.as_str())
             .collect::<HashSet<_>>();
-        let marker = locale_asset_marker(&locale);
-        let mut missing = Vec::new();
-        let mut extra = Vec::new();
+        // Archivos que solo eligen las banderas, que solo elige la regla por rutas (de más) y
+        // archivos de Windows con el idioma pedido en el nombre que las banderas dejan fuera.
+        let mut only_by_flags = Vec::new();
+        let mut only_by_path = Vec::new();
+        let mut named_but_skipped = Vec::new();
         for file in rman.iter_files() {
             let path = file.path(&directories);
-            let file_flags = file
-                .flags
-                .as_ref()
-                .map(|set| set.iter(flags.iter()).collect::<Vec<_>>())
-                .unwrap_or_default();
-            let locales = file_flags
-                .iter()
-                .filter_map(|flag| normalize_locale(flag))
-                .collect::<Vec<_>>();
-            let platforms = file_flags
-                .iter()
-                .filter(|flag| PLATFORM_MARKERS.contains(flag))
-                .collect::<Vec<_>>();
-            let wanted = (locales.is_empty()
-                || locales
-                    .iter()
-                    .any(|flag| locale_asset_marker(flag) == marker))
-                && (platforms.is_empty() || platforms.iter().any(|flag| **flag == PLATFORM));
-            match (wanted, selected.contains(path.as_str())) {
-                (true, false) => missing.push(path),
-                (false, true) => extra.push(path),
+            let chosen = selected.contains(path.as_str());
+            match (chosen, path_matches_locale(&path, marker, &locale_markers)) {
+                (true, false) => only_by_flags.push(path.clone()),
+                (false, true) => only_by_path.push(path.clone()),
                 _ => {}
+            }
+            if !chosen && has_marker(&path, &locale) && !has_marker(&path, "macos") {
+                named_but_skipped.push(path);
             }
         }
         let work = plan_download(&files, &KeptParts::default(), MAX_WINDOW_BYTES).unwrap();
         let install_bytes = work.remaining.iter().sum::<u64>();
         let chunk_references = files.iter().map(|file| file.chunks.len()).sum::<usize>();
         eprintln!(
-            "{locale}: {} files, {chunk_references} chunk references, {} range requests, download {} B, install {install_bytes} B, {} extra by path rule",
+            "{locale}: {} files, {chunk_references} chunk references, {} range requests, download {} B, install {install_bytes} B, {} only by flags, {} only by path rule",
             files.len(),
             work.windows.len(),
             work.missing_bytes,
-            extra.len()
+            only_by_flags.len(),
+            only_by_path.len()
+        );
+        eprintln!(
+            "first only by flags: {:?}; first only by path rule: {:?}",
+            &only_by_flags[..only_by_flags.len().min(10)],
+            &only_by_path[..only_by_path.len().min(10)]
         );
         let (before, after) = reservation_peaks(&files, MAX_WINDOW_BYTES);
         let mib = |bytes: u64| bytes as f64 / 1_048_576.0;
@@ -4766,8 +5004,8 @@ mod tests {
             mib(after.overhead)
         );
         assert!(
-            missing.is_empty(),
-            "files flagged for {locale} but skipped: {missing:?}"
+            named_but_skipped.is_empty(),
+            "files named for {locale} but skipped by the flags: {named_but_skipped:?}"
         );
     }
 
@@ -5490,6 +5728,9 @@ mod tests {
         let _ = stream.flush();
     }
 
+    /// Directorio, nombre, tamaño, bundle, si se instala con es_MX en Windows y máscara de banderas.
+    type FixtureFile<'a> = (Option<u64>, &'a str, usize, u64, bool, Option<u64>);
+
     struct Fixture {
         manifest: Vec<u8>,
         bundles: HashMap<u64, Vec<u8>>,
@@ -5523,12 +5764,43 @@ mod tests {
     /// dos bundles comprimidos con zstd, y un archivo que reutiliza un fragmento del ejecutable.
     fn build_fixture() -> Fixture {
         const CHUNK: usize = 4_096;
-        let specs: [(Option<u64>, &str, usize, u64, bool); 5] = [
-            (None, GAME_EXE, 9_000, 0xA1, true),
-            (Some(3), "Aatrox.es_MX.wad.client", 7_000, 0xB2, true),
-            (Some(3), "Aatrox.fr_FR.wad.client", 5_000, 0xB2, false),
-            (Some(2), "Bootstrap.windows.wad.client", 3_000, 0xA1, true),
-            (Some(2), "Bootstrap.macos.wad.client", 2_000, 0xB2, false),
+        // La última columna es la máscara de banderas con el bit `id - 1` de las banderas de abajo
+        // (windows 1, en_US 2, es_MX 3, fr_FR 4, macos 5): así los flujos completos pasan por la
+        // selección por banderas, que es la de los manifiestos reales.
+        let specs: [FixtureFile; 5] = [
+            (None, GAME_EXE, 9_000, 0xA1, true, None),
+            (
+                Some(3),
+                "Aatrox.es_MX.wad.client",
+                7_000,
+                0xB2,
+                true,
+                Some(1 << 2),
+            ),
+            (
+                Some(3),
+                "Aatrox.fr_FR.wad.client",
+                5_000,
+                0xB2,
+                false,
+                Some(1 << 3),
+            ),
+            (
+                Some(2),
+                "Bootstrap.windows.wad.client",
+                3_000,
+                0xA1,
+                true,
+                Some(1),
+            ),
+            (
+                Some(2),
+                "Bootstrap.macos.wad.client",
+                2_000,
+                0xB2,
+                false,
+                Some(1 << 4),
+            ),
         ];
         let directories = [
             (1, None, "DATA"),
@@ -5542,7 +5814,9 @@ mod tests {
         let mut manifest_files = Vec::new();
         let mut files = Vec::new();
         let mut next_chunk_id = 0x1000_u64;
-        for (index, (directory, name, size, bundle_id, selected)) in specs.into_iter().enumerate() {
+        for (index, (directory, name, size, bundle_id, selected, mask)) in
+            specs.into_iter().enumerate()
+        {
             let content = (0..size)
                 .map(|offset| ((offset * 31 + index * 97) % 251) as u8)
                 .collect::<Vec<_>>();
@@ -5570,7 +5844,14 @@ mod tests {
                 Some(2) => format!("DATA/FINAL/{name}"),
                 Some(_) => format!("DATA/FINAL/Champions/{name}"),
             };
-            manifest_files.push((index as u64 + 1, directory, name, size as u32, chunk_ids));
+            manifest_files.push((
+                index as u64 + 1,
+                directory,
+                name,
+                size as u32,
+                chunk_ids,
+                mask,
+            ));
             files.push((path, content, selected));
         }
 
@@ -5583,6 +5864,7 @@ mod tests {
             "Shared.wad.client",
             CHUNK as u32,
             vec![shared_chunk],
+            None,
         ));
         files.push((
             "DATA/FINAL/Shared.wad.client".to_string(),
@@ -5711,7 +5993,8 @@ mod tests {
     }
 
     type ManifestBundle = (u64, Vec<(u64, u32, u32)>);
-    type ManifestFile<'a> = (u64, Option<u64>, &'a str, u32, Vec<u64>);
+    /// Id, directorio, nombre, tamaño, fragmentos y máscara de banderas (el bit `id - 1` de cada una).
+    type ManifestFile<'a> = (u64, Option<u64>, &'a str, u32, Vec<u64>, Option<u64>);
 
     /// Codifica un RMAN 2.1 (la versión que publica Riot hoy) con cuerpo comprimido en zstd.
     fn encode_test_manifest(
@@ -5761,13 +6044,15 @@ mod tests {
         let files_at = body.pos();
         body.link(root[2], files_at);
         let file_slots = body.put_vector(files.len());
-        for ((file_id, directory, name, size, chunk_ids), slot) in files.iter().zip(file_slots) {
+        for ((file_id, directory, name, size, chunk_ids, mask), slot) in
+            files.iter().zip(file_slots)
+        {
             let fields = [
                 TestField::U64(*file_id),
                 directory.map_or(TestField::Absent, TestField::U64),
                 TestField::U32(*size),
                 TestField::Offset,
-                TestField::Absent,
+                mask.map_or(TestField::Absent, TestField::U64),
                 TestField::Absent,
                 TestField::Absent,
                 TestField::Offset,

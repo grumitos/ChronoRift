@@ -76,12 +76,17 @@ ChronoRift maps known replay platform ids to a default locale:
 | JP1 | `ja_JP` |
 | KR | `ko_KR` |
 | LA1, LA2 | `es_MX` |
-| NA1, OC1, PH2, SG2 | `en_US` |
+| NA1 | `en_US` |
+| OC1 | `en_AU` |
+| PH2 | `en_PH` |
+| SG2 | `en_SG` |
 | RU | `ru_RU` |
 | TH2 | `th_TH` |
 | TR1 | `tr_TR` |
 | TW2 | `zh_TW` |
 | VN2 | `vi_VN` |
+
+ME1 is a known platform with no suggested locale: the interface does not offer `ar_AE`. A platform id outside this list (in the metadata or in the file name) gives no region.
 
 This is only a default. The plan keeps the locale editable because backups and downloaded clients may have different language assets. A client downloaded by ChronoRift only has the files of the locale it was installed with, so it is shown and launched with that locale; its plans (resume, verify) start from it too. A chosen executable uses the replay's suggested locale or the one picked in the plan.
 

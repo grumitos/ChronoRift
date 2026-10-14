@@ -69,7 +69,7 @@ Optional suites against real data are skipped unless their variables are set:
 | Variable | Test | What it checks |
 | --- | --- | --- |
 | `CHRONORIFT_REPLAY_DIRECTORY` | `rofl::tests::real_replays_match_an_independent_read_and_stay_untouched` | Every `.rofl` in the folder parses, key fields match an independent read of the trailer JSON, and the folder is unchanged afterwards. |
-| `CHRONORIFT_MANIFEST_SAMPLE` (+ optional `CHRONORIFT_MANIFEST_LOCALE`) | `client::tests::real_manifest_selection_matches_rman_flags` | The path-based locale selection skips no file that the RMAN flags require, and prints download size and range-request count. |
+| `CHRONORIFT_MANIFEST_SAMPLE` (+ optional `CHRONORIFT_MANIFEST_LOCALE`) | `client::tests::real_manifest_flag_selection_keeps_named_locale_files` | The flag-based selection installs every file that carries the requested locale in its name, and prints how it differs from the old path-marker rule plus download size and range-request count. |
 
 Example (PowerShell): `$env:CHRONORIFT_REPLAY_DIRECTORY="$env:USERPROFILE\Documents\League of Legends\Replays"; cargo test --manifest-path src-tauri/Cargo.toml real_ -- --nocapture`
 

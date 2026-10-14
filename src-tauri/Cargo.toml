@@ -3,6 +3,7 @@ name = "chronorift"
 version = "0.1.0"
 description = "Replay archive and playback helper for League of Legends ROFL files."
 authors = ["ChronoRift contributors"]
+license = "MIT"
 edition = "2021"
 # El mayor `rust-version` del grafo bloqueado (`cargo metadata --locked`), acordado con FairTranslator.
 rust-version = "1.88"
