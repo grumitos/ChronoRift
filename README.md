@@ -88,11 +88,13 @@ cargo test --manifest-path src-tauri/Cargo.toml real_install_downloads_the_repla
 
 ## Version Policy (shared with FairTranslator)
 
-- Both apps use the same Tauri line and move together: one session proposes the exact versions, the other confirms, and both apply them the same day. Today it is the 2.11 line (`tauri` 2.11.6, `tauri-build` 2.6.3, `@tauri-apps/cli` 2.11.5, `@tauri-apps/api` 2.11.1); the planned move is to 2.12.1 on 2026-10-08. No Tauri 3 until it is stable.
-- The Tauri ecosystem is pinned exactly: `=x.y.z` in `Cargo.toml` for `tauri`, `tauri-build`, and `tauri-plugin-*`, and `x.y.z` without `^` or `~` in `package.json` for `@tauri-apps/*`. A plugin both apps use has the same version in both (`dialog` 2.7.3); ChronoRift also uses `opener` 2.5.5. Every other dependency uses a range, with `Cargo.lock` and `bun.lock` committed.
-- Packages must be at least 7 days old: `bunfig.toml` sets `minimumReleaseAge`, and crates are checked by hand.
-- While `tauri` is pinned to an older minor, do not run a general `cargo update`: Tauri declares its internal crates with `^` and the lock would mix lines. Use `cargo update -p <crate> --precise <version>`.
-- `rust-version` is the highest `rust_version` declared by the locked graph (`cargo metadata --locked --format-version 1`), the same in both apps (the higher one if they differ): 1.88 today. Development uses the current stable toolchain, with no `rust-toolchain.toml`.
+The shared rule is written in `VERSION_POLICY.md` of the design kit (version 0.1.4 or later); this section applies it to ChronoRift.
+
+- Both apps use the same Tauri line. Each app may bump on its own with the rules below, without asking the other, and tells it which exact versions it chose so the set stays aligned. Today it is the 2.12 line (`tauri` 2.12.1, `tauri-build` 2.7.1, `@tauri-apps/cli` 2.12.1, `@tauri-apps/api` 2.12.1), applied on 2026-10-14. No Tauri 3 until it is stable.
+- The Tauri ecosystem is pinned exactly: `=x.y.z` in `Cargo.toml` for `tauri`, `tauri-build`, and `tauri-plugin-*`, and `x.y.z` without `^` or `~` in `package.json` for `@tauri-apps/*`. A plugin both apps use has the same version in both (`dialog` 2.8.1); ChronoRift also uses `opener` 2.7.0. Every other dependency uses a range, with `Cargo.lock` and `bun.lock` committed.
+- Packages must be at least 7 days old, the crates a bump brings into the lock included: `bunfig.toml` sets `minimumReleaseAge`, and crates are checked by hand (publish date on crates.io). A targeted `cargo update -p tauri ...` pulls the newest compatible internal crates, some younger than that; hold them with `cargo update -p <crate> --precise <version>`. On 2026-10-14 that was `tauri-utils` 2.10.1, `tauri-runtime` and `tauri-runtime-wry` 2.12.1, `tauri-macros`, `tauri-codegen` and `tauri-plugin` 2.7.1, `tauri-plugin-fs` 2.6.0, and `swift-rs` 1.0.8.
+- Do not run a general `cargo update`: Tauri declares its internal crates with `~` or `^`, so the lock would mix lines or take crates younger than 7 days. Use `cargo update -p <crate> --precise <version>`.
+- `rust-version` is the highest `rust_version` declared by the locked graph (`cargo metadata --locked --format-version 1`), the same in both apps (the higher one if they differ): 1.90 today. Development uses the current stable toolchain, with no `rust-toolchain.toml`.
 - Major updates outside Tauri are decided per project.
 
 ## Architecture

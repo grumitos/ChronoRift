@@ -6,7 +6,7 @@ authors = ["ChronoRift contributors"]
 license = "MIT"
 edition = "2021"
 # El mayor `rust-version` del grafo bloqueado (`cargo metadata --locked`), acordado con FairTranslator.
-rust-version = "1.88"
+rust-version = "1.90"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -21,14 +21,14 @@ name = "chronorift_lib"
 crate-type = ["rlib"]
 
 [build-dependencies]
-tauri-build = { version = "=2.6.3", features = [] }
+tauri-build = { version = "=2.7.1", features = [] }
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 cdragon-rman = "0.2"
-tauri = { version = "=2.11.6", features = [] }
-tauri-plugin-dialog = "=2.7.3"
-tauri-plugin-opener = "=2.5.5"
+tauri = { version = "=2.12.1", features = [] }
+tauri-plugin-dialog = "=2.8.1"
+tauri-plugin-opener = "=2.7.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 zstd = "0.13"
